@@ -11,7 +11,7 @@ use ratatui::{
 };
 use shed_core::{
     Block, BlockId, BlockState, CompareOp, Filter, FilterSpec, PipelineValue, Predicate, Session,
-    Value,
+    SortDirection, SortKey, Value,
 };
 
 use crate::exec::run_command;
@@ -39,6 +39,9 @@ enum FilterKind {
     Drop,
     Take,
     Skip,
+    SortBy,
+    Uniq,
+    Count,
 }
 
 impl FilterKind {
@@ -53,6 +56,9 @@ impl FilterKind {
         FilterKind::Drop,
         FilterKind::Take,
         FilterKind::Skip,
+        FilterKind::SortBy,
+        FilterKind::Uniq,
+        FilterKind::Count,
     ];
 
     fn name(self) -> &'static str {
@@ -67,6 +73,9 @@ impl FilterKind {
             FilterKind::Drop => "drop",
             FilterKind::Take => "take",
             FilterKind::Skip => "skip",
+            FilterKind::SortBy => "sort-by",
+            FilterKind::Uniq => "uniq",
+            FilterKind::Count => "count",
         }
     }
 
@@ -82,6 +91,9 @@ impl FilterKind {
             FilterKind::Drop => "remove the chosen columns",
             FilterKind::Take => "keep the first N rows",
             FilterKind::Skip => "drop the first N rows",
+            FilterKind::SortBy => "sort rows by a column (numeric coercion when both sides parse)",
+            FilterKind::Uniq => "drop duplicate rows (optionally keyed by columns)",
+            FilterKind::Count => "collapse to a single row with the row count",
         }
     }
 
@@ -112,6 +124,8 @@ enum FormField {
     CsvDelim,
     CsvHasHeader,
     RegexPattern,
+    SortColumn,
+    SortDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +252,8 @@ struct FilterEditState {
     csv_delim: char,
     csv_has_header: bool,
     regex_pattern: String,
+    sort_column: usize,
+    sort_direction: SortDirection,
     available_columns: Vec<String>,
     field: FormField,
     editing_index: Option<usize>,
@@ -258,6 +274,8 @@ impl FilterEditState {
             csv_delim: ',',
             csv_has_header: true,
             regex_pattern: String::new(),
+            sort_column: 0,
+            sort_direction: SortDirection::Asc,
             available_columns,
             field: FormField::Kind,
             editing_index,
@@ -291,6 +309,28 @@ impl FilterEditState {
                 state.kind = FilterKind::FromRegex;
                 state.regex_pattern = pattern.clone();
             }
+            Some(FilterSpec::SortBy { keys }) => {
+                state.kind = FilterKind::SortBy;
+                if let Some(first) = keys.first() {
+                    state.sort_column = state
+                        .available_columns
+                        .iter()
+                        .position(|c| c == &first.column)
+                        .unwrap_or(0);
+                    state.sort_direction = first.direction;
+                }
+            }
+            Some(FilterSpec::Uniq { by }) => {
+                state.kind = FilterKind::Uniq;
+                if let Some(cols) = by {
+                    for col in cols {
+                        if let Some(i) = state.available_columns.iter().position(|c| c == col) {
+                            state.column_selections[i] = true;
+                        }
+                    }
+                }
+            }
+            Some(FilterSpec::Count) => state.kind = FilterKind::Count,
             Some(FilterSpec::Where {
                 predicate: Predicate::Matches { column, pattern },
             }) => {
@@ -365,9 +405,10 @@ impl FilterEditState {
 
     fn fields(&self) -> &'static [FormField] {
         match self.kind {
-            FilterKind::FromLines | FilterKind::FromFields | FilterKind::FromJson => {
-                &[FormField::Kind]
-            }
+            FilterKind::FromLines
+            | FilterKind::FromFields
+            | FilterKind::FromJson
+            | FilterKind::Count => &[FormField::Kind],
             FilterKind::FromCsv => &[
                 FormField::Kind,
                 FormField::CsvDelim,
@@ -380,9 +421,27 @@ impl FilterEditState {
                 FormField::Op,
                 FormField::Pattern,
             ],
-            FilterKind::Select | FilterKind::Drop => &[FormField::Kind, FormField::Columns],
+            FilterKind::Select | FilterKind::Drop | FilterKind::Uniq => {
+                &[FormField::Kind, FormField::Columns]
+            }
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
+            FilterKind::SortBy => &[FormField::Kind, FormField::SortColumn, FormField::SortDir],
         }
+    }
+
+    fn cycle_sort_column(&mut self, delta: i32) {
+        if self.available_columns.is_empty() {
+            return;
+        }
+        let len = self.available_columns.len() as i32;
+        self.sort_column = (self.sort_column as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    fn flip_sort_direction(&mut self) {
+        self.sort_direction = match self.sort_direction {
+            SortDirection::Asc => SortDirection::Desc,
+            SortDirection::Desc => SortDirection::Asc,
+        };
     }
 
     fn cycle_delim(&mut self, delta: i32) {
@@ -506,6 +565,22 @@ impl FilterEditState {
             }
             FilterKind::Take => self.parsed_n().map(|n| FilterSpec::Take { n }),
             FilterKind::Skip => self.parsed_n().map(|n| FilterSpec::Skip { n }),
+            FilterKind::SortBy => {
+                let col = self.available_columns.get(self.sort_column)?.clone();
+                Some(FilterSpec::SortBy {
+                    keys: vec![SortKey {
+                        column: col,
+                        direction: self.sort_direction,
+                    }],
+                })
+            }
+            FilterKind::Uniq => {
+                let cols = self.selected_columns();
+                Some(FilterSpec::Uniq {
+                    by: if cols.is_empty() { None } else { Some(cols) },
+                })
+            }
+            FilterKind::Count => Some(FilterSpec::Count),
         }
     }
 }
@@ -716,7 +791,26 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::CsvDelim => handle_csv_delim_key(state, key),
             FormField::CsvHasHeader => handle_csv_has_header_key(state, key),
             FormField::RegexPattern => handle_regex_pattern_key(state, key),
+            FormField::SortColumn => handle_sort_column_key(state, key),
+            FormField::SortDir => handle_sort_dir_key(state, key),
         },
+    }
+}
+
+fn handle_sort_column_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left | KeyCode::Up => state.cycle_sort_column(-1),
+        KeyCode::Right | KeyCode::Down => state.cycle_sort_column(1),
+        _ => {}
+    }
+}
+
+fn handle_sort_dir_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
+            state.flip_sort_direction();
+        }
+        _ => {}
     }
 }
 
@@ -1251,6 +1345,24 @@ fn describe_filter(spec: &FilterSpec) -> String {
         FilterSpec::Drop { columns } => format!("drop {}", columns.join(", ")),
         FilterSpec::Take { n } => format!("take {n}"),
         FilterSpec::Skip { n } => format!("skip {n}"),
+        FilterSpec::SortBy { keys } => {
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let dir = match k.direction {
+                        SortDirection::Asc => "↑",
+                        SortDirection::Desc => "↓",
+                    };
+                    format!("{} {dir}", k.column)
+                })
+                .collect();
+            format!("sort-by {}", parts.join(", "))
+        }
+        FilterSpec::Uniq { by } => match by {
+            Some(cols) => format!("uniq by {}", cols.join(", ")),
+            None => "uniq".into(),
+        },
+        FilterSpec::Count => "count".into(),
     }
 }
 
@@ -1462,6 +1574,8 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::CsvDelim => "delim",
         FormField::CsvHasHeader => "header",
         FormField::RegexPattern => "regex",
+        FormField::SortColumn => "column",
+        FormField::SortDir => "direction",
     };
     let label_style = if active {
         Style::default()
@@ -1515,6 +1629,28 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             active,
             "(empty: matches nothing — use named groups like (?<col>…))",
         ),
+        FormField::SortColumn => {
+            if state.available_columns.is_empty() {
+                vec![Span::styled(
+                    "(no columns — pipeline output is bytes; add a parser)",
+                    Style::default().fg(Color::Red),
+                )]
+            } else {
+                let col = state
+                    .available_columns
+                    .get(state.sort_column)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                render_select_value(col, "", active)
+            }
+        }
+        FormField::SortDir => {
+            let (label, desc) = match state.sort_direction {
+                SortDirection::Asc => ("asc ↑", "smallest first"),
+                SortDirection::Desc => ("desc ↓", "largest first"),
+            };
+            render_select_value(label, desc, active)
+        }
     };
 
     let mut all = vec![label_span];
@@ -1735,24 +1871,61 @@ mod tests {
         block.pipeline.push(FilterSpec::FromLines);
         let mut state = FilterEditState::for_add(&block);
         assert_eq!(state.kind, FilterKind::Where);
-        // ALL = [FromLines, FromFields, FromCsv, FromJson, FromRegex,
-        //        Where, Select, Drop, Take, Skip]
-        let order = [
-            FilterKind::Select,
-            FilterKind::Drop,
-            FilterKind::Take,
-            FilterKind::Skip,
-            FilterKind::FromLines,
-            FilterKind::FromFields,
-            FilterKind::FromCsv,
-            FilterKind::FromJson,
-            FilterKind::FromRegex,
-            FilterKind::Where,
-        ];
-        for expected in order {
+        // Walks once around the cycle and lands back on Where.
+        for _ in 0..FilterKind::ALL.len() {
             state.cycle_kind(1);
-            assert_eq!(state.kind, expected);
         }
+        assert_eq!(state.kind, FilterKind::Where);
+    }
+
+    #[test]
+    fn build_filter_sort_by_includes_direction() {
+        let mut block = block_with_stdout(b"a\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::SortBy;
+        state.sort_direction = SortDirection::Desc;
+        match state.build_filter() {
+            Some(FilterSpec::SortBy { keys }) => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].column, "line");
+                assert_eq!(keys[0].direction, SortDirection::Desc);
+            }
+            _ => panic!("expected SortBy"),
+        }
+    }
+
+    #[test]
+    fn build_filter_uniq_no_columns_means_full_dedupe() {
+        let mut block = block_with_stdout(b"a b\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Uniq;
+        match state.build_filter() {
+            Some(FilterSpec::Uniq { by }) => assert!(by.is_none()),
+            _ => panic!("expected Uniq with by=None"),
+        }
+        state.column_selections[0] = true;
+        match state.build_filter() {
+            Some(FilterSpec::Uniq { by: Some(cols) }) => assert_eq!(cols, vec!["_1".to_string()]),
+            _ => panic!("expected Uniq with by=Some([_1])"),
+        }
+    }
+
+    #[test]
+    fn for_edit_prepopulates_sort_by() {
+        let mut block = block_with_stdout(b"a\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::SortBy {
+            keys: vec![SortKey {
+                column: "line".into(),
+                direction: SortDirection::Desc,
+            }],
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::SortBy);
+        assert_eq!(state.sort_direction, SortDirection::Desc);
+        assert_eq!(state.available_columns, vec!["line"]);
     }
 
     #[test]

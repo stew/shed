@@ -23,6 +23,21 @@ pub enum FilterSpec {
     Drop { columns: Vec<String> },
     Take { n: usize },
     Skip { n: usize },
+    SortBy { keys: Vec<SortKey> },
+    Uniq { by: Option<Vec<String>> },
+    Count,
+}
+
+#[derive(Debug, Clone)]
+pub struct SortKey {
+    pub column: String,
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +103,9 @@ impl Filter for FilterSpec {
             FilterSpec::Drop { columns } => apply_drop(input, columns),
             FilterSpec::Take { n } => apply_take(input, *n),
             FilterSpec::Skip { n } => apply_skip(input, *n),
+            FilterSpec::SortBy { keys } => apply_sort_by(input, keys),
+            FilterSpec::Uniq { by } => apply_uniq(input, by.as_deref()),
+            FilterSpec::Count => apply_count(input),
         }
     }
 }
@@ -314,6 +332,86 @@ fn json_to_value(j: serde_json::Value) -> Value {
     }
 }
 
+fn apply_sort_by(input: PipelineValue, keys: &[SortKey]) -> Result<PipelineValue, FilterError> {
+    let mut items = require_list(input)?;
+    items.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        for key in keys {
+            let av = match a {
+                Value::Record(r) => r.get(&key.column),
+                _ => None,
+            };
+            let bv = match b {
+                Value::Record(r) => r.get(&key.column),
+                _ => None,
+            };
+            let ord = match (av, bv) {
+                (Some(av), Some(bv)) => compare_values(av, bv).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            let ord = match key.direction {
+                SortDirection::Asc => ord,
+                SortDirection::Desc => ord.reverse(),
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    Ok(PipelineValue::Structured(Value::List(items)))
+}
+
+fn apply_uniq(input: PipelineValue, by: Option<&[String]>) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items {
+        let key = uniq_key(&item, by);
+        if seen.insert(key) {
+            kept.push(item);
+        }
+    }
+    Ok(PipelineValue::Structured(Value::List(kept)))
+}
+
+fn uniq_key(record: &Value, by: Option<&[String]>) -> String {
+    match record {
+        Value::Record(r) => {
+            let cols: Vec<&str> = match by {
+                Some(c) => c.iter().map(String::as_str).collect(),
+                None => r.keys().map(String::as_str).collect(),
+            };
+            cols.iter()
+                .map(|col| format!("{col}={}", value_key_string(r.get(*col))))
+                .collect::<Vec<_>>()
+                .join("\0")
+        }
+        other => format!("scalar:{other:?}"),
+    }
+}
+
+fn value_key_string(v: Option<&Value>) -> String {
+    match v {
+        None => "<missing>".into(),
+        Some(Value::Null) => "<null>".into(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Int(i)) => i.to_string(),
+        Some(Value::Float(f)) => f.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
+fn apply_count(input: PipelineValue) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    let mut rec = IndexMap::with_capacity(1);
+    rec.insert("count".to_string(), Value::Int(items.len() as i64));
+    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
+}
+
 fn apply_from_regex(input: PipelineValue, pattern: &str) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| FilterError::InvalidUtf8)?;
@@ -425,7 +523,13 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Float(x), Float(y)) => x.partial_cmp(y),
         (Int(x), Float(y)) => (*x as f64).partial_cmp(y),
         (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)),
-        (String(x), String(y)) => Some(x.cmp(y)),
+        (String(x), String(y)) => {
+            if let (Ok(xn), Ok(yn)) = (x.parse::<f64>(), y.parse::<f64>()) {
+                Some(xn.partial_cmp(&yn).unwrap_or(std::cmp::Ordering::Equal))
+            } else {
+                Some(x.cmp(y))
+            }
+        }
         (String(x), Int(y)) => x.parse::<i64>().ok().and_then(|n| Some(n.cmp(y))),
         (String(x), Float(y)) => x.parse::<f64>().ok().and_then(|n| n.partial_cmp(y)),
         (Int(x), String(y)) => y.parse::<i64>().ok().and_then(|n| Some(x.cmp(&n))),
@@ -898,6 +1002,109 @@ mod tests {
         };
         let keys: Vec<&str> = first.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["_1", "_2"]);
+    }
+
+    #[test]
+    fn count_returns_single_row_with_total() {
+        let pipeline = vec![FilterSpec::FromLines, FilterSpec::Count];
+        let result = run(&pipeline, b"a\nb\nc\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 1);
+        let r = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(r.get("count"), Some(&Value::Int(3)));
+    }
+
+    #[test]
+    fn uniq_full_row_dedup() {
+        let pipeline = vec![FilterSpec::FromLines, FilterSpec::Uniq { by: None }];
+        let result = run(&pipeline, b"a\nb\na\nc\nb\n");
+        assert_eq!(lines_of(result), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn uniq_by_specific_column_keeps_first_occurrence() {
+        let pipeline = vec![
+            FilterSpec::FromFields,
+            FilterSpec::Uniq {
+                by: Some(vec!["_1".into()]),
+            },
+        ];
+        let result = run(&pipeline, b"a 1\nb 2\na 3\nc 4\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 3);
+        let firsts: Vec<String> = items
+            .iter()
+            .map(|v| match v {
+                Value::Record(r) => match r.get("_1") {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(firsts, vec!["a", "b", "c"]);
+        // Confirm we kept the FIRST a (with _2="1"), not the later one (_2="3")
+        match &items[0] {
+            Value::Record(r) => {
+                assert_eq!(r.get("_2"), Some(&Value::String("1".into())));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn sort_by_ascending() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::SortBy {
+                keys: vec![SortKey {
+                    column: "line".into(),
+                    direction: SortDirection::Asc,
+                }],
+            },
+        ];
+        let result = run(&pipeline, b"banana\napple\ncherry\n");
+        assert_eq!(lines_of(result), vec!["apple", "banana", "cherry"]);
+    }
+
+    #[test]
+    fn sort_by_descending() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::SortBy {
+                keys: vec![SortKey {
+                    column: "line".into(),
+                    direction: SortDirection::Desc,
+                }],
+            },
+        ];
+        let result = run(&pipeline, b"banana\napple\ncherry\n");
+        assert_eq!(lines_of(result), vec!["cherry", "banana", "apple"]);
+    }
+
+    #[test]
+    fn sort_by_numeric_via_string_coercion() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::SortBy {
+                keys: vec![SortKey {
+                    column: "line".into(),
+                    direction: SortDirection::Asc,
+                }],
+            },
+        ];
+        // String-typed numbers — sort_by uses compare_values which coerces.
+        let result = run(&pipeline, b"10\n2\n1\n100\n");
+        assert_eq!(lines_of(result), vec!["1", "2", "10", "100"]);
     }
 
     #[test]
