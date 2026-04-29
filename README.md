@@ -209,10 +209,10 @@ so you don't lose data without noticing.
 | Tab / Shift-Tab      | next/prev field |
 | ←→                   | cycle Select fields (Kind, Column, Op, Direction); on Columns multi-select moves cursor; on Pattern/RegexPattern/N: ignored |
 | Type                 | edit text fields (Pattern, RegexPattern, N digits, Rename "to" inputs) |
-| Backspace            | text fields: delete last char; sort-keys: remove the active key |
+| Backspace            | text fields: delete last char; sort-keys / where-clause: remove the active row |
 | Space                | toggle Bool fields (CsvHasHeader); flip direction (SortDir); toggle column in Columns multi-select; toggle direction on a sort key |
-| `a`                  | (on SortKeys) append a new sort key |
-| `x` / Backspace      | (on SortKeys) remove the active sort key (min 1) |
+| `a`                  | (on SortKeys / where-clause) append a new row |
+| `x` / Backspace      | (on SortKeys / where-clause) remove the active row (min 1) |
 | Enter                | apply — commits the in-progress filter to the pipeline |
 | Esc                  | cancel — restores the saved filter, returns to BlockCursor |
 
