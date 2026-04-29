@@ -157,7 +157,7 @@ force handover for anything not on the list, prefix the command with
 | `from-csv`    | parser      | `delim`, `has_header`     | flexible — mixed-field rows survive |
 | `from-json`   | parser      | (none)                    | array of objects → rows; object → 1 row; scalar → wrapped in `value` column |
 | `from-regex`  | parser      | `pattern`                 | named captures become columns; non-matching lines are dropped |
-| `where`       | row filter  | `column`, `op`, `value`   | ops: `matches` (regex), `contains` (substring), `=`, `≠`, `<`, `≤`, `>`, `≥`. Numeric coercion when both sides parse. Lenient per-row (drops rows on null/type mismatch); hard-fail on bad regex / unknown column. |
+| `where`       | row filter  | clauses + AND/OR          | each clause is `column`/`op`/`value` with op in `matches` (regex), `contains` (substring), `=`, `≠`, `<`, `≤`, `>`, `≥`. Multiple clauses combine with a single AND or OR. Numeric coercion when both sides parse. Lenient per-row (drops rows on null/type mismatch); hard-fail on bad regex / unknown column. |
 | `select`      | columns     | `columns`                 | keep listed columns in given order |
 | `drop`        | columns     | `columns`                 | remove listed columns |
 | `rename`      | columns     | pairs                     | each form row is one column → new name (blank means unchanged) |
@@ -274,8 +274,9 @@ shed/
 
 Known gaps and likely next steps, in rough priority order:
 
-- And/Or composition in `where` predicates (data model supports it; UI
-  does not)
+- Predicate negation in the `where` form (the data model has
+  `Predicate::Not`; the form has `≠` for compares but no negation
+  for `matches`/`contains`)
 - Alt-screen auto-handover — detect `\x1b[?1049h` mid-capture and
   switch to handover mode
 - vt100 emulation for cursor-positioning programs (cargo progress

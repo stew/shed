@@ -103,9 +103,10 @@ pub enum SortDirection {
 /// numeric coercion ([`Compare`](Predicate::Compare) on a string column
 /// vs a numeric value will try parsing the string side as a number).
 ///
-/// `And`/`Or`/`Not` compose other predicates. The v0 UI doesn't yet
-/// expose a builder for them, but the data model supports them — they
-/// can be constructed programmatically.
+/// `And`/`Or`/`Not` compose other predicates. The form lets the user
+/// build flat And-chains and Or-chains (with a single combine
+/// operator across all clauses); arbitrary nesting and `Not` are
+/// data-model features that have to be constructed programmatically.
 #[derive(Debug, Clone)]
 pub enum Predicate {
     Matches { column: String, pattern: String },
