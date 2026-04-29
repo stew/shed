@@ -1,3 +1,44 @@
+//! ratatui-based TUI: event loop, focus model, rendering, filter form.
+//!
+//! # Focus model
+//!
+//! shed has three focus contexts. The status bar at the bottom always
+//! lists keys available in the current context:
+//!
+//! | Focus         | Purpose                                          |
+//! |---------------|--------------------------------------------------|
+//! | `Prompt`      | type commands; Enter spawns                      |
+//! | `BlockCursor` | navigate blocks (↑↓), filters within (←→), edit |
+//! | `FilterEdit`  | schema-aware form for the active filter          |
+//!
+//! Focus transitions: `Esc` from `Prompt` enters `BlockCursor` on the
+//! newest block; `Esc` from `BlockCursor` returns to `Prompt`; `f`/Enter
+//! on a block enters `FilterEdit`; `Esc` from `FilterEdit` cancels.
+//!
+//! # Concurrency
+//!
+//! Commands run as tokio `spawn_blocking` tasks (`portable-pty`'s API is
+//! sync). The event loop polls completed tasks via
+//! [`reap_completed`] each iteration and updates the corresponding block.
+//! The TUI never freezes during long-running commands; multiple commands
+//! coexist with their own ⏵/●/⚠ glyphs.
+//!
+//! # Fullscreen handover
+//!
+//! Some commands (`top`, `vim`, `less`, …) need full terminal control.
+//! [`spawn_prompt`] detects them via a built-in blacklist (or the `!`
+//! prefix), sets [`App::pending_handover`], and the event loop performs
+//! the handover at the top of its next iteration: tear down ratatui,
+//! await the child with inherited stdio, re-init ratatui.
+//!
+//! # Form fields
+//!
+//! Each filter kind uses a small set of field types:
+//! - **Select** — Kind, Column, Op, Direction, CsvDelim, CsvHasHeader: ←→ cycles
+//! - **TextInput** — Pattern, RegexPattern, N (digits only), Rename "to": typing edits
+//! - **Multi-select** — Columns (Select/Drop/Uniq): ↑↓ moves cursor, Space toggles
+//! - **Multi-line list** — SortKeys, RenameMap: each row has its own state
+
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;

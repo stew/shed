@@ -1,3 +1,25 @@
+//! PTY-based command execution.
+//!
+//! Each command is spawned attached to a pseudo-terminal (via
+//! `portable-pty`), so terminal-aware programs (`ls --color`, `cargo build`,
+//! `git status`, …) detect a TTY and emit ANSI-colored output. The captured
+//! bytes (including escape sequences) live on the resulting
+//! [`shed_core::Capture`]; the TUI's `ansi` module decodes them at render
+//! time.
+//!
+//! `portable-pty`'s API is synchronous, so the actual capture happens on
+//! tokio's blocking thread pool via `spawn_blocking`. [`spawn_command`]
+//! returns:
+//! - the [`JoinHandle`] for that blocking task (which the event loop
+//!   `is_finished()`-polls and awaits on completion),
+//! - a [`Killer`] (a `Box<dyn ChildKiller + Send + Sync>`) that the TUI
+//!   keeps alongside the handle so Ctrl-C and shed shutdown can actually
+//!   terminate the child process.
+//!
+//! This split is important because aborting a `spawn_blocking` task is a
+//! no-op for the running closure (you can't interrupt blocking work) — the
+//! killer is the only way to make a long-running PTY child stop.
+
 use std::io::Read;
 use std::time::Instant;
 

@@ -4,13 +4,25 @@ use std::time::Instant;
 use crate::block::{Block, BlockId, BlockState};
 use crate::capture::Capture;
 
+/// Default total capture-byte budget for an entire [`Session`], in bytes
+/// (256 MiB). When the sum of unpinned captures exceeds this, the
+/// oldest-touched ones are evicted by [`Session::evict_to_fit`]. Pinned
+/// captures count toward the budget but are never evicted.
 pub const DEFAULT_CAPTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// All session-wide state: the ordered set of [`Block`]s, a name registry,
+/// the current cursor, and the capture-byte budget.
+///
+/// `Session` is pure data — it does not own running tasks, the TUI, or
+/// the terminal. The binary crate maintains its own `App` struct that
+/// wraps a `Session` plus I/O state.
 pub struct Session {
     blocks: BTreeMap<BlockId, Block>,
     next_id: u64,
     names: HashMap<String, BlockId>,
     cursor: Option<BlockId>,
+    /// Total byte budget for unpinned captures across the session.
+    /// Initialized to [`DEFAULT_CAPTURE_BUDGET_BYTES`].
     pub capture_budget_bytes: usize,
 }
 
@@ -31,6 +43,9 @@ impl Session {
         }
     }
 
+    /// Append a new block in `Running` state and return its id. The id is
+    /// monotonic — `add_block` always returns a strictly greater id than
+    /// any previous call on this session.
     pub fn add_block(&mut self, argv: Vec<String>) -> BlockId {
         let id = BlockId(self.next_id);
         self.next_id += 1;
@@ -55,10 +70,13 @@ impl Session {
         self.blocks.get_mut(&id)
     }
 
+    /// Iterate blocks in monotonic id order (oldest first).
     pub fn blocks(&self) -> impl Iterator<Item = &Block> {
         self.blocks.values()
     }
 
+    /// Attach a captured stdout/stderr to a block and bump its
+    /// `last_touched` timestamp. Returns `false` if the id is unknown.
     pub fn set_capture(&mut self, id: BlockId, capture: Capture) -> bool {
         match self.blocks.get_mut(&id) {
             Some(b) => {
@@ -81,12 +99,19 @@ impl Session {
         }
     }
 
+    /// Bump a block's `last_touched` timestamp without mutating anything
+    /// else. Used when the user opens or pipes through a block — it
+    /// signals "still relevant" to the LRU evictor.
     pub fn touch(&mut self, id: BlockId) {
         if let Some(b) = self.blocks.get_mut(&id) {
             b.last_touched = Instant::now();
         }
     }
 
+    /// Pin a block under `name`. If `name` already maps to another block,
+    /// that mapping is transferred (the previous owner's `name` becomes
+    /// `None`). Pinned blocks count toward the capture budget but never
+    /// evict. Returns `false` if `id` is unknown.
     pub fn pin(&mut self, id: BlockId, name: String) -> bool {
         if !self.blocks.contains_key(&id) {
             return false;
@@ -133,10 +158,15 @@ impl Session {
         self.blocks.values().map(|b| b.capture_size_bytes()).sum()
     }
 
-    /// Evict captures from unpinned blocks (oldest `last_touched` first) until
-    /// total bytes is under budget. Pinned blocks count toward the budget but
-    /// are never evicted; if pinned alone exceed the budget, the budget is
-    /// violated rather than enforced.
+    /// Evict captures from unpinned blocks (oldest `last_touched` first)
+    /// until total bytes is under [`Session::capture_budget_bytes`].
+    ///
+    /// Pinned blocks count toward the budget but are never evicted; if
+    /// the pinned set alone exceeds the budget, the budget is violated
+    /// rather than enforced. Eviction sets the block's
+    /// [`Block::capture`] to `None`; the block itself stays in the
+    /// session (its id and pipeline are preserved). The user sees a cold
+    /// `○` glyph in the UI.
     pub fn evict_to_fit(&mut self) {
         if self.total_capture_bytes() <= self.capture_budget_bytes {
             return;

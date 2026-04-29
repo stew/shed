@@ -5,52 +5,122 @@ use thiserror::Error;
 
 use crate::value::Value;
 
+/// The data flowing through a filter pipeline.
+///
+/// A pipeline always starts with [`PipelineValue::Bytes`] (the raw
+/// captured stdout). The first filter in any pipeline must be a parser
+/// (`from-lines`, `from-csv`, `from-json`, `from-regex`, `from-fields`)
+/// that converts bytes into [`PipelineValue::Structured`]. All
+/// downstream filters operate on the structured form.
 #[derive(Debug, Clone)]
 pub enum PipelineValue {
     Bytes(Bytes),
     Structured(Value),
 }
 
+/// A single filter in a pipeline. `FilterSpec` is *data*: it serializes,
+/// is inspected by the UI's filter form, and is applied via
+/// [`Filter::apply`] (or [`apply_with_notes`] for diagnostic stats).
+///
+/// Filters fall into four classes:
+///
+/// - **Parsers** (`FromLines`, `FromFields`, `FromCsv`, `FromJson`,
+///   `FromRegex`) convert raw bytes into structured rows. They must be
+///   the first filter in any pipeline.
+/// - **Row transforms** (`Where`, `Take`, `Skip`, `Uniq`, `SortBy`)
+///   keep, drop, dedupe, or reorder rows.
+/// - **Column transforms** (`Select`, `Drop`, `Rename`) reshape the
+///   schema of each row.
+/// - **Aggregations** (`Count`) collapse the row stream to a summary.
 #[derive(Debug, Clone)]
 pub enum FilterSpec {
+    /// One record per line; column `line` holds the line text.
     FromLines,
+    /// Whitespace split each line; columns auto-named `_1`, `_2`, …
+    /// using the maximum field count seen across all lines.
     FromFields,
+    /// CSV parser using the given delimiter. With `has_header` true,
+    /// the first row's fields become column names; otherwise columns
+    /// are auto-named `_1`, `_2`, … The reader is `flexible(true)`
+    /// (rows with mismatched field counts still parse).
     FromCsv { delim: char, has_header: bool },
+    /// JSON parser. Top-level shape is normalized into a list of
+    /// records: array-of-objects becomes rows; a single object becomes
+    /// a one-row list; scalars are wrapped as `{value: scalar}`.
     FromJson,
+    /// Regex parser. Each line is matched against `pattern`; named
+    /// captures become columns (unnamed groups become `_1`, `_2`, …).
+    /// Lines that don't match are dropped.
     FromRegex { pattern: String },
+    /// Keep rows whose column matches a [`Predicate`]. Per-row
+    /// evaluation errors (Null comparison, type mismatch) silently
+    /// drop the row; schema-level errors (bad regex, unknown column)
+    /// hard-fail the filter. See [`apply_with_notes`] for the silent
+    /// drop count.
     Where { predicate: Predicate },
+    /// Keep only the listed columns, in the given order.
     Select { columns: Vec<String> },
+    /// Remove the listed columns.
     Drop { columns: Vec<String> },
+    /// Keep the first `n` rows.
     Take { n: usize },
+    /// Drop the first `n` rows.
     Skip { n: usize },
+    /// Stable sort by one or more [`SortKey`]s. Numeric coercion
+    /// applies when both sides parse as numbers (so `"10"` sorts after
+    /// `"2"`).
     SortBy { keys: Vec<SortKey> },
+    /// Drop duplicate rows. With `by = None`, dedupe by full row;
+    /// otherwise dedupe keyed by the listed columns. The first
+    /// occurrence of each key is kept.
     Uniq { by: Option<Vec<String>> },
+    /// Collapse to a single row `{count: N}`.
     Count,
+    /// Rename columns. Each `(from, to)` pair renames `from` to `to`
+    /// in every record where it appears.
     Rename { pairs: Vec<(String, String)> },
 }
 
+/// One key in a `sort-by` filter: a column name and a direction.
 #[derive(Debug, Clone)]
 pub struct SortKey {
     pub column: String,
     pub direction: SortDirection,
 }
 
+/// Sort direction for a [`SortKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
     Asc,
     Desc,
 }
 
+/// A boolean predicate over a [`Value::Record`], used by
+/// [`FilterSpec::Where`].
+///
+/// `Matches` is unanchored regex; `Contains` is plain substring;
+/// `Compare` is the family of `=`/`≠`/`<`/`≤`/`>`/`≥` with cross-type
+/// numeric coercion ([`Compare`](Predicate::Compare) on a string column
+/// vs a numeric value will try parsing the string side as a number).
+///
+/// `And`/`Or`/`Not` compose other predicates. The v0 UI doesn't yet
+/// expose a builder for them, but the data model supports them — they
+/// can be constructed programmatically.
 #[derive(Debug, Clone)]
 pub enum Predicate {
     Matches { column: String, pattern: String },
     Contains { column: String, substring: String },
-    Compare { column: String, op: CompareOp, value: Value },
+    Compare {
+        column: String,
+        op: CompareOp,
+        value: Value,
+    },
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
     Not(Box<Predicate>),
 }
 
+/// Comparison operator for [`Predicate::Compare`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     Eq,
@@ -61,6 +131,11 @@ pub enum CompareOp {
     Ge,
 }
 
+/// Errors produced by [`Filter::apply`]. These are *schema-level* —
+/// problems that prevent the pipeline from making sense at all
+/// (wrong upstream shape, bad regex, unknown column in the schema).
+/// Per-row data weirdness (a Null on a numeric Compare, etc.) is
+/// silently dropped by `where` and counted in [`FilterNotes`].
 #[derive(Debug, Error)]
 pub enum FilterError {
     #[error("filter expected bytes input, got structured value")]
@@ -87,22 +162,33 @@ pub enum FilterError {
     },
 }
 
+/// Trait implemented by [`FilterSpec`]: applies a filter to a
+/// [`PipelineValue`]. Errors here are schema-level (see
+/// [`FilterError`]); per-row drops by `where` are silent and surfaced
+/// via [`apply_with_notes`].
 pub trait Filter {
     fn apply(&self, input: PipelineValue) -> Result<PipelineValue, FilterError>;
 }
 
-/// Diagnostic counters reported alongside a filter's normal output. Currently
-/// only `error_drops` is non-zero, set by `where` when per-row evaluation hits
-/// a type mismatch (e.g. comparing a Null/non-numeric value against a number)
-/// — those rows are silently dropped, but the count is surfaced so the UI can
-/// flag what would otherwise be invisible row loss.
+/// Diagnostic counters reported alongside a filter's normal output.
+///
+/// Currently only `error_drops` is non-zero. It's set by `where` when
+/// per-row evaluation hits a type mismatch — e.g., a Compare against a
+/// Null cell, or a Matches against a non-string column. Those rows are
+/// silently dropped (matching SQL-style three-valued NULL handling),
+/// but the count is surfaced so the UI can flag what would otherwise
+/// be invisible row loss.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterNotes {
+    /// Rows silently dropped by `where` because the predicate errored
+    /// for that row.
     pub error_drops: usize,
 }
 
-/// Apply a filter and return its output plus diagnostic stats. Used by the UI
-/// to surface notes; `FilterSpec::apply` is just this with stats discarded.
+/// Apply a filter and return its output plus diagnostic stats. Used by
+/// the TUI to render an inline `ⓘ -N` annotation next to each filter
+/// that dropped rows; `FilterSpec::apply` is just this with the stats
+/// discarded.
 pub fn apply_with_notes(
     spec: &FilterSpec,
     input: PipelineValue,

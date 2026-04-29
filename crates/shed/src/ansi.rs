@@ -1,3 +1,23 @@
+//! ANSI escape parser for rendering captured PTY output.
+//!
+//! Programs running under shed's PTY emit ANSI escape sequences for color
+//! (SGR), cursor positioning, line clears, alt-screen, etc. This module
+//! walks the byte stream via `vte` and produces `ratatui::text::Line`s with
+//! `Span`s carrying the corresponding `Style`.
+//!
+//! What we honor:
+//! - SGR (CSI `m`): foreground/background colors (8-color, bright, 8-bit
+//!   indexed, 24-bit RGB), bold, dim, italic, underlined, reversed,
+//!   crossed-out.
+//! - `\n` starts a new line; `\r` is silently consumed (so PTY-emitted
+//!   `\r\n` collapses to `\n`); `\t` becomes a literal tab.
+//!
+//! What we drop:
+//! - Cursor positioning, line clears, scroll regions, alt-screen requests,
+//!   OSC sequences (window titles, hyperlinks, …) — anything that would
+//!   require a full terminal screen state. Programs that need that
+//!   (`top`, `vim`, `less`, …) trigger fullscreen handover instead.
+
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
