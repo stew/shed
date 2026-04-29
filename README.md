@@ -251,6 +251,23 @@ so you don't lose data without noticing.
 | Enter                | apply — commits the in-progress filter to the pipeline |
 | Esc                  | cancel — restores the saved filter, returns to BlockCursor |
 
+### EnvEdit (environment-variable editor)
+
+Triggered by `Ctrl-E` from the prompt. A scrollable list of every
+environment variable in shed's process, sorted by key, with edit /
+add / delete affordances. Changes are visible to subsequent spawned
+commands immediately.
+
+| Key                 | Action |
+|---------------------|--------|
+| `↑` / `↓` / `j`/`k` | navigate |
+| `/`                 | filter the list (case-insensitive substring on the key, live) |
+| `e` / Enter         | edit the selected var's value (input bar pre-fills with current) |
+| `a`                 | add a new var; type `KEY=VALUE`, Enter to commit |
+| `d` / Delete        | unset the selected var |
+| Esc                 | exit the input mode you're in (filter / edit / add); a second Esc / `q` leaves the editor |
+| Ctrl-D              | quit shed |
+
 ### BlockExpand (pager)
 
 Entered via `e` from BlockCursor. The selected block's full pipeline

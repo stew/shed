@@ -111,6 +111,49 @@ enum Focus {
     BlockCursor,
     FilterEdit,
     BlockExpand,
+    EnvEdit,
+}
+
+#[derive(Debug, Clone)]
+enum EnvInputMode {
+    None,
+    Filter,
+    Edit(String),
+    Add,
+}
+
+#[derive(Debug, Clone)]
+struct EnvEditState {
+    cursor: usize,
+    filter: String,
+    input_mode: EnvInputMode,
+    input_buffer: String,
+}
+
+impl EnvEditState {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            filter: String::new(),
+            input_mode: EnvInputMode::None,
+            input_buffer: String::new(),
+        }
+    }
+
+    /// Snapshot of `std::env::vars()` sorted by key, optionally filtered
+    /// by `self.filter` (case-insensitive substring on the key).
+    fn entries(&self) -> Vec<(String, String)> {
+        let mut all: Vec<(String, String)> = std::env::vars().collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        if self.filter.is_empty() {
+            all
+        } else {
+            let f = self.filter.to_lowercase();
+            all.into_iter()
+                .filter(|(k, _)| k.to_lowercase().contains(&f))
+                .collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,6 +1031,7 @@ struct App {
     write_input_mode: bool,
     write_input: String,
     last_cwd: Option<PathBuf>,
+    env_edit: Option<EnvEditState>,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
@@ -1027,6 +1071,7 @@ impl App {
             write_input_mode: false,
             write_input: String::new(),
             last_cwd: None,
+            env_edit: None,
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
@@ -1213,6 +1258,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::BlockCursor => handle_cursor_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
         Focus::BlockExpand => handle_block_expand_key(app, key),
+        Focus::EnvEdit => handle_env_edit_key(app, key),
     }
 }
 
@@ -1232,6 +1278,11 @@ fn cancel_at_cursor(app: &mut App) -> bool {
 }
 
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        app.env_edit = Some(EnvEditState::new());
+        app.focus = Focus::EnvEdit;
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
@@ -2154,6 +2205,129 @@ fn run_exit_builtin(app: &mut App) {
     app.quit = true;
 }
 
+fn handle_env_edit_key(app: &mut App, key: KeyEvent) {
+    let Some(state) = app.env_edit.as_mut() else {
+        app.focus = Focus::Prompt;
+        return;
+    };
+
+    match &state.input_mode {
+        EnvInputMode::Filter => {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    state.input_mode = EnvInputMode::None;
+                }
+                KeyCode::Char(c) => {
+                    state.filter.push(c);
+                    let len = state.entries().len();
+                    state.cursor = state.cursor.min(len.saturating_sub(1));
+                }
+                KeyCode::Backspace => {
+                    state.filter.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
+        EnvInputMode::Edit(_) | EnvInputMode::Add => {
+            match key.code {
+                KeyCode::Esc => {
+                    state.input_mode = EnvInputMode::None;
+                    state.input_buffer.clear();
+                }
+                KeyCode::Enter => {
+                    commit_env_input(app);
+                }
+                KeyCode::Char(c) => state.input_buffer.push(c),
+                KeyCode::Backspace => {
+                    state.input_buffer.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
+        EnvInputMode::None => {}
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.env_edit = None;
+            app.focus = Focus::Prompt;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.cursor = state.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let len = state.entries().len();
+            if len > 0 {
+                state.cursor = (state.cursor + 1).min(len - 1);
+            }
+        }
+        KeyCode::Char('/') => {
+            state.input_mode = EnvInputMode::Filter;
+        }
+        KeyCode::Char('a') => {
+            state.input_mode = EnvInputMode::Add;
+            state.input_buffer.clear();
+        }
+        KeyCode::Char('e') | KeyCode::Enter => {
+            let entries = state.entries();
+            if let Some((k, v)) = entries.get(state.cursor) {
+                state.input_mode = EnvInputMode::Edit(k.clone());
+                state.input_buffer = v.clone();
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            let entries = state.entries();
+            if let Some((k, _)) = entries.get(state.cursor) {
+                let k = k.clone();
+                // SAFETY: see export builtin's note.
+                unsafe {
+                    std::env::remove_var(&k);
+                }
+                let new_len = state.entries().len();
+                state.cursor = state.cursor.min(new_len.saturating_sub(1));
+                app.flash = Some(format!("unset {k}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn commit_env_input(app: &mut App) {
+    let Some(state) = app.env_edit.as_mut() else {
+        return;
+    };
+    let mode = std::mem::replace(&mut state.input_mode, EnvInputMode::None);
+    let buffer = std::mem::take(&mut state.input_buffer);
+    let flash = match mode {
+        EnvInputMode::Edit(key) => {
+            // SAFETY: see export builtin's note.
+            unsafe {
+                std::env::set_var(&key, &buffer);
+            }
+            Some(format!("set {key}={buffer}"))
+        }
+        EnvInputMode::Add => match buffer.split_once('=') {
+            Some((k, v)) if !k.is_empty() => {
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+                Some(format!("set {k}={v}"))
+            }
+            _ => {
+                state.input_buffer = buffer;
+                state.input_mode = EnvInputMode::Add;
+                Some("expected KEY=VALUE".into())
+            }
+        },
+        _ => None,
+    };
+    if let Some(msg) = flash {
+        app.flash = Some(msg);
+    }
+}
+
 /// `export KEY=VALUE [KEY=VALUE ...]` sets one or more environment vars in
 /// shed's process; subsequent spawned commands inherit them. Bare `export
 /// KEY` (without `=`) is rejected — shed doesn't have POSIX's marked-for-
@@ -2231,7 +2405,124 @@ fn draw(f: &mut Frame, app: &App) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
         Focus::BlockExpand => draw_block_expand(f, app),
+        Focus::EnvEdit => draw_env_edit(f, app),
         _ => draw_repl(f, app),
+    }
+}
+
+fn draw_env_edit(f: &mut Frame, app: &App) {
+    let Some(state) = app.env_edit.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let entries = state.entries();
+    let total = entries.len();
+    let title = if state.filter.is_empty() {
+        format!("env  ({total} vars)")
+    } else {
+        format!("env  ({total} vars · filter \"{}\")", state.filter)
+    };
+    draw_header(f, chunks[0], &title);
+
+    // Body: scrollable list with cursor following
+    let body_area = chunks[1];
+    let visible = body_area.height as usize;
+    let cursor = state.cursor.min(total.saturating_sub(1));
+    let scroll_offset = if cursor >= visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::LightCyan);
+    let val_style = Style::default().fg(Color::Gray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, (k, v)) in entries.iter().enumerate().skip(scroll_offset).take(visible) {
+        let selected = i == cursor;
+        let prefix = if selected { "▸ " } else { "  " };
+        let mut spans = vec![
+            Span::styled(prefix, if selected { highlight } else { dim }),
+            Span::styled(k.clone(), if selected { highlight } else { key_style }),
+            Span::styled(" = ", dim),
+            Span::styled(v.clone(), if selected { highlight } else { val_style }),
+        ];
+        if selected {
+            spans.insert(0, Span::raw(""));
+        }
+        lines.push(Line::from(spans));
+    }
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "  (no matching vars)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, body_area);
+
+    // Status bar / input prompt
+    match &state.input_mode {
+        EnvInputMode::Filter => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.filter.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::Edit(key) => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("edit {key}: "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.input_buffer.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::Add => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "add KEY=VALUE: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.input_buffer.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::None => draw_status(f, chunks[2], app),
     }
 }
 
@@ -2826,7 +3117,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Focus::FilterEdit | Focus::BlockExpand => Line::from(""),
+        Focus::FilterEdit | Focus::BlockExpand | Focus::EnvEdit => Line::from(""),
     };
     let widget = Paragraph::new(line).block(border);
     f.render_widget(widget, area);
@@ -3418,6 +3709,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Enter", "run"),
             ("↑↓", "history"),
             ("!cmd", "fullscreen"),
+            ("Ctrl-E", "env"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
@@ -3447,6 +3739,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("/?", "search f/b"),
             ("n/N", "next/prev"),
             ("i", "case"),
+            ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::EnvEdit => vec![
+            ("↑↓", "nav"),
+            ("/", "filter"),
+            ("e/Enter", "edit"),
+            ("a", "add"),
+            ("d", "delete"),
             ("Esc / q", "back"),
             ("Ctrl-D", "quit"),
         ],
