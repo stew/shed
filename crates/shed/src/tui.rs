@@ -64,11 +64,12 @@ struct FilterEditState {
     where_pattern: String,
     available_columns: Vec<String>,
     field: FormField,
+    editing_index: Option<usize>,
 }
 
 impl FilterEditState {
-    fn from_block(block: &Block) -> Self {
-        let available_columns = compute_schema(block);
+    fn for_add(block: &Block) -> Self {
+        let available_columns = compute_schema_at(block, block.pipeline.len());
         let kind = if available_columns.is_empty() {
             FilterKind::FromLines
         } else {
@@ -81,6 +82,40 @@ impl FilterEditState {
             where_pattern: String::new(),
             available_columns,
             field: FormField::Kind,
+            editing_index: None,
+        }
+    }
+
+    fn for_edit(block: &Block, index: usize) -> Self {
+        let available_columns = compute_schema_at(block, index);
+        let (kind, where_column, where_pattern) = match block.pipeline.get(index) {
+            Some(FilterSpec::FromLines) => (FilterKind::FromLines, 0, String::new()),
+            Some(FilterSpec::Where {
+                predicate: Predicate::Matches { column, pattern },
+            }) => {
+                let col_idx = available_columns
+                    .iter()
+                    .position(|c| c == column)
+                    .unwrap_or(0);
+                (FilterKind::Where, col_idx, pattern.clone())
+            }
+            Some(FilterSpec::Where { .. }) | None => {
+                let kind = if available_columns.is_empty() {
+                    FilterKind::FromLines
+                } else {
+                    FilterKind::Where
+                };
+                (kind, 0, String::new())
+            }
+        };
+        Self {
+            block_id: block.id,
+            kind,
+            where_column,
+            where_pattern,
+            available_columns,
+            field: FormField::Kind,
+            editing_index: Some(index),
         }
     }
 
@@ -140,12 +175,12 @@ impl FilterEditState {
     }
 }
 
-fn compute_schema(block: &Block) -> Vec<String> {
+fn compute_schema_at(block: &Block, before_index: usize) -> Vec<String> {
     let Some(capture) = &block.capture else {
         return Vec::new();
     };
     let mut value = PipelineValue::Bytes(capture.stdout.clone());
-    for filter in &block.pipeline {
+    for filter in block.pipeline.iter().take(before_index) {
         match filter.apply(value) {
             Ok(v) => value = v,
             Err(_) => return Vec::new(),
@@ -168,6 +203,7 @@ struct App {
     prompt: String,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
+    pipeline_cursor: usize,
     flash: Option<String>,
     quit: bool,
 }
@@ -179,6 +215,7 @@ impl App {
             prompt: String::new(),
             focus: Focus::Prompt,
             filter_edit: None,
+            pipeline_cursor: 0,
             flash: None,
             quit: false,
         }
@@ -200,7 +237,24 @@ impl App {
         if let Some(i) = ids.iter().position(|id| *id == cur) {
             let new_i = (i as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize;
             self.session.set_cursor(Some(ids[new_i]));
+            self.reset_pipeline_cursor();
         }
+    }
+
+    fn reset_pipeline_cursor(&mut self) {
+        self.pipeline_cursor = self
+            .session
+            .cursor()
+            .and_then(|id| self.session.block(id))
+            .map(|b| b.pipeline.len())
+            .unwrap_or(0);
+    }
+
+    fn cursor_block_pipeline_len(&self) -> Option<usize> {
+        self.session
+            .cursor()
+            .and_then(|id| self.session.block(id))
+            .map(|b| b.pipeline.len())
     }
 }
 
@@ -248,6 +302,7 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
                 app.session.set_cursor(Some(id));
+                app.reset_pipeline_cursor();
                 app.focus = Focus::BlockCursor;
             } else {
                 app.flash = Some("no blocks yet".into());
@@ -270,10 +325,21 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Up => app.move_cursor(-1),
         KeyCode::Down => app.move_cursor(1),
+        KeyCode::Left => move_filter_cursor(app, -1),
+        KeyCode::Right => move_filter_cursor(app, 1),
         KeyCode::Char('f') | KeyCode::Enter => open_filter_edit(app),
-        KeyCode::Char('d') => drop_last_filter(app),
+        KeyCode::Char('d') => drop_filter_at_cursor(app),
         _ => {}
     }
+}
+
+fn move_filter_cursor(app: &mut App, delta: i32) {
+    let Some(len) = app.cursor_block_pipeline_len() else {
+        return;
+    };
+    let max = len as i32;
+    let new = (app.pipeline_cursor as i32 + delta).clamp(0, max) as usize;
+    app.pipeline_cursor = new;
 }
 
 fn open_filter_edit(app: &mut App) {
@@ -283,7 +349,12 @@ fn open_filter_edit(app: &mut App) {
     let Some(block) = app.session.block(id) else {
         return;
     };
-    app.filter_edit = Some(FilterEditState::from_block(block));
+    let state = if app.pipeline_cursor < block.pipeline.len() {
+        FilterEditState::for_edit(block, app.pipeline_cursor)
+    } else {
+        FilterEditState::for_add(block)
+    };
+    app.filter_edit = Some(state);
     app.focus = Focus::FilterEdit;
 }
 
@@ -343,19 +414,45 @@ fn apply_filter_edit(app: &mut App) {
         return;
     };
     let id = state.block_id;
+    let editing_index = state.editing_index;
     if let Some(block) = app.session.block_mut(id) {
-        block.pipeline.push(spec);
+        match editing_index {
+            None => block.pipeline.push(spec),
+            Some(i) if i < block.pipeline.len() => block.pipeline[i] = spec,
+            Some(_) => block.pipeline.push(spec),
+        }
     }
     app.filter_edit = None;
     app.focus = Focus::BlockCursor;
+    app.reset_pipeline_cursor();
 }
 
-fn drop_last_filter(app: &mut App) {
+fn drop_filter_at_cursor(app: &mut App) {
     let Some(id) = app.session.cursor() else { return };
-    if let Some(block) = app.session.block_mut(id) {
-        if block.pipeline.pop().is_none() {
-            app.flash = Some("no filters to drop".into());
+    let cursor = app.pipeline_cursor;
+    let dropped = if let Some(block) = app.session.block_mut(id) {
+        if block.pipeline.is_empty() {
+            false
+        } else if cursor < block.pipeline.len() {
+            block.pipeline.remove(cursor);
+            true
+        } else {
+            block.pipeline.pop();
+            true
         }
+    } else {
+        false
+    };
+    if !dropped {
+        app.flash = Some("no filters to drop".into());
+    }
+    let new_len = app
+        .session
+        .block(id)
+        .map(|b| b.pipeline.len())
+        .unwrap_or(0);
+    if app.pipeline_cursor > new_len {
+        app.pipeline_cursor = new_len;
     }
 }
 
@@ -416,7 +513,12 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
         return;
     };
 
-    let stack_height = (block.pipeline.len() + 1) as u16 + 2;
+    let stack_rows = if state.editing_index.is_some() {
+        block.pipeline.len()
+    } else {
+        block.pipeline.len() + 1
+    };
+    let stack_height = stack_rows.max(1) as u16 + 2;
     let form_height = (state.fields().len() as u16) + 2;
 
     let chunks = Layout::default()
@@ -462,13 +564,22 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     for block in app.session.blocks() {
         let selected = cursor_visible && cursor_id == Some(block.id);
-        lines.extend(render_block(block, selected));
+        let pipeline_cursor = if selected {
+            Some(app.pipeline_cursor)
+        } else {
+            None
+        };
+        lines.extend(render_block(block, selected, pipeline_cursor));
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
-fn render_block(block: &Block, selected: bool) -> Vec<Line<'static>> {
+fn render_block(
+    block: &Block,
+    selected: bool,
+    pipeline_cursor: Option<usize>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     let glyph = match &block.state {
@@ -510,8 +621,8 @@ fn render_block(block: &Block, selected: bool) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(header));
 
-    if !block.pipeline.is_empty() {
-        lines.push(pipeline_line(&block.pipeline));
+    if !block.pipeline.is_empty() || pipeline_cursor.is_some() {
+        lines.push(pipeline_line(&block.pipeline, pipeline_cursor));
     }
 
     lines.extend(render_block_preview(block));
@@ -543,16 +654,32 @@ fn render_block(block: &Block, selected: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn pipeline_line(pipeline: &[FilterSpec]) -> Line<'static> {
+fn pipeline_line(pipeline: &[FilterSpec], selected: Option<usize>) -> Line<'static> {
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::LightCyan);
+    let dim = Style::default().fg(Color::DarkGray);
+
     let mut spans = vec![Span::raw("      ")];
     for (i, f) in pipeline.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(" │ ", dim));
         }
-        spans.push(Span::styled(
-            describe_filter(f),
-            Style::default().fg(Color::LightCyan),
-        ));
+        let style = if selected == Some(i) { highlight } else { normal };
+        spans.push(Span::styled(format!(" {} ", describe_filter(f)), style));
+    }
+    if selected.is_some() {
+        if !pipeline.is_empty() {
+            spans.push(Span::styled(" │ ", dim));
+        }
+        let style = if selected == Some(pipeline.len()) {
+            highlight
+        } else {
+            dim
+        };
+        spans.push(Span::styled(" + add ", style));
     }
     Line::from(spans)
 }
@@ -778,8 +905,10 @@ fn compute_preview_lines(
         ))];
     };
     let mut hypothetical: Vec<FilterSpec> = block.pipeline.clone();
-    if let Some(spec) = state.build_filter() {
-        hypothetical.push(spec);
+    match (state.editing_index, state.build_filter()) {
+        (None, Some(spec)) => hypothetical.push(spec),
+        (Some(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
+        _ => {}
     }
     let value = apply_pipeline(&capture.stdout, &hypothetical);
     match value {
@@ -806,38 +935,43 @@ fn draw_stack_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEditS
     let inner = block_widget.inner(area);
     f.render_widget(block_widget, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, spec) in block.pipeline.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {} ", circled(i + 1)),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                describe_filter(spec),
-                Style::default().fg(Color::LightCyan),
-            ),
-        ]));
-    }
     let active_label = match state.build_filter() {
         Some(spec) => describe_filter(&spec),
         None => format!("{} (incomplete)", state.kind.name()),
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {} ", circled(block.pipeline.len() + 1)),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            active_label,
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ← editing", Style::default().fg(Color::DarkGray)),
-    ]));
+    let edit_style = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let normal = Style::default().fg(Color::LightCyan);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, spec) in block.pipeline.iter().enumerate() {
+        let is_editing_here = state.editing_index == Some(i);
+        let (label, style, suffix) = if is_editing_here {
+            (active_label.clone(), edit_style, Some("  ← editing"))
+        } else {
+            (describe_filter(spec), normal, None)
+        };
+        let mut spans = vec![
+            Span::styled(format!("  {} ", circled(i + 1)), dim),
+            Span::styled(label, style),
+        ];
+        if let Some(s) = suffix {
+            spans.push(Span::styled(s, dim));
+        }
+        lines.push(Line::from(spans));
+    }
+    if state.editing_index.is_none() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {} ", circled(block.pipeline.len() + 1)),
+                edit_style,
+            ),
+            Span::styled(active_label, edit_style),
+            Span::styled("  ← editing", dim),
+        ]));
+    }
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
@@ -978,9 +1112,10 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Ctrl-D", "quit"),
         ],
         Focus::BlockCursor => vec![
-            ("↑↓", "navigate"),
-            ("f", "add filter"),
-            ("d", "drop last"),
+            ("↑↓", "blocks"),
+            ("←→", "filters"),
+            ("f", "add/edit"),
+            ("d", "drop"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
         ],
@@ -1037,28 +1172,45 @@ mod tests {
     #[test]
     fn schema_empty_for_bytes_input() {
         let block = block_with_stdout(b"a\nb\nc\n");
-        assert!(compute_schema(&block).is_empty());
+        assert!(compute_schema_at(&block, 0).is_empty());
     }
 
     #[test]
     fn schema_has_line_after_from_lines() {
         let mut block = block_with_stdout(b"a\nb\nc\n");
         block.pipeline.push(FilterSpec::FromLines);
-        assert_eq!(compute_schema(&block), vec!["line".to_string()]);
+        assert_eq!(compute_schema_at(&block, 1), vec!["line".to_string()]);
+    }
+
+    #[test]
+    fn schema_at_index_uses_filters_before_only() {
+        let mut block = block_with_stdout(b"a\nb\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Where {
+            predicate: Predicate::Matches {
+                column: "line".into(),
+                pattern: "a".into(),
+            },
+        });
+        // Schema BEFORE the where filter — only from-lines applied.
+        assert_eq!(compute_schema_at(&block, 1), vec!["line".to_string()]);
+        // Schema BEFORE from-lines — bytes, no schema.
+        assert!(compute_schema_at(&block, 0).is_empty());
     }
 
     #[test]
     fn filter_edit_state_picks_parser_when_input_is_bytes() {
         let block = block_with_stdout(b"a\nb\nc\n");
-        let state = FilterEditState::from_block(&block);
+        let state = FilterEditState::for_add(&block);
         assert_eq!(state.kind, FilterKind::FromLines);
+        assert_eq!(state.editing_index, None);
     }
 
     #[test]
     fn filter_edit_state_picks_where_when_schema_available() {
         let mut block = block_with_stdout(b"a\nb\nc\n");
         block.pipeline.push(FilterSpec::FromLines);
-        let state = FilterEditState::from_block(&block);
+        let state = FilterEditState::for_add(&block);
         assert_eq!(state.kind, FilterKind::Where);
         assert_eq!(state.available_columns, vec!["line".to_string()]);
     }
@@ -1066,9 +1218,8 @@ mod tests {
     #[test]
     fn build_filter_for_where_requires_column() {
         let block = block_with_stdout(b"a\n");
-        let mut state = FilterEditState::from_block(&block);
+        let mut state = FilterEditState::for_add(&block);
         state.kind = FilterKind::Where;
-        // No columns available
         assert!(state.build_filter().is_none());
     }
 
@@ -1076,11 +1227,38 @@ mod tests {
     fn cycle_kind_changes_filter_type() {
         let mut block = block_with_stdout(b"a\n");
         block.pipeline.push(FilterSpec::FromLines);
-        let mut state = FilterEditState::from_block(&block);
+        let mut state = FilterEditState::for_add(&block);
         assert_eq!(state.kind, FilterKind::Where);
         state.cycle_kind(1);
         assert_eq!(state.kind, FilterKind::FromLines);
         state.cycle_kind(1);
         assert_eq!(state.kind, FilterKind::Where);
+    }
+
+    #[test]
+    fn for_edit_prepopulates_from_existing_where() {
+        let mut block = block_with_stdout(b"a\nb\nbb\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Where {
+            predicate: Predicate::Matches {
+                column: "line".into(),
+                pattern: "bb".into(),
+            },
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::Where);
+        assert_eq!(state.editing_index, Some(1));
+        assert_eq!(state.where_pattern, "bb");
+        assert_eq!(state.available_columns, vec!["line".to_string()]);
+        assert_eq!(state.selected_column(), Some("line"));
+    }
+
+    #[test]
+    fn for_edit_prepopulates_from_existing_from_lines() {
+        let mut block = block_with_stdout(b"x\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        let state = FilterEditState::for_edit(&block, 0);
+        assert_eq!(state.kind, FilterKind::FromLines);
+        assert_eq!(state.editing_index, Some(0));
     }
 }
