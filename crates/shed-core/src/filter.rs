@@ -228,6 +228,7 @@ fn apply_from_csv(
     let bytes = require_bytes(input)?;
     let mut builder = csv::ReaderBuilder::new();
     builder.has_headers(has_header);
+    builder.flexible(true);
     if delim.is_ascii() {
         builder.delimiter(delim as u8);
     }
@@ -748,6 +749,25 @@ mod tests {
         };
         assert_eq!(first.get("_1"), Some(&Value::String("alice".into())));
         assert_eq!(first.get("_2"), Some(&Value::String("30".into())));
+    }
+
+    #[test]
+    fn from_csv_is_flexible_about_field_count() {
+        // Some rows have extra/missing fields. flexible(true) lets the parse
+        // succeed; downstream filters can deal with the variance.
+        let result = FilterSpec::FromCsv {
+            delim: ',',
+            has_header: true,
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "a,b\n1,2\n3\n4,5,6\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 3);
     }
 
     #[test]

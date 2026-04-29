@@ -864,11 +864,14 @@ fn drop_filter_at_cursor(app: &mut App) {
 }
 
 async fn run_prompt(app: &mut App) {
-    let argv: Vec<String> = app
-        .prompt
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let trimmed = app.prompt.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Some(argv) = shlex::split(trimmed) else {
+        app.flash = Some("unmatched quote".into());
+        return;
+    };
     if argv.is_empty() {
         return;
     }
