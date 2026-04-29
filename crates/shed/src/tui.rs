@@ -413,10 +413,25 @@ fn render_pipeline_value(value: PipelineValue) -> Vec<Line<'static>> {
         PipelineValue::Structured(Value::List(items)) => {
             let mut out = Vec::new();
             let total = items.len();
+
+            let columns = schema_of(&items);
+            if !columns.is_empty() {
+                let header_text = columns.join("   ");
+                out.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(
+                        header_text,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    ),
+                ]));
+            }
+
             for item in items.iter().take(PREVIEW_LINES) {
                 out.push(Line::from(vec![
                     Span::raw("      "),
-                    Span::raw(format_record_or_value(item)),
+                    Span::raw(format_row(item, &columns)),
                 ]));
             }
             if total > PREVIEW_LINES {
@@ -440,20 +455,26 @@ fn render_pipeline_value(value: PipelineValue) -> Vec<Line<'static>> {
     }
 }
 
-fn format_record_or_value(v: &Value) -> String {
+fn schema_of(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .find_map(|v| match v {
+            Value::Record(r) => Some(r.keys().cloned().collect()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn format_row(v: &Value, columns: &[String]) -> String {
     match v {
-        Value::Record(r) => {
-            if r.len() == 1 {
-                if let Some((_, Value::String(s))) = r.iter().next() {
-                    return s.clone();
-                }
-            }
-            let parts: Vec<String> = r
-                .iter()
-                .map(|(k, v)| format!("{k}={}", format_scalar(v)))
-                .collect();
-            parts.join("  ")
-        }
+        Value::Record(r) => columns
+            .iter()
+            .map(|c| match r.get(c) {
+                Some(val) => format_scalar(val),
+                None => "—".into(),
+            })
+            .collect::<Vec<_>>()
+            .join("   "),
         other => format_scalar(other),
     }
 }
