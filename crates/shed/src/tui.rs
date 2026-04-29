@@ -4909,9 +4909,18 @@ fn draw_header(f: &mut Frame, area: Rect, title: &str) {
 fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
     let cursor_id = app.session.cursor();
     let cursor_visible = app.focus != Focus::Prompt;
+    let separator = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut first = true;
     for block in app.session.blocks() {
+        if !first {
+            lines.push(separator.clone());
+        }
+        first = false;
         let selected = cursor_visible && cursor_id == Some(block.id);
         let pipeline_cursor = if selected {
             Some(app.pipeline_cursor)
@@ -4956,42 +4965,54 @@ fn render_block(
         BlockState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
         BlockState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
     };
-    let id_style = if selected {
-        Style::default()
+    // Identifier: pinned blocks render as `@name`, unpinned as `%id`.
+    let (id_text, pinned) = match &block.name {
+        Some(name) => (format!(" @{name} "), true),
+        None => (format!(" %{} ", block.id.0), false),
+    };
+    let id_style = match (selected, pinned) {
+        (true, true) => Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        (false, true) => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (false, false) => Style::default().fg(Color::Cyan),
     };
     let prefix = if selected { "▸ " } else { "  " };
     let mut header = vec![
         Span::raw(prefix),
-        Span::styled(format!(" %{} ", block.id.0), id_style),
+        Span::styled(id_text, id_style),
         Span::raw(" "),
         glyph,
-        Span::raw(" "),
-        Span::styled(
+    ];
+    // Show the command + each pipeline filter only when the block is
+    // selected. Non-selected blocks render as a compact `id glyph + output`
+    // row — the user reaches details by navigating onto the block.
+    if selected {
+        header.push(Span::raw(" "));
+        header.push(Span::styled(
             block.argv.join(" "),
             if command_focused {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Magenta)
                     .add_modifier(Modifier::BOLD)
-            } else if selected {
-                Style::default().add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().add_modifier(Modifier::BOLD)
             },
-        ),
-    ];
-    // Inline pipeline filters: command │ from-fields │ where … │ + add
-    // When command_focused is true the cursor is on the argv; treat the
-    // pipeline as unfocused so no filter wears the magenta highlight and
-    // the `+ add` slot is suppressed.
-    let effective_cursor = if command_focused { None } else { pipeline_cursor };
-    let show_pipeline = !block.pipeline.is_empty() || effective_cursor.is_some();
-    if show_pipeline {
+        ));
+        lines.push(Line::from(header));
+
+        // Each filter on its own line. When command_focused is true the
+        // pipeline cursor is treated as None so no filter wears the
+        // active-magenta highlight and the `+ add` slot is suppressed.
+        let effective_cursor = if command_focused { None } else { pipeline_cursor };
         let highlight = Style::default()
             .fg(Color::Black)
             .bg(Color::Magenta)
@@ -4999,37 +5020,40 @@ fn render_block(
         let normal = Style::default().fg(Color::LightCyan);
         let dim = Style::default().fg(Color::DarkGray);
         let warn = Style::default().fg(Color::Yellow);
+        let indent = "       ";
 
         for (i, f) in block.pipeline.iter().enumerate() {
-            header.push(Span::styled(" │ ", dim));
             let style = if effective_cursor == Some(i) {
                 highlight
             } else {
                 normal
             };
-            header.push(Span::styled(format!(" {} ", describe_filter(f)), style));
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled("│ ", dim),
+                Span::styled(format!(" {} ", describe_filter(f)), style),
+            ];
             let n = drops.get(i).copied().unwrap_or(0);
             if n > 0 {
-                header.push(Span::styled(format!(" ⓘ-{n}"), warn));
+                spans.push(Span::styled(format!("  ⓘ-{n}"), warn));
             }
+            lines.push(Line::from(spans));
         }
         if effective_cursor.is_some() {
-            header.push(Span::styled(" │ ", dim));
             let style = if effective_cursor == Some(block.pipeline.len()) {
                 highlight
             } else {
                 dim
             };
-            header.push(Span::styled(" + add ", style));
+            lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled("│ ", dim),
+                Span::styled(" + add ", style),
+            ]));
         }
+    } else {
+        lines.push(Line::from(header));
     }
-    if let Some(name) = &block.name {
-        header.push(Span::styled(
-            format!("  ◉ {name}"),
-            Style::default().fg(Color::Magenta),
-        ));
-    }
-    lines.push(Line::from(header));
 
     match pipeline_outcome {
         Some(Ok((value, _))) => lines.extend(render_pipeline_value(value)),
@@ -5096,7 +5120,6 @@ fn render_block(
         lines.extend(render_note_lines(text));
     }
 
-    lines.push(Line::from(""));
     lines
 }
 
@@ -6064,11 +6087,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 "edit cmd: ",
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(app.cmd_edit_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Magenta)),
+            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
         ]))
         .style(Style::default().bg(Color::DarkGray));
         f.render_widget(widget, area);
@@ -6104,11 +6127,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 "alias name: ",
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(app.alias_name_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Magenta)),
+            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
         ]))
         .style(Style::default().bg(Color::DarkGray));
         f.render_widget(widget, area);
@@ -6120,11 +6143,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 "pin name: ",
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(Color::LightMagenta)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(app.pin_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Magenta)),
+            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
         ]))
         .style(Style::default().bg(Color::DarkGray));
         f.render_widget(widget, area);
