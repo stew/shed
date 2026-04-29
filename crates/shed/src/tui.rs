@@ -1994,6 +1994,8 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab => state.cycle_field(1),
         KeyCode::BackTab => state.cycle_field(-1),
+        KeyCode::Up if !is_multiline_field(state.field) => state.cycle_field(-1),
+        KeyCode::Down if !is_multiline_field(state.field) => state.cycle_field(1),
         KeyCode::Enter => apply_filter_edit(app),
         _ => match state.field {
             FormField::Kind => handle_kind_key(state, key),
@@ -2013,6 +2015,44 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::DelimText => handle_delim_text_key(state, key),
         },
     }
+}
+
+fn is_multiline_field(field: FormField) -> bool {
+    matches!(
+        field,
+        FormField::SortKeys | FormField::RenameMap | FormField::Columns
+    )
+}
+
+fn filter_edit_field_hints(field: FormField) -> Vec<(&'static str, &'static str)> {
+    use FormField::*;
+    let mut hints: Vec<(&'static str, &'static str)> = match field {
+        Kind => vec![("←→", "kind")],
+        Column => vec![("←→", "column")],
+        Op => vec![("←→", "op")],
+        Pattern => vec![("type", "value")],
+        N => vec![("0-9", "digits")],
+        Columns => vec![("↑↓", "cursor"), ("Space", "toggle")],
+        CsvDelim => vec![("←→", "delim")],
+        CsvHasHeader => vec![("←→/Space", "toggle")],
+        RegexPattern => vec![("type", "regex")],
+        SortKeys => vec![
+            ("↑↓", "row"),
+            ("←→", "column"),
+            ("Space", "asc/desc"),
+            ("a", "add"),
+            ("x", "remove"),
+        ],
+        RenameMap => vec![("↑↓", "row"), ("type", "name")],
+        WhereCombine => vec![("←→/Space", "AND/OR")],
+        WhereClauseSelect => vec![("←→", "clause"), ("a", "add"), ("x", "remove")],
+        TargetColumn => vec![("←→", "column")],
+        DelimText => vec![("type", "delim")],
+    };
+    hints.push(("Tab", "next field"));
+    hints.push(("Enter", "apply"));
+    hints.push(("Esc", "cancel"));
+    hints
 }
 
 fn handle_target_column_key(state: &mut FilterEditState, key: KeyEvent) {
@@ -4055,12 +4095,14 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::FilterEdit => vec![
-            ("Tab", "next field"),
-            ("←→", "cycle"),
-            ("Enter", "apply"),
-            ("Esc", "cancel"),
-        ],
+        Focus::FilterEdit => {
+            let field = app
+                .filter_edit
+                .as_ref()
+                .map(|s| s.field)
+                .unwrap_or(FormField::Kind);
+            filter_edit_field_hints(field)
+        }
         Focus::BlockExpand => vec![
             ("↑↓ / jk", "scroll"),
             ("PgUp/Dn", "page"),
