@@ -27,6 +27,7 @@ pub async fn run_command(argv: &[String], cap_bytes: usize) -> Result<Capture, E
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|source| ExecError::Spawn {
             program: argv[0].clone(),

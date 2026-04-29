@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
@@ -10,11 +11,14 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Block, BlockId, BlockState, CompareOp, Filter, FilterSpec, PipelineValue, Predicate, Session,
-    SortDirection, SortKey, Value,
+    Block, BlockId, BlockState, Capture, CompareOp, Filter, FilterSpec, PipelineValue, Predicate,
+    Session, SortDirection, SortKey, Value,
 };
+use tokio::task::JoinHandle;
 
-use crate::exec::run_command;
+use crate::exec::{ExecError, run_command};
+
+type CommandTask = JoinHandle<Result<Capture, ExecError>>;
 
 const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -616,6 +620,17 @@ struct App {
     pipeline_cursor: usize,
     flash: Option<String>,
     quit: bool,
+    running: HashMap<BlockId, CommandTask>,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Aborting JoinHandles drops each task's locals (the tokio Child),
+        // and Child has kill_on_drop(true), so child processes get killed too.
+        for (_, handle) in self.running.drain() {
+            handle.abort();
+        }
+    }
 }
 
 impl App {
@@ -628,6 +643,7 @@ impl App {
             pipeline_cursor: 0,
             flash: None,
             quit: false,
+            running: HashMap::new(),
         }
     }
 
@@ -678,6 +694,7 @@ pub async fn run() -> io::Result<()> {
 async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
     loop {
+        reap_completed(&mut app).await;
         terminal.draw(|f| draw(f, &app))?;
         if app.quit {
             return Ok(());
@@ -686,14 +703,43 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.flash = None;
-                    handle_key(&mut app, key).await;
+                    handle_key(&mut app, key);
                 }
             }
         }
     }
 }
 
-async fn handle_key(app: &mut App, key: KeyEvent) {
+async fn reap_completed(app: &mut App) {
+    let finished_ids: Vec<BlockId> = app
+        .running
+        .iter()
+        .filter(|(_, h)| h.is_finished())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in finished_ids {
+        let Some(handle) = app.running.remove(&id) else {
+            continue;
+        };
+        match handle.await {
+            Ok(Ok(capture)) => {
+                let exit = capture.exit_code.unwrap_or(-1);
+                app.session.set_capture(id, capture);
+                app.session.set_state(id, BlockState::Done(exit));
+            }
+            Ok(Err(e)) => {
+                app.session.set_state(id, BlockState::Failed(e.to_string()));
+            }
+            Err(e) => {
+                app.session
+                    .set_state(id, BlockState::Failed(format!("task error: {e}")));
+            }
+        }
+        app.session.evict_to_fit();
+    }
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
     {
@@ -701,13 +747,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match app.focus {
-        Focus::Prompt => handle_prompt_key(app, key).await,
+        Focus::Prompt => handle_prompt_key(app, key),
         Focus::BlockCursor => handle_cursor_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
     }
 }
 
-async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
+fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
@@ -722,7 +768,7 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             app.prompt.pop();
         }
-        KeyCode::Enter => run_prompt(app).await,
+        KeyCode::Enter => spawn_prompt(app),
         _ => {}
     }
 }
@@ -957,7 +1003,7 @@ fn drop_filter_at_cursor(app: &mut App) {
     }
 }
 
-async fn run_prompt(app: &mut App) {
+fn spawn_prompt(app: &mut App) {
     let trimmed = app.prompt.trim();
     if trimmed.is_empty() {
         return;
@@ -971,18 +1017,8 @@ async fn run_prompt(app: &mut App) {
     }
     app.prompt.clear();
     let id = app.session.add_block(argv.clone());
-
-    match run_command(&argv, CAPTURE_CAP).await {
-        Ok(capture) => {
-            let exit = capture.exit_code.unwrap_or(-1);
-            app.session.set_capture(id, capture);
-            app.session.set_state(id, BlockState::Done(exit));
-        }
-        Err(e) => {
-            app.session.set_state(id, BlockState::Failed(e.to_string()));
-        }
-    }
-    app.session.evict_to_fit();
+    let handle = tokio::spawn(async move { run_command(&argv, CAPTURE_CAP).await });
+    app.running.insert(id, handle);
 }
 
 fn draw(f: &mut Frame, app: &App) {
