@@ -903,6 +903,7 @@ struct App {
     search_query: String,
     search_input: String,
     search_input_mode: bool,
+    search_anchor_scroll: usize,
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
@@ -934,6 +935,7 @@ impl App {
             search_query: String::new(),
             search_input: String::new(),
             search_input_mode: false,
+            search_anchor_scroll: 0,
             flash: None,
             quit: false,
             running: HashMap::new(),
@@ -1152,11 +1154,20 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc => {
                 app.search_input_mode = false;
                 app.search_input.clear();
+                app.search_query.clear();
+                app.expand_scroll = app.search_anchor_scroll;
             }
-            KeyCode::Enter => commit_search(app),
-            KeyCode::Char(c) => app.search_input.push(c),
+            KeyCode::Enter => {
+                app.search_input_mode = false;
+                // search_query is already in sync via update_search; nothing to do.
+            }
+            KeyCode::Char(c) => {
+                app.search_input.push(c);
+                update_search(app);
+            }
             KeyCode::Backspace => {
                 app.search_input.pop();
+                update_search(app);
             }
             _ => {}
         }
@@ -1181,6 +1192,8 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('/') => {
             app.search_input_mode = true;
             app.search_input.clear();
+            app.search_query.clear();
+            app.search_anchor_scroll = app.expand_scroll;
         }
         KeyCode::Char('n') => jump_to_search(app, true),
         KeyCode::Char('N') => jump_to_search(app, false),
@@ -1206,19 +1219,26 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn commit_search(app: &mut App) {
-    let q = std::mem::take(&mut app.search_input);
-    app.search_input_mode = false;
-    if q.is_empty() {
-        app.search_query.clear();
+/// Live-update the active search as the user types. Keeps `search_query`
+/// in sync with `search_input`, then (if the query compiles as a regex)
+/// jumps the scroll to the first match at or after the anchor position
+/// recorded when `/` was pressed. Invalid-regex states are left
+/// untouched: scroll doesn't move, no error is raised — the input bar
+/// just shows "(invalid regex)" until the user finishes typing.
+fn update_search(app: &mut App) {
+    app.search_query = app.search_input.clone();
+    if app.search_query.is_empty() {
+        app.expand_scroll = app.search_anchor_scroll;
         return;
     }
-    app.search_query = q;
+    let Some(regex) = try_compile(&app.search_query) else {
+        return;
+    };
     let Some(id) = app.session.cursor() else { return };
     let Some(block) = app.session.block(id) else { return };
     let lines = compute_block_lines(block);
-    let matches = find_matches(&lines, &app.search_query);
-    if let Some(&first) = matches.iter().find(|&&m| m >= app.expand_scroll) {
+    let matches = find_matches_regex(&lines, &regex);
+    if let Some(&first) = matches.iter().find(|&&m| m >= app.search_anchor_scroll) {
         app.expand_scroll = first;
     } else if let Some(&first) = matches.first() {
         app.expand_scroll = first;
@@ -1229,10 +1249,14 @@ fn jump_to_search(app: &mut App, forward: bool) {
     if app.search_query.is_empty() {
         return;
     }
+    let Some(regex) = try_compile(&app.search_query) else {
+        app.flash = Some(format!("invalid regex: {}", app.search_query));
+        return;
+    };
     let Some(id) = app.session.cursor() else { return };
     let Some(block) = app.session.block(id) else { return };
     let lines = compute_block_lines(block);
-    let matches = find_matches(&lines, &app.search_query);
+    let matches = find_matches_regex(&lines, &regex);
     if matches.is_empty() {
         app.flash = Some(format!("no matches for '{}'", app.search_query));
         return;
@@ -1265,11 +1289,18 @@ fn compute_block_lines(block: &Block) -> Vec<Line<'static>> {
     }
 }
 
-fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
+fn try_compile(query: &str) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    regex::Regex::new(query).ok()
+}
+
+fn find_matches_regex(lines: &[Line<'static>], regex: &regex::Regex) -> Vec<usize> {
     lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| line_text(l).contains(query))
+        .filter(|(_, l)| regex.is_match(&line_text(l)))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1708,28 +1739,33 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
             total,
         )
     };
+    let regex = try_compile(&app.search_query);
     if !app.search_query.is_empty() {
-        let matches = find_matches(&all_lines, &app.search_query);
-        title.push_str(&format!(
-            "    /{}  ({} match{})",
-            app.search_query,
-            matches.len(),
-            if matches.len() == 1 { "" } else { "es" },
-        ));
+        let count = match &regex {
+            Some(r) => find_matches_regex(&all_lines, r).len(),
+            None => 0,
+        };
+        let suffix = if regex.is_none() {
+            format!("    /{}  (invalid regex)", app.search_query)
+        } else {
+            format!(
+                "    /{}  ({} match{})",
+                app.search_query,
+                count,
+                if count == 1 { "" } else { "es" },
+            )
+        };
+        title.push_str(&suffix);
     }
     draw_header(f, chunks[0], &title);
 
-    let query = app.search_query.clone();
     let visible_lines: Vec<Line<'static>> = all_lines
         .into_iter()
         .skip(scroll)
         .take(visible)
-        .map(|line| {
-            if !query.is_empty() && line_text(&line).contains(&query) {
-                highlight_line(line)
-            } else {
-                line
-            }
+        .map(|line| match &regex {
+            Some(r) if r.is_match(&line_text(&line)) => highlight_line(line),
+            _ => line,
         })
         .collect();
     let para = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
@@ -2702,7 +2738,8 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if app.search_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
+        let invalid = !app.search_input.is_empty() && try_compile(&app.search_input).is_none();
+        let mut spans = vec![
             Span::raw(" "),
             Span::styled(
                 "/",
@@ -2712,8 +2749,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ),
             Span::raw(app.search_input.clone()),
             Span::styled("▏", Style::default().fg(Color::Yellow)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
+        ];
+        if invalid {
+            spans.push(Span::styled(
+                "  (invalid regex)",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        let widget = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::DarkGray));
         f.render_widget(widget, area);
         return;
     }
@@ -2857,15 +2901,31 @@ mod tests {
     }
 
     #[test]
-    fn find_matches_returns_indices_of_lines_containing_query() {
+    fn find_matches_regex_returns_indices_of_matching_lines() {
         let lines: Vec<Line<'static>> = vec![
             Line::from("apple"),
             Line::from("banana"),
             Line::from("apple pie"),
             Line::from("cherry"),
         ];
-        assert_eq!(find_matches(&lines, "apple"), vec![0, 2]);
-        assert_eq!(find_matches(&lines, "z"), Vec::<usize>::new());
+        let r = regex::Regex::new("apple").unwrap();
+        assert_eq!(find_matches_regex(&lines, &r), vec![0, 2]);
+        let r2 = regex::Regex::new("z").unwrap();
+        assert_eq!(find_matches_regex(&lines, &r2), Vec::<usize>::new());
+        // Regex semantics: `.` matches any char.
+        let r3 = regex::Regex::new("a..le").unwrap();
+        assert_eq!(find_matches_regex(&lines, &r3), vec![0, 2]);
+        // Anchored regex.
+        let r4 = regex::Regex::new("^a").unwrap();
+        assert_eq!(find_matches_regex(&lines, &r4), vec![0, 2]);
+    }
+
+    #[test]
+    fn try_compile_handles_empty_and_invalid() {
+        assert!(try_compile("").is_none());
+        assert!(try_compile("[unclosed").is_none());
+        assert!(try_compile("valid").is_some());
+        assert!(try_compile("\\d+").is_some());
     }
 
     #[test]
