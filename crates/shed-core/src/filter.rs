@@ -229,16 +229,55 @@ fn apply_from_fields(input: PipelineValue) -> Result<PipelineValue, FilterError>
 
 fn apply_where(input: PipelineValue, predicate: &Predicate) -> Result<PipelineValue, FilterError> {
     let items = require_list(input)?;
-    let kept = items
+
+    // Pre-validate the predicate against the first record's schema and any
+    // regex patterns. This catches "column doesn't exist anywhere" and "bad
+    // regex" up front, since per-row errors below are silently treated as
+    // "row doesn't match" — which is the right behavior for heterogeneous
+    // data (e.g. an `ls -lat` 'total N' header row missing later columns)
+    // but would silently swallow these top-level mistakes.
+    if let Some(sample) = items.iter().find_map(|v| match v {
+        Value::Record(r) => Some(r),
+        _ => None,
+    }) {
+        validate_predicate(predicate, sample)?;
+    }
+
+    let kept: Vec<Value> = items
         .into_iter()
-        .map(|item| predicate.evaluate(&item).map(|keep| (keep, item)))
-        .filter_map(|res| match res {
-            Ok((true, item)) => Some(Ok(item)),
-            Ok((false, _)) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter(|item| predicate.evaluate(item).unwrap_or(false))
+        .collect();
     Ok(PipelineValue::Structured(Value::List(kept)))
+}
+
+fn validate_predicate(
+    p: &Predicate,
+    sample: &IndexMap<String, Value>,
+) -> Result<(), FilterError> {
+    match p {
+        Predicate::Matches { column, pattern } => {
+            if !sample.contains_key(column) {
+                return Err(FilterError::UnknownColumn(column.clone()));
+            }
+            Regex::new(pattern).map_err(|e| FilterError::BadRegex {
+                pattern: pattern.clone(),
+                error: e.to_string(),
+            })?;
+            Ok(())
+        }
+        Predicate::Contains { column, .. } | Predicate::Compare { column, .. } => {
+            if !sample.contains_key(column) {
+                return Err(FilterError::UnknownColumn(column.clone()));
+            }
+            Ok(())
+        }
+        Predicate::And(a, b) | Predicate::Or(a, b) => {
+            validate_predicate(a, sample)?;
+            validate_predicate(b, sample)?;
+            Ok(())
+        }
+        Predicate::Not(p) => validate_predicate(p, sample),
+    }
 }
 
 fn apply_select(input: PipelineValue, columns: &[String]) -> Result<PipelineValue, FilterError> {
@@ -696,6 +735,81 @@ mod tests {
             b"strawberry\nblueberry\nblackberry\nbanana\n",
         );
         assert_eq!(lines_of(result), vec!["blueberry", "blackberry"]);
+    }
+
+    #[test]
+    fn where_drops_rows_with_null_or_uncomparable_values() {
+        // Mirrors the `ls -lat` header row scenario: the first row has fewer
+        // fields than the rest, so from-fields fills the missing columns with
+        // Null. A numeric Compare on that column should silently drop those
+        // rows rather than aborting the pipeline.
+        let pipeline = vec![
+            FilterSpec::FromFields,
+            FilterSpec::Where {
+                predicate: Predicate::Compare {
+                    column: "_3".into(),
+                    op: CompareOp::Gt,
+                    value: Value::Int(10),
+                },
+            },
+        ];
+        let result = run(&pipeline, b"total 5\nfile1 1 100\nfile2 1 5\nfile3 1 50\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 2);
+        for item in items {
+            match item {
+                Value::Record(r) => match r.get("_1") {
+                    Some(Value::String(s)) => assert!(s == "file1" || s == "file3"),
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            }
+        }
+    }
+
+    #[test]
+    fn where_drops_rows_with_string_that_doesnt_parse_as_number() {
+        let pipeline = vec![
+            FilterSpec::FromFields,
+            FilterSpec::Where {
+                predicate: Predicate::Compare {
+                    column: "_2".into(),
+                    op: CompareOp::Gt,
+                    value: Value::Int(10),
+                },
+            },
+        ];
+        // Row 1 has `header` in _2 (not numeric); should be dropped.
+        let result = run(&pipeline, b"name header\nalice 50\nbob 5\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn where_bad_regex_still_hard_fails() {
+        // Pre-validation catches regex compile errors so the user gets a
+        // clear error rather than silently empty results.
+        let result = FilterSpec::Where {
+            predicate: Predicate::Matches {
+                column: "line".into(),
+                pattern: "[unclosed".into(),
+            },
+        }
+        .apply({
+            let mut v = PipelineValue::Bytes(Bytes::from_static(b"a\n"));
+            v = FilterSpec::FromLines.apply(v).unwrap();
+            v
+        });
+        match result {
+            Err(FilterError::BadRegex { .. }) => {}
+            other => panic!("expected BadRegex, got {other:?}"),
+        }
     }
 
     #[test]
