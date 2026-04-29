@@ -31,6 +31,9 @@ enum Focus {
 enum FilterKind {
     FromLines,
     FromFields,
+    FromCsv,
+    FromJson,
+    FromRegex,
     Where,
     Select,
     Drop,
@@ -42,6 +45,9 @@ impl FilterKind {
     const ALL: &'static [FilterKind] = &[
         FilterKind::FromLines,
         FilterKind::FromFields,
+        FilterKind::FromCsv,
+        FilterKind::FromJson,
+        FilterKind::FromRegex,
         FilterKind::Where,
         FilterKind::Select,
         FilterKind::Drop,
@@ -53,6 +59,9 @@ impl FilterKind {
         match self {
             FilterKind::FromLines => "from-lines",
             FilterKind::FromFields => "from-fields",
+            FilterKind::FromCsv => "from-csv",
+            FilterKind::FromJson => "from-json",
+            FilterKind::FromRegex => "from-regex",
             FilterKind::Where => "where",
             FilterKind::Select => "select",
             FilterKind::Drop => "drop",
@@ -64,8 +73,11 @@ impl FilterKind {
     fn description(self) -> &'static str {
         match self {
             FilterKind::FromLines => "parse bytes into one record per line",
-            FilterKind::FromFields => "parse bytes into records by whitespace (auto-named _1, _2, …)",
-            FilterKind::Where => "keep rows whose column matches a regex",
+            FilterKind::FromFields => "parse bytes into records by whitespace (auto _1, _2, …)",
+            FilterKind::FromCsv => "parse bytes as CSV (delimiter + optional header row)",
+            FilterKind::FromJson => "parse bytes as JSON (array of objects → rows)",
+            FilterKind::FromRegex => "parse each line by a regex; named captures become columns",
+            FilterKind::Where => "keep rows whose column matches a predicate",
             FilterKind::Select => "keep only the chosen columns",
             FilterKind::Drop => "remove the chosen columns",
             FilterKind::Take => "keep the first N rows",
@@ -73,6 +85,20 @@ impl FilterKind {
         }
     }
 
+}
+
+const DELIM_CHOICES: &[(char, &str)] = &[
+    (',', "comma"),
+    ('\t', "tab"),
+    (';', "semicolon"),
+    ('|', "pipe"),
+];
+
+fn delim_label(c: char) -> &'static str {
+    DELIM_CHOICES
+        .iter()
+        .find_map(|(ch, label)| if *ch == c { Some(*label) } else { None })
+        .unwrap_or("?")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +109,9 @@ enum FormField {
     Pattern,
     N,
     Columns,
+    CsvDelim,
+    CsvHasHeader,
+    RegexPattern,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +235,9 @@ struct FilterEditState {
     n_input: String,
     column_selections: Vec<bool>,
     column_cursor: usize,
+    csv_delim: char,
+    csv_has_header: bool,
+    regex_pattern: String,
     available_columns: Vec<String>,
     field: FormField,
     editing_index: Option<usize>,
@@ -223,6 +255,9 @@ impl FilterEditState {
             n_input: String::new(),
             column_selections,
             column_cursor: 0,
+            csv_delim: ',',
+            csv_has_header: true,
+            regex_pattern: String::new(),
             available_columns,
             field: FormField::Kind,
             editing_index,
@@ -246,6 +281,16 @@ impl FilterEditState {
         match block.pipeline.get(index) {
             Some(FilterSpec::FromLines) => state.kind = FilterKind::FromLines,
             Some(FilterSpec::FromFields) => state.kind = FilterKind::FromFields,
+            Some(FilterSpec::FromCsv { delim, has_header }) => {
+                state.kind = FilterKind::FromCsv;
+                state.csv_delim = *delim;
+                state.csv_has_header = *has_header;
+            }
+            Some(FilterSpec::FromJson) => state.kind = FilterKind::FromJson,
+            Some(FilterSpec::FromRegex { pattern }) => {
+                state.kind = FilterKind::FromRegex;
+                state.regex_pattern = pattern.clone();
+            }
             Some(FilterSpec::Where {
                 predicate: Predicate::Matches { column, pattern },
             }) => {
@@ -320,7 +365,15 @@ impl FilterEditState {
 
     fn fields(&self) -> &'static [FormField] {
         match self.kind {
-            FilterKind::FromLines | FilterKind::FromFields => &[FormField::Kind],
+            FilterKind::FromLines | FilterKind::FromFields | FilterKind::FromJson => {
+                &[FormField::Kind]
+            }
+            FilterKind::FromCsv => &[
+                FormField::Kind,
+                FormField::CsvDelim,
+                FormField::CsvHasHeader,
+            ],
+            FilterKind::FromRegex => &[FormField::Kind, FormField::RegexPattern],
             FilterKind::Where => &[
                 FormField::Kind,
                 FormField::Column,
@@ -330,6 +383,15 @@ impl FilterEditState {
             FilterKind::Select | FilterKind::Drop => &[FormField::Kind, FormField::Columns],
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
         }
+    }
+
+    fn cycle_delim(&mut self, delta: i32) {
+        let i = DELIM_CHOICES
+            .iter()
+            .position(|(c, _)| *c == self.csv_delim)
+            .unwrap_or(0) as i32;
+        let new_i = (i + delta).rem_euclid(DELIM_CHOICES.len() as i32) as usize;
+        self.csv_delim = DELIM_CHOICES[new_i].0;
     }
 
     fn cycle_op(&mut self, delta: i32) {
@@ -393,6 +455,20 @@ impl FilterEditState {
         match self.kind {
             FilterKind::FromLines => Some(FilterSpec::FromLines),
             FilterKind::FromFields => Some(FilterSpec::FromFields),
+            FilterKind::FromCsv => Some(FilterSpec::FromCsv {
+                delim: self.csv_delim,
+                has_header: self.csv_has_header,
+            }),
+            FilterKind::FromJson => Some(FilterSpec::FromJson),
+            FilterKind::FromRegex => {
+                if self.regex_pattern.trim().is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::FromRegex {
+                        pattern: self.regex_pattern.clone(),
+                    })
+                }
+            }
             FilterKind::Where => {
                 let column = self.selected_column()?.to_string();
                 let predicate = match self.where_op {
@@ -637,7 +713,37 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::Pattern => handle_pattern_key(state, key),
             FormField::N => handle_n_key(state, key),
             FormField::Columns => handle_columns_key(state, key),
+            FormField::CsvDelim => handle_csv_delim_key(state, key),
+            FormField::CsvHasHeader => handle_csv_has_header_key(state, key),
+            FormField::RegexPattern => handle_regex_pattern_key(state, key),
         },
+    }
+}
+
+fn handle_csv_delim_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left | KeyCode::Up => state.cycle_delim(-1),
+        KeyCode::Right | KeyCode::Down => state.cycle_delim(1),
+        _ => {}
+    }
+}
+
+fn handle_csv_has_header_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
+            state.csv_has_header = !state.csv_has_header;
+        }
+        _ => {}
+    }
+}
+
+fn handle_regex_pattern_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => state.regex_pattern.push(c),
+        KeyCode::Backspace => {
+            state.regex_pattern.pop();
+        }
+        _ => {}
     }
 }
 
@@ -1130,6 +1236,13 @@ fn describe_filter(spec: &FilterSpec) -> String {
     match spec {
         FilterSpec::FromLines => "from-lines".into(),
         FilterSpec::FromFields => "from-fields".into(),
+        FilterSpec::FromCsv { delim, has_header } => format!(
+            "from-csv {}{}",
+            delim_label(*delim),
+            if *has_header { "" } else { " (no header)" }
+        ),
+        FilterSpec::FromJson => "from-json".into(),
+        FilterSpec::FromRegex { pattern } => format!("from-regex /{pattern}/"),
         FilterSpec::Where { predicate } => format!("where {}", describe_predicate(predicate)),
         FilterSpec::Select { columns } => format!("select {}", columns.join(", ")),
         FilterSpec::Drop { columns } => format!("drop {}", columns.join(", ")),
@@ -1343,6 +1456,9 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::Pattern => state.where_op.value_label(),
         FormField::N => "n",
         FormField::Columns => "columns",
+        FormField::CsvDelim => "delim",
+        FormField::CsvHasHeader => "header",
+        FormField::RegexPattern => "regex",
     };
     let label_style = if active {
         Style::default()
@@ -1381,6 +1497,21 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         }
         FormField::N => render_text_field(&state.n_input, active, "(unset)"),
         FormField::Columns => render_columns_field(state, active),
+        FormField::CsvDelim => render_select_value(delim_label(state.csv_delim), "", active),
+        FormField::CsvHasHeader => render_select_value(
+            if state.csv_has_header { "true" } else { "false" },
+            if state.csv_has_header {
+                "first row is column names"
+            } else {
+                "auto-name columns _1, _2, …"
+            },
+            active,
+        ),
+        FormField::RegexPattern => render_text_field(
+            &state.regex_pattern,
+            active,
+            "(empty: matches nothing — use named groups like (?<col>…))",
+        ),
     };
 
     let mut all = vec![label_span];
@@ -1600,9 +1731,9 @@ mod tests {
         let mut block = block_with_stdout(b"a\n");
         block.pipeline.push(FilterSpec::FromLines);
         let mut state = FilterEditState::for_add(&block);
-        // Default is Where because schema is non-empty.
         assert_eq!(state.kind, FilterKind::Where);
-        // ALL = [FromLines, FromFields, Where, Select, Drop, Take, Skip]
+        // ALL = [FromLines, FromFields, FromCsv, FromJson, FromRegex,
+        //        Where, Select, Drop, Take, Skip]
         let order = [
             FilterKind::Select,
             FilterKind::Drop,
@@ -1610,12 +1741,66 @@ mod tests {
             FilterKind::Skip,
             FilterKind::FromLines,
             FilterKind::FromFields,
+            FilterKind::FromCsv,
+            FilterKind::FromJson,
+            FilterKind::FromRegex,
             FilterKind::Where,
         ];
         for expected in order {
             state.cycle_kind(1);
             assert_eq!(state.kind, expected);
         }
+    }
+
+    #[test]
+    fn for_edit_prepopulates_from_csv() {
+        let mut block = block_with_stdout(b"a,b\n1,2\n");
+        block.pipeline.push(FilterSpec::FromCsv {
+            delim: ';',
+            has_header: false,
+        });
+        let state = FilterEditState::for_edit(&block, 0);
+        assert_eq!(state.kind, FilterKind::FromCsv);
+        assert_eq!(state.csv_delim, ';');
+        assert!(!state.csv_has_header);
+    }
+
+    #[test]
+    fn for_edit_prepopulates_from_regex() {
+        let mut block = block_with_stdout(b"x\n");
+        block.pipeline.push(FilterSpec::FromRegex {
+            pattern: r"(?<k>\w+)".into(),
+        });
+        let state = FilterEditState::for_edit(&block, 0);
+        assert_eq!(state.kind, FilterKind::FromRegex);
+        assert_eq!(state.regex_pattern, r"(?<k>\w+)");
+    }
+
+    #[test]
+    fn build_filter_from_regex_requires_pattern() {
+        let block = block_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::FromRegex;
+        assert!(state.build_filter().is_none());
+        state.regex_pattern = "abc".into();
+        match state.build_filter() {
+            Some(FilterSpec::FromRegex { pattern }) => assert_eq!(pattern, "abc"),
+            _ => panic!("expected FromRegex"),
+        }
+    }
+
+    #[test]
+    fn cycle_delim_walks_choices() {
+        let block = block_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::FromCsv;
+        assert_eq!(state.csv_delim, ',');
+        state.cycle_delim(1);
+        assert_eq!(state.csv_delim, '\t');
+        state.cycle_delim(1);
+        assert_eq!(state.csv_delim, ';');
+        state.cycle_delim(-1);
+        assert_eq!(state.csv_delim, '\t');
     }
 
     #[test]

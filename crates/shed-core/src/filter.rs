@@ -15,6 +15,9 @@ pub enum PipelineValue {
 pub enum FilterSpec {
     FromLines,
     FromFields,
+    FromCsv { delim: char, has_header: bool },
+    FromJson,
+    FromRegex { pattern: String },
     Where { predicate: Predicate },
     Select { columns: Vec<String> },
     Drop { columns: Vec<String> },
@@ -58,6 +61,8 @@ pub enum FilterError {
     InvalidUtf8,
     #[error("invalid regex `{pattern}`: {error}")]
     BadRegex { pattern: String, error: String },
+    #[error("failed to parse {format}: {error}")]
+    ParseError { format: &'static str, error: String },
     #[error("type mismatch on column `{column}`: expected {expected}, got {got}")]
     TypeMismatch {
         column: String,
@@ -75,6 +80,9 @@ impl Filter for FilterSpec {
         match self {
             FilterSpec::FromLines => apply_from_lines(input),
             FilterSpec::FromFields => apply_from_fields(input),
+            FilterSpec::FromCsv { delim, has_header } => apply_from_csv(input, *delim, *has_header),
+            FilterSpec::FromJson => apply_from_json(input),
+            FilterSpec::FromRegex { pattern } => apply_from_regex(input, pattern),
             FilterSpec::Where { predicate } => apply_where(input, predicate),
             FilterSpec::Select { columns } => apply_select(input, columns),
             FilterSpec::Drop { columns } => apply_drop(input, columns),
@@ -210,6 +218,135 @@ fn apply_skip(input: PipelineValue, n: usize) -> Result<PipelineValue, FilterErr
     Ok(PipelineValue::Structured(Value::List(
         items.into_iter().skip(n).collect(),
     )))
+}
+
+fn apply_from_csv(
+    input: PipelineValue,
+    delim: char,
+    has_header: bool,
+) -> Result<PipelineValue, FilterError> {
+    let bytes = require_bytes(input)?;
+    let mut builder = csv::ReaderBuilder::new();
+    builder.has_headers(has_header);
+    if delim.is_ascii() {
+        builder.delimiter(delim as u8);
+    }
+    let mut reader = builder.from_reader(bytes.as_ref());
+
+    let headers: Vec<String> = if has_header {
+        reader
+            .headers()
+            .map_err(|e| FilterError::ParseError {
+                format: "csv",
+                error: e.to_string(),
+            })?
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut records = Vec::new();
+    for result in reader.records() {
+        let record = result.map_err(|e| FilterError::ParseError {
+            format: "csv",
+            error: e.to_string(),
+        })?;
+        let mut rec = IndexMap::with_capacity(record.len());
+        for (i, field) in record.iter().enumerate() {
+            let col = if has_header {
+                headers
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("_{}", i + 1))
+            } else {
+                format!("_{}", i + 1)
+            };
+            rec.insert(col, Value::String(field.to_string()));
+        }
+        records.push(Value::Record(rec));
+    }
+    Ok(PipelineValue::Structured(Value::List(records)))
+}
+
+fn apply_from_json(input: PipelineValue) -> Result<PipelineValue, FilterError> {
+    let bytes = require_bytes(input)?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| FilterError::ParseError {
+            format: "json",
+            error: e.to_string(),
+        })?;
+    let value = json_to_value(json);
+    let list = match value {
+        Value::List(items) => items,
+        record @ Value::Record(_) => vec![record],
+        scalar => {
+            let mut rec = IndexMap::with_capacity(1);
+            rec.insert("value".to_string(), scalar);
+            vec![Value::Record(rec)]
+        }
+    };
+    Ok(PipelineValue::Structured(Value::List(list)))
+}
+
+fn json_to_value(j: serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s),
+        serde_json::Value::Array(arr) => Value::List(arr.into_iter().map(json_to_value).collect()),
+        serde_json::Value::Object(obj) => Value::Record(
+            obj.into_iter()
+                .map(|(k, v)| (k, json_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn apply_from_regex(input: PipelineValue, pattern: &str) -> Result<PipelineValue, FilterError> {
+    let bytes = require_bytes(input)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| FilterError::InvalidUtf8)?;
+    let regex = Regex::new(pattern).map_err(|e| FilterError::BadRegex {
+        pattern: pattern.to_string(),
+        error: e.to_string(),
+    })?;
+
+    let column_names: Vec<String> = regex
+        .capture_names()
+        .enumerate()
+        .skip(1)
+        .map(|(i, name)| match name {
+            Some(n) => n.to_string(),
+            None => format!("_{i}"),
+        })
+        .collect();
+
+    let mut records = Vec::new();
+    for line in text.lines() {
+        let Some(captures) = regex.captures(line) else {
+            continue;
+        };
+        let mut rec = IndexMap::with_capacity(column_names.len());
+        for (i, name) in column_names.iter().enumerate() {
+            let value = captures
+                .get(i + 1)
+                .map(|m| Value::String(m.as_str().to_string()))
+                .unwrap_or(Value::Null);
+            rec.insert(name.clone(), value);
+        }
+        records.push(Value::Record(rec));
+    }
+    Ok(PipelineValue::Structured(Value::List(records)))
 }
 
 impl Predicate {
@@ -564,6 +701,183 @@ mod tests {
         ];
         let result = run(&pipeline, b"alpha\nbravo\nzulu\n");
         assert_eq!(lines_of(result), vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn from_csv_with_header() {
+        let result = FilterSpec::FromCsv {
+            delim: ',',
+            has_header: true,
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "name,age\nalice,30\nbob,25\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 2);
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        let keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["name", "age"]);
+        assert_eq!(first.get("name"), Some(&Value::String("alice".into())));
+        assert_eq!(first.get("age"), Some(&Value::String("30".into())));
+    }
+
+    #[test]
+    fn from_csv_without_header_uses_underscore_names() {
+        let result = FilterSpec::FromCsv {
+            delim: ',',
+            has_header: false,
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "alice,30\nbob,25\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(first.get("_1"), Some(&Value::String("alice".into())));
+        assert_eq!(first.get("_2"), Some(&Value::String("30".into())));
+    }
+
+    #[test]
+    fn from_csv_tab_delim() {
+        let result = FilterSpec::FromCsv {
+            delim: '\t',
+            has_header: true,
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "x\ty\n1\t2\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(first.get("x"), Some(&Value::String("1".into())));
+        assert_eq!(first.get("y"), Some(&Value::String("2".into())));
+    }
+
+    #[test]
+    fn from_json_array_of_objects() {
+        let result = FilterSpec::FromJson
+            .apply(PipelineValue::Bytes(Bytes::from(
+                r#"[{"a": 1}, {"a": 2, "b": "x"}]"#.to_string(),
+            )))
+            .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 2);
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(first.get("a"), Some(&Value::Int(1)));
+        let second = match &items[1] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        assert_eq!(second.get("a"), Some(&Value::Int(2)));
+        assert_eq!(second.get("b"), Some(&Value::String("x".into())));
+    }
+
+    #[test]
+    fn from_json_top_level_object_becomes_single_record() {
+        let result = FilterSpec::FromJson
+            .apply(PipelineValue::Bytes(Bytes::from(
+                r#"{"name": "alice", "age": 30}"#.to_string(),
+            )))
+            .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn from_json_array_of_scalars() {
+        let result = FilterSpec::FromJson
+            .apply(PipelineValue::Bytes(Bytes::from(
+                "[1, 2, 3]".to_string(),
+            )))
+            .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 3);
+        // Scalars stay as-is in the list — they'll render but downstream filters may struggle.
+        assert_eq!(items[0], Value::Int(1));
+    }
+
+    #[test]
+    fn from_json_invalid_input_errors() {
+        let err = FilterSpec::FromJson
+            .apply(PipelineValue::Bytes(Bytes::from("not json".to_string())))
+            .unwrap_err();
+        assert!(matches!(err, FilterError::ParseError { format: "json", .. }));
+    }
+
+    #[test]
+    fn from_regex_named_captures() {
+        let result = FilterSpec::FromRegex {
+            pattern: r"(?<key>\w+)=(?<val>\d+)".into(),
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "alpha=1\nbeta=22\nignored\ngamma=333\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 3);
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        let keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["key", "val"]);
+        assert_eq!(first.get("key"), Some(&Value::String("alpha".into())));
+        assert_eq!(first.get("val"), Some(&Value::String("1".into())));
+    }
+
+    #[test]
+    fn from_regex_unnamed_groups_get_underscores() {
+        let result = FilterSpec::FromRegex {
+            pattern: r"(\w+) (\w+)".into(),
+        }
+        .apply(PipelineValue::Bytes(Bytes::from(
+            "hello world\nfoo bar\n".to_string(),
+        )))
+        .unwrap();
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        let keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["_1", "_2"]);
     }
 
     #[test]
