@@ -11,4 +11,7 @@ name = "shed"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1.11.1"
 shed-core.workspace = true
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "process", "io-util"] }
