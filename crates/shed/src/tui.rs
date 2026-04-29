@@ -75,6 +75,7 @@ enum FilterKind {
     SortBy,
     Uniq,
     Count,
+    Rename,
 }
 
 impl FilterKind {
@@ -92,6 +93,7 @@ impl FilterKind {
         FilterKind::SortBy,
         FilterKind::Uniq,
         FilterKind::Count,
+        FilterKind::Rename,
     ];
 
     fn name(self) -> &'static str {
@@ -109,6 +111,7 @@ impl FilterKind {
             FilterKind::SortBy => "sort-by",
             FilterKind::Uniq => "uniq",
             FilterKind::Count => "count",
+            FilterKind::Rename => "rename",
         }
     }
 
@@ -127,6 +130,7 @@ impl FilterKind {
             FilterKind::SortBy => "sort rows by a column (numeric coercion when both sides parse)",
             FilterKind::Uniq => "drop duplicate rows (optionally keyed by columns)",
             FilterKind::Count => "collapse to a single row with the row count",
+            FilterKind::Rename => "rename columns (leave a row blank to keep its current name)",
         }
     }
 
@@ -158,6 +162,7 @@ enum FormField {
     CsvHasHeader,
     RegexPattern,
     SortKeys,
+    RenameMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +291,8 @@ struct FilterEditState {
     regex_pattern: String,
     sort_keys: Vec<(usize, SortDirection)>,
     sort_keys_cursor: usize,
+    rename_to_inputs: Vec<String>,
+    rename_cursor: usize,
     available_columns: Vec<String>,
     field: FormField,
     editing_index: Option<usize>,
@@ -312,6 +319,8 @@ impl FilterEditState {
                 vec![(0, SortDirection::Asc)]
             },
             sort_keys_cursor: 0,
+            rename_to_inputs: vec![String::new(); available_columns.len()],
+            rename_cursor: 0,
             available_columns,
             field: FormField::Kind,
             editing_index,
@@ -374,6 +383,16 @@ impl FilterEditState {
                 }
             }
             Some(FilterSpec::Count) => state.kind = FilterKind::Count,
+            Some(FilterSpec::Rename { pairs }) => {
+                state.kind = FilterKind::Rename;
+                for (from, to) in pairs {
+                    if let Some(i) = state.available_columns.iter().position(|c| c == from) {
+                        if let Some(slot) = state.rename_to_inputs.get_mut(i) {
+                            *slot = to.clone();
+                        }
+                    }
+                }
+            }
             Some(FilterSpec::Where {
                 predicate: Predicate::Matches { column, pattern },
             }) => {
@@ -469,6 +488,7 @@ impl FilterEditState {
             }
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
             FilterKind::SortBy => &[FormField::Kind, FormField::SortKeys],
+            FilterKind::Rename => &[FormField::Kind, FormField::RenameMap],
         }
     }
 
@@ -479,6 +499,7 @@ impl FilterEditState {
                 let with_add = if n < MAX_SORT_KEYS { n + 1 } else { n };
                 with_add.max(1) as u16
             }
+            FormField::RenameMap => self.available_columns.len().max(1) as u16,
             _ => 1,
         }
     }
@@ -635,6 +656,28 @@ impl FilterEditState {
                 })
             }
             FilterKind::Count => Some(FilterSpec::Count),
+            FilterKind::Rename => {
+                let pairs: Vec<(String, String)> = self
+                    .rename_to_inputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, to)| {
+                        let to = to.trim();
+                        if to.is_empty() {
+                            None
+                        } else {
+                            self.available_columns
+                                .get(i)
+                                .map(|from| (from.clone(), to.to_string()))
+                        }
+                    })
+                    .collect();
+                if pairs.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::Rename { pairs })
+                }
+            }
         }
     }
 }
@@ -957,7 +1000,34 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::CsvHasHeader => handle_csv_has_header_key(state, key),
             FormField::RegexPattern => handle_regex_pattern_key(state, key),
             FormField::SortKeys => handle_sort_keys_key(state, key),
+            FormField::RenameMap => handle_rename_map_key(state, key),
         },
+    }
+}
+
+fn handle_rename_map_key(state: &mut FilterEditState, key: KeyEvent) {
+    if state.available_columns.is_empty() {
+        return;
+    }
+    let max = state.available_columns.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Up => {
+            state.rename_cursor = state.rename_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            state.rename_cursor = (state.rename_cursor + 1).min(max);
+        }
+        KeyCode::Char(c) => {
+            if let Some(input) = state.rename_to_inputs.get_mut(state.rename_cursor) {
+                input.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = state.rename_to_inputs.get_mut(state.rename_cursor) {
+                input.pop();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1573,6 +1643,14 @@ fn describe_filter(spec: &FilterSpec) -> String {
             None => "uniq".into(),
         },
         FilterSpec::Count => "count".into(),
+        FilterSpec::Rename { pairs } => {
+            let s = pairs
+                .iter()
+                .map(|(f, t)| format!("{f}→{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("rename {s}")
+        }
     }
 }
 
@@ -1766,14 +1844,82 @@ fn draw_form_pane(f: &mut Frame, area: Rect, state: &FilterEditState) {
 
     let mut lines: Vec<Line> = Vec::new();
     for field in state.fields() {
-        if *field == FormField::SortKeys {
-            lines.extend(render_sort_keys_field(state));
-        } else {
-            lines.push(render_form_row(state, *field));
+        match *field {
+            FormField::SortKeys => lines.extend(render_sort_keys_field(state)),
+            FormField::RenameMap => lines.extend(render_rename_map_field(state)),
+            _ => lines.push(render_form_row(state, *field)),
         }
     }
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
+}
+
+fn render_rename_map_field(state: &FilterEditState) -> Vec<Line<'static>> {
+    let active = state.field == FormField::RenameMap;
+    let label_first = format!("  {:>8}: ", "rename");
+    let label_rest: String = " ".repeat(label_first.chars().count());
+
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    if state.available_columns.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(label_first, label_style),
+            Span::styled(
+                "(no columns — pipeline output is bytes; add a parser)",
+                Style::default().fg(Color::Red),
+            ),
+        ])];
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, col) in state.available_columns.iter().enumerate() {
+        let on_cursor = active && i == state.rename_cursor;
+        let label = if i == 0 {
+            Span::styled(label_first.clone(), label_style)
+        } else {
+            Span::raw(label_rest.clone())
+        };
+        let to = state.rename_to_inputs.get(i).cloned().unwrap_or_default();
+
+        let from_style = if on_cursor {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let arrow_style = Style::default().fg(Color::DarkGray);
+        let to_style = if on_cursor {
+            Style::default().fg(Color::White)
+        } else if to.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Magenta)
+        };
+
+        let mut spans = vec![
+            label,
+            Span::styled(format!("{col}"), from_style),
+            Span::styled(" → ", arrow_style),
+        ];
+        if to.is_empty() && !on_cursor {
+            spans.push(Span::styled(
+                "(unchanged)".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            spans.push(Span::styled(to.clone(), to_style));
+        }
+        if on_cursor {
+            spans.push(Span::styled("▏", Style::default().fg(Color::Magenta)));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn render_sort_keys_field(state: &FilterEditState) -> Vec<Line<'static>> {
@@ -1874,6 +2020,7 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::CsvHasHeader => "header",
         FormField::RegexPattern => "regex",
         FormField::SortKeys => "keys",
+        FormField::RenameMap => "rename",
     };
     let label_style = if active {
         Style::default()
@@ -1927,8 +2074,8 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             active,
             "(empty: matches nothing — use named groups like (?<col>…))",
         ),
-        FormField::SortKeys => {
-            // Multi-line — handled by render_form_field instead.
+        FormField::SortKeys | FormField::RenameMap => {
+            // Multi-line — handled separately.
             return Line::from("");
         }
     };
@@ -2245,6 +2392,48 @@ mod tests {
             Some(FilterSpec::Uniq { by: Some(cols) }) => assert_eq!(cols, vec!["_1".to_string()]),
             _ => panic!("expected Uniq with by=Some([_1])"),
         }
+    }
+
+    #[test]
+    fn build_filter_rename_collects_only_nonempty_rows() {
+        let mut block = block_with_stdout(b"a b c\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Rename;
+        // available_columns = [_1, _2, _3]; rename_to_inputs starts as 3 empties.
+        state.rename_to_inputs[0] = "file".into();
+        state.rename_to_inputs[2] = "owner".into();
+        match state.build_filter() {
+            Some(FilterSpec::Rename { pairs }) => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("_1".into(), "file".into()));
+                assert_eq!(pairs[1], ("_3".into(), "owner".into()));
+            }
+            _ => panic!("expected Rename"),
+        }
+    }
+
+    #[test]
+    fn build_filter_rename_empty_is_none() {
+        let mut block = block_with_stdout(b"a b\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Rename;
+        // All inputs empty.
+        assert!(state.build_filter().is_none());
+    }
+
+    #[test]
+    fn for_edit_prepopulates_rename() {
+        let mut block = block_with_stdout(b"a b c\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        block.pipeline.push(FilterSpec::Rename {
+            pairs: vec![("_2".into(), "size".into())],
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::Rename);
+        assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
+        assert_eq!(state.rename_to_inputs, vec!["", "size", ""]);
     }
 
     #[test]

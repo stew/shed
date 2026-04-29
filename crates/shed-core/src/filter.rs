@@ -26,6 +26,7 @@ pub enum FilterSpec {
     SortBy { keys: Vec<SortKey> },
     Uniq { by: Option<Vec<String>> },
     Count,
+    Rename { pairs: Vec<(String, String)> },
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,7 @@ impl Filter for FilterSpec {
             FilterSpec::SortBy { keys } => apply_sort_by(input, keys),
             FilterSpec::Uniq { by } => apply_uniq(input, by.as_deref()),
             FilterSpec::Count => apply_count(input),
+            FilterSpec::Rename { pairs } => apply_rename(input, pairs),
         }
     }
 }
@@ -466,6 +468,31 @@ fn apply_count(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let mut rec = IndexMap::with_capacity(1);
     rec.insert("count".to_string(), Value::Int(items.len() as i64));
     Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
+}
+
+fn apply_rename(
+    input: PipelineValue,
+    pairs: &[(String, String)],
+) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    let kept: Vec<Value> = items
+        .into_iter()
+        .map(|item| match item {
+            Value::Record(r) => {
+                let mut new_rec = IndexMap::with_capacity(r.len());
+                for (k, v) in r {
+                    let new_key = pairs
+                        .iter()
+                        .find_map(|(from, to)| if &k == from { Some(to.clone()) } else { None })
+                        .unwrap_or(k);
+                    new_rec.insert(new_key, v);
+                }
+                Value::Record(new_rec)
+            }
+            other => other,
+        })
+        .collect();
+    Ok(PipelineValue::Structured(Value::List(kept)))
 }
 
 fn apply_from_regex(input: PipelineValue, pattern: &str) -> Result<PipelineValue, FilterError> {
@@ -1186,6 +1213,53 @@ mod tests {
         // String-typed numbers — sort_by uses compare_values which coerces.
         let result = run(&pipeline, b"10\n2\n1\n100\n");
         assert_eq!(lines_of(result), vec!["1", "2", "10", "100"]);
+    }
+
+    #[test]
+    fn rename_renames_specified_columns_in_order() {
+        let pipeline = vec![
+            FilterSpec::FromFields,
+            FilterSpec::Rename {
+                pairs: vec![
+                    ("_1".into(), "file".into()),
+                    ("_3".into(), "owner".into()),
+                ],
+            },
+        ];
+        let result = run(&pipeline, b"a b c\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        let first = match &items[0] {
+            Value::Record(r) => r,
+            _ => panic!(),
+        };
+        let keys: Vec<&str> = first.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["file", "_2", "owner"]);
+        assert_eq!(first.get("file"), Some(&Value::String("a".into())));
+    }
+
+    #[test]
+    fn rename_passes_through_unmatched_columns() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Rename {
+                pairs: vec![("nonexistent".into(), "whatever".into())],
+            },
+        ];
+        let result = run(&pipeline, b"a\nb\n");
+        // Both rows still have a "line" column.
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        for item in items {
+            match item {
+                Value::Record(r) => assert!(r.contains_key("line")),
+                _ => panic!(),
+            }
+        }
     }
 
     #[test]
