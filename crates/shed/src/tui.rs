@@ -3154,46 +3154,146 @@ fn render_pipeline_value_with_max(value: PipelineValue, max: usize) -> Vec<Line<
     match value {
         PipelineValue::Bytes(b) => render_raw_lines(&b, max),
         PipelineValue::Structured(Value::List(items)) => {
-            let mut out = Vec::new();
-            let total = items.len();
             let columns = schema_of(&items);
-            if !columns.is_empty() {
-                let header_text = columns.join("   ");
-                out.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(
-                        header_text,
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                    ),
-                ]));
+            if columns.is_empty() {
+                render_scalar_list(&items, max)
+            } else {
+                render_table(&items, &columns, max)
             }
-            for item in items.iter().take(max) {
-                out.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::raw(format_row(item, &columns)),
-                ]));
-            }
-            if total > max {
-                out.push(Line::from(Span::styled(
-                    format!("      … {} more rows", total - max),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            if total == 0 {
-                out.push(Line::from(Span::styled(
-                    "      (no rows)",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            out
         }
         PipelineValue::Structured(other) => vec![Line::from(vec![
             Span::raw("      "),
             Span::raw(format!("{other:?}")),
         ])],
     }
+}
+
+/// Render a list of records as an aligned table with header + separator
+/// row + data rows. Column widths are computed across ALL records so the
+/// table doesn't jiggle as the user scrolls in the pager. Vertical
+/// dividers (`│`) make space-containing cell values unambiguous.
+fn render_table(items: &[Value], columns: &[String], max_rows: usize) -> Vec<Line<'static>> {
+    let widths = compute_column_widths(items, columns);
+    let total = items.len();
+    let dim = Style::default().fg(Color::DarkGray);
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines = Vec::new();
+
+    // Header row
+    let mut header_spans = vec![Span::raw("      ")];
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            header_spans.push(Span::styled(" │ ", dim));
+        }
+        header_spans.push(Span::styled(pad_right(col, widths[i]), header_style));
+    }
+    lines.push(Line::from(header_spans));
+
+    // Separator
+    let mut sep_spans = vec![Span::raw("      ")];
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            sep_spans.push(Span::styled("─┼─", dim));
+        }
+        sep_spans.push(Span::styled("─".repeat(*w), dim));
+    }
+    lines.push(Line::from(sep_spans));
+
+    // Data rows
+    for item in items.iter().take(max_rows) {
+        let mut row_spans = vec![Span::raw("      ")];
+        for (i, col) in columns.iter().enumerate() {
+            if i > 0 {
+                row_spans.push(Span::styled(" │ ", dim));
+            }
+            let cell = match item {
+                Value::Record(r) => r.get(col).map(cell_string).unwrap_or_default(),
+                _ => String::new(),
+            };
+            row_spans.push(Span::raw(pad_right(&cell, widths[i])));
+        }
+        lines.push(Line::from(row_spans));
+    }
+
+    if total > max_rows {
+        lines.push(Line::from(Span::styled(
+            format!("      … {} more rows", total - max_rows),
+            dim,
+        )));
+    }
+    if total == 0 {
+        lines.push(Line::from(Span::styled("      (no rows)", dim)));
+    }
+    lines
+}
+
+fn compute_column_widths(items: &[Value], columns: &[String]) -> Vec<usize> {
+    let mut widths: Vec<usize> = columns.iter().map(|c| display_width(c)).collect();
+    for item in items {
+        if let Value::Record(r) = item {
+            for (i, col) in columns.iter().enumerate() {
+                if let Some(v) = r.get(col) {
+                    let w = display_width(&cell_string(v));
+                    if w > widths[i] {
+                        widths[i] = w;
+                    }
+                }
+            }
+        }
+    }
+    widths
+}
+
+fn render_scalar_list(items: &[Value], max: usize) -> Vec<Line<'static>> {
+    let total = items.len();
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut out = Vec::new();
+    for item in items.iter().take(max) {
+        out.push(Line::from(vec![
+            Span::raw("      "),
+            Span::raw(format_scalar(item)),
+        ]));
+    }
+    if total > max {
+        out.push(Line::from(Span::styled(
+            format!("      … {} more rows", total - max),
+            dim,
+        )));
+    }
+    if total == 0 {
+        out.push(Line::from(Span::styled("      (no rows)", dim)));
+    }
+    out
+}
+
+fn cell_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        other => format_scalar(other),
+    }
+}
+
+fn pad_right(s: &str, width: usize) -> String {
+    let cur = display_width(s);
+    if cur >= width {
+        s.to_string()
+    } else {
+        let mut out = s.to_string();
+        for _ in 0..(width - cur) {
+            out.push(' ');
+        }
+        out
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    // ASCII-ish approximation. Wide CJK / emoji would need unicode-width
+    // for true cell counting; for shed's typical PTY output (ASCII-heavy)
+    // this is fine.
+    s.chars().count()
 }
 
 fn schema_of(items: &[Value]) -> Vec<String> {
@@ -3206,19 +3306,6 @@ fn schema_of(items: &[Value]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn format_row(v: &Value, columns: &[String]) -> String {
-    match v {
-        Value::Record(r) => columns
-            .iter()
-            .map(|c| match r.get(c) {
-                Some(val) => format_scalar(val),
-                None => "—".into(),
-            })
-            .collect::<Vec<_>>()
-            .join("   "),
-        other => format_scalar(other),
-    }
-}
 
 fn format_scalar(v: &Value) -> String {
     match v {
