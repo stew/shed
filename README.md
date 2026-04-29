@@ -205,6 +205,35 @@ Notes render dimmed and italicized with a `▎` left edge so they're
 visually distinct from command output. They round-trip through
 notebooks alongside argv, name, and pipeline.
 
+### Aliases
+
+A *global* alias is a saved `(argv, pipeline)` pair addressed by name.
+Type the name at the prompt and shed materialises a fresh block with
+that argv and pipeline pre-filled, then drops you into in-place command
+edit so you can append args before running:
+
+```
+list           ↵    →   block %N appears with argv `ls -lat`,
+                         cmd-edit bar shows  `ls -lat ` (cursor at end)
+list /etc      ✗         (alias lookup is single-token only)
+```
+
+Aliases shadow real binaries — an alias named `ls` wins over `/usr/bin/ls`.
+Use `bash -c 'ls'` if you need to bypass.
+
+| How                      | Action |
+|--------------------------|--------|
+| `A` (in BlockCursor)     | save the cursor block as an alias (input bar `alias name:`). If the name already exists, a `[y]es / [n]o` prompt appears before overwriting. |
+| type `<name>` at prompt  | invoke alias — creates an Idle block, opens cmd-edit pre-filled with `argv ` (trailing space) so you can append args + Enter. |
+| `/aliases` at prompt     | open the manage view: `↑↓` navigate, `x` (or `d`) delete, `Esc` / `q` back. |
+
+Storage is `$XDG_CONFIG_HOME/shed/aliases.json` (fallback
+`~/.config/shed/aliases.json`), versioned JSON, written on every change.
+Aliases are cross-session and not tied to any single notebook.
+
+Edit by re-invoking: type the alias, modify the argv / pipeline as
+needed, then `A` again with the same name and confirm overwrite.
+
 ### Notebooks
 
 A *notebook* is the saveable form of a session: an ordered list of
@@ -316,6 +345,7 @@ so you don't lose data without noticing.
 | `u`       | unpin the selected block (clear its name) |
 | `r`       | open a rerun input bar pre-filled with the block's argv (shlex-quoted). Edit and Enter to spawn a new block with the edited command and the same pipeline copied over; Esc cancels. The original block is unchanged. |
 | `n` / `N` | edit the block's pre-note / post-note (multi-line text rendered above / below the block, persisted to the notebook) |
+| `A`       | save the block as a global alias (input bar; overwrites prompt for confirmation) |
 | Ctrl-C    | cancel a running command (kills the child) |
 | Ctrl-S    | save notebook |
 | Ctrl-O    | open notebook |
@@ -405,6 +435,7 @@ shed/
 │   │   ├── filter.rs   FilterSpec, Predicate, Filter trait, apply_with_notes
 │   │   ├── block.rs    Block, BlockId, BlockState (incl. Idle for loaded notebooks)
 │   │   ├── notebook.rs Notebook save/load (JSON, structure-only)
+│   │   ├── aliases.rs  Cross-session named (argv, pipeline) saves
 │   │   └── session.rs  Session with LRU eviction
 │   └── shed/           bin: TUI + exec + ANSI
 │       ├── main.rs     entry point

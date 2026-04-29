@@ -26,6 +26,7 @@
 //! dropped (their [`Block::capture`] becomes `None`). Pinned captures count
 //! toward the budget but are never evicted.
 
+pub mod aliases;
 pub mod block;
 pub mod capture;
 pub mod filter;
@@ -33,6 +34,7 @@ pub mod notebook;
 pub mod session;
 pub mod value;
 
+pub use aliases::{ALIASES_VERSION, Alias, AliasError, AliasFile};
 pub use block::{Block, BlockId, BlockState};
 pub use capture::Capture;
 pub use filter::{
