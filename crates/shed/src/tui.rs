@@ -10,7 +10,8 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Block, BlockId, BlockState, Filter, FilterSpec, PipelineValue, Predicate, Session, Value,
+    Block, BlockId, BlockState, CompareOp, Filter, FilterSpec, PipelineValue, Predicate, Session,
+    Value,
 };
 
 use crate::exec::run_command;
@@ -78,15 +79,129 @@ impl FilterKind {
 enum FormField {
     Kind,
     Column,
+    Op,
     Pattern,
     N,
     Columns,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhereOp {
+    Matches,
+    Contains,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl WhereOp {
+    const ALL: &'static [WhereOp] = &[
+        WhereOp::Matches,
+        WhereOp::Contains,
+        WhereOp::Eq,
+        WhereOp::Ne,
+        WhereOp::Lt,
+        WhereOp::Le,
+        WhereOp::Gt,
+        WhereOp::Ge,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            WhereOp::Matches => "matches",
+            WhereOp::Contains => "contains",
+            WhereOp::Eq => "=",
+            WhereOp::Ne => "≠",
+            WhereOp::Lt => "<",
+            WhereOp::Le => "≤",
+            WhereOp::Gt => ">",
+            WhereOp::Ge => "≥",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            WhereOp::Matches => "regex match (unanchored)",
+            WhereOp::Contains => "case-sensitive substring",
+            WhereOp::Eq => "equal",
+            WhereOp::Ne => "not equal",
+            WhereOp::Lt => "less than",
+            WhereOp::Le => "less than or equal",
+            WhereOp::Gt => "greater than",
+            WhereOp::Ge => "greater than or equal",
+        }
+    }
+
+    fn value_label(self) -> &'static str {
+        match self {
+            WhereOp::Matches => "pattern",
+            WhereOp::Contains => "substring",
+            _ => "value",
+        }
+    }
+
+    fn to_compare_op(self) -> Option<CompareOp> {
+        match self {
+            WhereOp::Eq => Some(CompareOp::Eq),
+            WhereOp::Ne => Some(CompareOp::Ne),
+            WhereOp::Lt => Some(CompareOp::Lt),
+            WhereOp::Le => Some(CompareOp::Le),
+            WhereOp::Gt => Some(CompareOp::Gt),
+            WhereOp::Ge => Some(CompareOp::Ge),
+            _ => None,
+        }
+    }
+}
+
+fn compare_op_to_where_op(op: CompareOp) -> WhereOp {
+    match op {
+        CompareOp::Eq => WhereOp::Eq,
+        CompareOp::Ne => WhereOp::Ne,
+        CompareOp::Lt => WhereOp::Lt,
+        CompareOp::Le => WhereOp::Le,
+        CompareOp::Gt => WhereOp::Gt,
+        CompareOp::Ge => WhereOp::Ge,
+    }
+}
+
+fn parse_value_input(s: &str) -> Value {
+    let trimmed = s.trim();
+    match trimmed {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        "" => Value::String(String::new()),
+        _ => {
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Value::Int(i);
+            }
+            if let Ok(f) = trimmed.parse::<f64>() {
+                return Value::Float(f);
+            }
+            Value::String(trimmed.to_string())
+        }
+    }
+}
+
+fn value_to_input_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        _ => format!("{v:?}"),
+    }
 }
 
 struct FilterEditState {
     block_id: BlockId,
     kind: FilterKind,
     where_column: usize,
+    where_op: WhereOp,
     where_pattern: String,
     n_input: String,
     column_selections: Vec<bool>,
@@ -103,6 +218,7 @@ impl FilterEditState {
             block_id,
             kind: FilterKind::FromLines,
             where_column: 0,
+            where_op: WhereOp::Matches,
             where_pattern: String::new(),
             n_input: String::new(),
             column_selections,
@@ -134,12 +250,37 @@ impl FilterEditState {
                 predicate: Predicate::Matches { column, pattern },
             }) => {
                 state.kind = FilterKind::Where;
+                state.where_op = WhereOp::Matches;
                 state.where_column = state
                     .available_columns
                     .iter()
                     .position(|c| c == column)
                     .unwrap_or(0);
                 state.where_pattern = pattern.clone();
+            }
+            Some(FilterSpec::Where {
+                predicate: Predicate::Contains { column, substring },
+            }) => {
+                state.kind = FilterKind::Where;
+                state.where_op = WhereOp::Contains;
+                state.where_column = state
+                    .available_columns
+                    .iter()
+                    .position(|c| c == column)
+                    .unwrap_or(0);
+                state.where_pattern = substring.clone();
+            }
+            Some(FilterSpec::Where {
+                predicate: Predicate::Compare { column, op, value },
+            }) => {
+                state.kind = FilterKind::Where;
+                state.where_op = compare_op_to_where_op(*op);
+                state.where_column = state
+                    .available_columns
+                    .iter()
+                    .position(|c| c == column)
+                    .unwrap_or(0);
+                state.where_pattern = value_to_input_string(value);
             }
             Some(FilterSpec::Where { .. }) => state.kind = FilterKind::Where,
             Some(FilterSpec::Select { columns }) => {
@@ -180,10 +321,21 @@ impl FilterEditState {
     fn fields(&self) -> &'static [FormField] {
         match self.kind {
             FilterKind::FromLines | FilterKind::FromFields => &[FormField::Kind],
-            FilterKind::Where => &[FormField::Kind, FormField::Column, FormField::Pattern],
+            FilterKind::Where => &[
+                FormField::Kind,
+                FormField::Column,
+                FormField::Op,
+                FormField::Pattern,
+            ],
             FilterKind::Select | FilterKind::Drop => &[FormField::Kind, FormField::Columns],
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
         }
+    }
+
+    fn cycle_op(&mut self, delta: i32) {
+        let i = WhereOp::ALL.iter().position(|o| *o == self.where_op).unwrap_or(0) as i32;
+        let new_i = (i + delta).rem_euclid(WhereOp::ALL.len() as i32) as usize;
+        self.where_op = WhereOp::ALL[new_i];
     }
 
     fn cycle_field(&mut self, delta: i32) {
@@ -242,13 +394,23 @@ impl FilterEditState {
             FilterKind::FromLines => Some(FilterSpec::FromLines),
             FilterKind::FromFields => Some(FilterSpec::FromFields),
             FilterKind::Where => {
-                let column = self.selected_column()?;
-                Some(FilterSpec::Where {
-                    predicate: Predicate::Matches {
-                        column: column.to_string(),
+                let column = self.selected_column()?.to_string();
+                let predicate = match self.where_op {
+                    WhereOp::Matches => Predicate::Matches {
+                        column,
                         pattern: self.where_pattern.clone(),
                     },
-                })
+                    WhereOp::Contains => Predicate::Contains {
+                        column,
+                        substring: self.where_pattern.clone(),
+                    },
+                    other => Predicate::Compare {
+                        column,
+                        op: other.to_compare_op()?,
+                        value: parse_value_input(&self.where_pattern),
+                    },
+                };
+                Some(FilterSpec::Where { predicate })
             }
             FilterKind::Select => {
                 let cols = self.selected_columns();
@@ -471,10 +633,19 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
         _ => match state.field {
             FormField::Kind => handle_kind_key(state, key),
             FormField::Column => handle_column_key(state, key),
+            FormField::Op => handle_op_key(state, key),
             FormField::Pattern => handle_pattern_key(state, key),
             FormField::N => handle_n_key(state, key),
             FormField::Columns => handle_columns_key(state, key),
         },
+    }
+}
+
+fn handle_op_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left | KeyCode::Up => state.cycle_op(-1),
+        KeyCode::Right | KeyCode::Down => state.cycle_op(1),
+        _ => {}
     }
 }
 
@@ -970,9 +1141,31 @@ fn describe_filter(spec: &FilterSpec) -> String {
 fn describe_predicate(p: &Predicate) -> String {
     match p {
         Predicate::Matches { column, pattern } => format!("{column} matches {pattern}"),
+        Predicate::Contains { column, substring } => format!("{column} contains {substring}"),
+        Predicate::Compare { column, op, value } => {
+            format!("{column} {} {}", describe_compare_op(*op), describe_compare_value(value))
+        }
         Predicate::And(a, b) => format!("({} && {})", describe_predicate(a), describe_predicate(b)),
         Predicate::Or(a, b) => format!("({} || {})", describe_predicate(a), describe_predicate(b)),
         Predicate::Not(p) => format!("!{}", describe_predicate(p)),
+    }
+}
+
+fn describe_compare_op(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "=",
+        CompareOp::Ne => "≠",
+        CompareOp::Lt => "<",
+        CompareOp::Le => "≤",
+        CompareOp::Gt => ">",
+        CompareOp::Ge => "≥",
+    }
+}
+
+fn describe_compare_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("\"{s}\""),
+        _ => format_scalar(v),
     }
 }
 
@@ -1146,7 +1339,8 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
     let label = match field {
         FormField::Kind => "filter",
         FormField::Column => "column",
-        FormField::Pattern => "pattern",
+        FormField::Op => "op",
+        FormField::Pattern => state.where_op.value_label(),
         FormField::N => "n",
         FormField::Columns => "columns",
     };
@@ -1176,7 +1370,15 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
                 render_select_value(col, "", active)
             }
         }
-        FormField::Pattern => render_text_field(&state.where_pattern, active, "(empty: matches everything)"),
+        FormField::Op => render_select_value(state.where_op.name(), state.where_op.description(), active),
+        FormField::Pattern => {
+            let empty_hint = match state.where_op {
+                WhereOp::Matches => "(empty: matches everything)",
+                WhereOp::Contains => "(empty: matches everything)",
+                _ => "(unset)",
+            };
+            render_text_field(&state.where_pattern, active, empty_hint)
+        }
         FormField::N => render_text_field(&state.n_input, active, "(unset)"),
         FormField::Columns => render_columns_field(state, active),
     };
@@ -1456,6 +1658,86 @@ mod tests {
         let state = FilterEditState::for_edit(&block, 1);
         assert_eq!(state.kind, FilterKind::Take);
         assert_eq!(state.n_input, "2");
+    }
+
+    #[test]
+    fn build_filter_where_uses_op_for_predicate_kind() {
+        let mut block = block_with_stdout(b"a\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Where;
+
+        state.where_op = WhereOp::Matches;
+        state.where_pattern = "abc".into();
+        match state.build_filter() {
+            Some(FilterSpec::Where { predicate: Predicate::Matches { pattern, .. } }) => {
+                assert_eq!(pattern, "abc");
+            }
+            _ => panic!("expected Matches"),
+        }
+
+        state.where_op = WhereOp::Contains;
+        match state.build_filter() {
+            Some(FilterSpec::Where { predicate: Predicate::Contains { substring, .. } }) => {
+                assert_eq!(substring, "abc");
+            }
+            _ => panic!("expected Contains"),
+        }
+
+        state.where_op = WhereOp::Gt;
+        state.where_pattern = "42".into();
+        match state.build_filter() {
+            Some(FilterSpec::Where {
+                predicate: Predicate::Compare { op, value, .. },
+            }) => {
+                assert_eq!(op, CompareOp::Gt);
+                assert_eq!(value, Value::Int(42));
+            }
+            _ => panic!("expected Compare(Gt, Int(42))"),
+        }
+    }
+
+    #[test]
+    fn parse_value_input_heuristics() {
+        assert_eq!(parse_value_input("123"), Value::Int(123));
+        assert_eq!(parse_value_input("-7"), Value::Int(-7));
+        assert_eq!(parse_value_input("3.14"), Value::Float(3.14));
+        assert_eq!(parse_value_input("true"), Value::Bool(true));
+        assert_eq!(parse_value_input("false"), Value::Bool(false));
+        assert_eq!(parse_value_input("hello"), Value::String("hello".into()));
+        assert_eq!(parse_value_input("  42  "), Value::Int(42));
+    }
+
+    #[test]
+    fn for_edit_prepopulates_compare_predicate() {
+        let mut block = block_with_stdout(b"1\n2\n10\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Where {
+            predicate: Predicate::Compare {
+                column: "line".into(),
+                op: CompareOp::Gt,
+                value: Value::Int(5),
+            },
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::Where);
+        assert_eq!(state.where_op, WhereOp::Gt);
+        assert_eq!(state.where_pattern, "5");
+    }
+
+    #[test]
+    fn for_edit_prepopulates_contains_predicate() {
+        let mut block = block_with_stdout(b"hello\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Where {
+            predicate: Predicate::Contains {
+                column: "line".into(),
+                substring: "ell".into(),
+            },
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.where_op, WhereOp::Contains);
+        assert_eq!(state.where_pattern, "ell");
     }
 
     #[test]

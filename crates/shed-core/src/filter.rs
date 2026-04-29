@@ -25,9 +25,21 @@ pub enum FilterSpec {
 #[derive(Debug, Clone)]
 pub enum Predicate {
     Matches { column: String, pattern: String },
+    Contains { column: String, substring: String },
+    Compare { column: String, op: CompareOp, value: Value },
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
     Not(Box<Predicate>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Error)]
@@ -221,10 +233,66 @@ impl Predicate {
                 })?;
                 Ok(regex.is_match(text))
             }
+            Predicate::Contains { column, substring } => {
+                let field = lookup_column(value, column)?;
+                let text = match field {
+                    Value::String(s) => s.as_str(),
+                    other => {
+                        return Err(FilterError::TypeMismatch {
+                            column: column.clone(),
+                            expected: "string",
+                            got: other.type_name(),
+                        });
+                    }
+                };
+                Ok(text.contains(substring))
+            }
+            Predicate::Compare { column, op, value: target } => {
+                let field = lookup_column(value, column)?;
+                let Some(ord) = compare_values(field, target) else {
+                    return Err(FilterError::TypeMismatch {
+                        column: column.clone(),
+                        expected: target.type_name(),
+                        got: field.type_name(),
+                    });
+                };
+                use std::cmp::Ordering::*;
+                Ok(match op {
+                    CompareOp::Eq => ord == Equal,
+                    CompareOp::Ne => ord != Equal,
+                    CompareOp::Lt => ord == Less,
+                    CompareOp::Le => matches!(ord, Less | Equal),
+                    CompareOp::Gt => ord == Greater,
+                    CompareOp::Ge => matches!(ord, Greater | Equal),
+                })
+            }
             Predicate::And(a, b) => Ok(a.evaluate(value)? && b.evaluate(value)?),
             Predicate::Or(a, b) => Ok(a.evaluate(value)? || b.evaluate(value)?),
             Predicate::Not(p) => Ok(!p.evaluate(value)?),
         }
+    }
+}
+
+// Best-effort total ordering across Value types. Numeric variants compare
+// numerically (with int↔float widening). Strings vs numerics try parsing
+// the string side as a number — so `where _5 > 1000` works when from-fields
+// has produced string columns. Mismatched types we can't reconcile return None.
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use Value::*;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Null, Null) => Some(Ordering::Equal),
+        (Bool(x), Bool(y)) => Some(x.cmp(y)),
+        (Int(x), Int(y)) => Some(x.cmp(y)),
+        (Float(x), Float(y)) => x.partial_cmp(y),
+        (Int(x), Float(y)) => (*x as f64).partial_cmp(y),
+        (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)),
+        (String(x), String(y)) => Some(x.cmp(y)),
+        (String(x), Int(y)) => x.parse::<i64>().ok().and_then(|n| Some(n.cmp(y))),
+        (String(x), Float(y)) => x.parse::<f64>().ok().and_then(|n| n.partial_cmp(y)),
+        (Int(x), String(y)) => y.parse::<i64>().ok().and_then(|n| Some(x.cmp(&n))),
+        (Float(x), String(y)) => y.parse::<f64>().ok().and_then(|n| x.partial_cmp(&n)),
+        _ => None,
     }
 }
 
@@ -432,6 +500,70 @@ mod tests {
         };
         let keys: Vec<&str> = first.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["_1", "_3"]);
+    }
+
+    #[test]
+    fn contains_matches_substring_case_sensitive() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Where {
+                predicate: Predicate::Contains {
+                    column: "line".into(),
+                    substring: "ell".into(),
+                },
+            },
+        ];
+        let result = run(&pipeline, b"hello\nworld\nyellow\nHELL\n");
+        assert_eq!(lines_of(result), vec!["hello", "yellow"]);
+    }
+
+    #[test]
+    fn compare_equality_on_strings() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Where {
+                predicate: Predicate::Compare {
+                    column: "line".into(),
+                    op: CompareOp::Eq,
+                    value: Value::String("hello".into()),
+                },
+            },
+        ];
+        let result = run(&pipeline, b"hello\nworld\nhello\n");
+        assert_eq!(lines_of(result), vec!["hello", "hello"]);
+    }
+
+    #[test]
+    fn compare_gt_with_numeric_coercion_on_string_column() {
+        // from-lines yields string-typed `line`; comparing with Int(10) coerces.
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Where {
+                predicate: Predicate::Compare {
+                    column: "line".into(),
+                    op: CompareOp::Gt,
+                    value: Value::Int(10),
+                },
+            },
+        ];
+        let result = run(&pipeline, b"5\n10\n15\n20\n");
+        assert_eq!(lines_of(result), vec!["15", "20"]);
+    }
+
+    #[test]
+    fn compare_lex_on_strings() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Where {
+                predicate: Predicate::Compare {
+                    column: "line".into(),
+                    op: CompareOp::Lt,
+                    value: Value::String("m".into()),
+                },
+            },
+        ];
+        let result = run(&pipeline, b"alpha\nbravo\nzulu\n");
+        assert_eq!(lines_of(result), vec!["alpha", "bravo"]);
     }
 
     #[test]
