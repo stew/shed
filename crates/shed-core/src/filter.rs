@@ -91,6 +91,31 @@ pub trait Filter {
     fn apply(&self, input: PipelineValue) -> Result<PipelineValue, FilterError>;
 }
 
+/// Diagnostic counters reported alongside a filter's normal output. Currently
+/// only `error_drops` is non-zero, set by `where` when per-row evaluation hits
+/// a type mismatch (e.g. comparing a Null/non-numeric value against a number)
+/// — those rows are silently dropped, but the count is surfaced so the UI can
+/// flag what would otherwise be invisible row loss.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterNotes {
+    pub error_drops: usize,
+}
+
+/// Apply a filter and return its output plus diagnostic stats. Used by the UI
+/// to surface notes; `FilterSpec::apply` is just this with stats discarded.
+pub fn apply_with_notes(
+    spec: &FilterSpec,
+    input: PipelineValue,
+) -> Result<(PipelineValue, FilterNotes), FilterError> {
+    match spec {
+        FilterSpec::Where { predicate } => {
+            let (value, error_drops) = apply_where_with_notes(input, predicate)?;
+            Ok((value, FilterNotes { error_drops }))
+        }
+        other => Ok((other.apply(input)?, FilterNotes::default())),
+    }
+}
+
 impl Filter for FilterSpec {
     fn apply(&self, input: PipelineValue) -> Result<PipelineValue, FilterError> {
         match self {
@@ -228,6 +253,13 @@ fn apply_from_fields(input: PipelineValue) -> Result<PipelineValue, FilterError>
 }
 
 fn apply_where(input: PipelineValue, predicate: &Predicate) -> Result<PipelineValue, FilterError> {
+    apply_where_with_notes(input, predicate).map(|(v, _)| v)
+}
+
+fn apply_where_with_notes(
+    input: PipelineValue,
+    predicate: &Predicate,
+) -> Result<(PipelineValue, usize), FilterError> {
     let items = require_list(input)?;
 
     // Pre-validate the predicate against the first record's schema and any
@@ -243,11 +275,18 @@ fn apply_where(input: PipelineValue, predicate: &Predicate) -> Result<PipelineVa
         validate_predicate(predicate, sample)?;
     }
 
+    let mut error_drops = 0usize;
     let kept: Vec<Value> = items
         .into_iter()
-        .filter(|item| predicate.evaluate(item).unwrap_or(false))
+        .filter(|item| match predicate.evaluate(item) {
+            Ok(b) => b,
+            Err(_) => {
+                error_drops += 1;
+                false
+            }
+        })
         .collect();
-    Ok(PipelineValue::Structured(Value::List(kept)))
+    Ok((PipelineValue::Structured(Value::List(kept)), error_drops))
 }
 
 fn validate_predicate(
@@ -735,6 +774,39 @@ mod tests {
             b"strawberry\nblueberry\nblackberry\nbanana\n",
         );
         assert_eq!(lines_of(result), vec!["blueberry", "blackberry"]);
+    }
+
+    #[test]
+    fn apply_with_notes_counts_error_drops_on_where() {
+        // Same fixture as the lenient-row test, but using apply_with_notes
+        // to verify the count of rows skipped due to type mismatch.
+        let mut value = PipelineValue::Bytes(Bytes::from_static(
+            b"total 5\nfile1 1 100\nfile2 1 5\nfile3 1 50\n",
+        ));
+        let (v, notes) = apply_with_notes(&FilterSpec::FromFields, value).unwrap();
+        assert_eq!(notes.error_drops, 0);
+        value = v;
+
+        let where_spec = FilterSpec::Where {
+            predicate: Predicate::Compare {
+                column: "_3".into(),
+                op: CompareOp::Gt,
+                value: Value::Int(10),
+            },
+        };
+        let (_v, notes) = apply_with_notes(&where_spec, value).unwrap();
+        // Only the "total 5" row has a Null _3; other rows compare normally.
+        assert_eq!(notes.error_drops, 1);
+    }
+
+    #[test]
+    fn apply_with_notes_zero_for_non_where_filters() {
+        let (_, notes) = apply_with_notes(
+            &FilterSpec::FromLines,
+            PipelineValue::Bytes(Bytes::from_static(b"a\nb\n")),
+        )
+        .unwrap();
+        assert_eq!(notes.error_drops, 0);
     }
 
     #[test]

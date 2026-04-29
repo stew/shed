@@ -12,7 +12,7 @@ use ratatui::{
 };
 use shed_core::{
     Block, BlockId, BlockState, Capture, CompareOp, Filter, FilterSpec, PipelineValue, Predicate,
-    Session, SortDirection, SortKey, Value,
+    Session, SortDirection, SortKey, Value, apply_with_notes,
 };
 use tokio::task::JoinHandle;
 
@@ -1480,35 +1480,61 @@ fn render_block_preview(block: &Block) -> Vec<Line<'static>> {
     let Some(capture) = &block.capture else {
         return Vec::new();
     };
-    let value = apply_pipeline(&capture.stdout, &block.pipeline);
-    render_value_or_error(value)
+    match apply_pipeline(&capture.stdout, &block.pipeline) {
+        Ok((value, notes)) => {
+            let mut lines = render_pipeline_value(value);
+            for note in &notes {
+                lines.push(note_line(note));
+            }
+            lines
+        }
+        Err(e) => filter_error_lines(&e),
+    }
 }
 
+/// Apply a pipeline of filters and accumulate per-filter diagnostic notes
+/// (currently: where filters that silently dropped rows due to type mismatch).
 fn apply_pipeline(
     bytes: &bytes::Bytes,
     pipeline: &[FilterSpec],
-) -> Result<PipelineValue, String> {
+) -> Result<(PipelineValue, Vec<String>), String> {
     let mut value = PipelineValue::Bytes(bytes.clone());
-    for filter in pipeline {
-        match filter.apply(value) {
-            Ok(v) => value = v,
+    let mut notes: Vec<String> = Vec::new();
+    for (i, filter) in pipeline.iter().enumerate() {
+        match apply_with_notes(filter, value) {
+            Ok((v, n)) => {
+                if n.error_drops > 0 {
+                    notes.push(format!(
+                        "filter {} dropped {} row{} (type mismatch)",
+                        circled(i + 1),
+                        n.error_drops,
+                        if n.error_drops == 1 { "" } else { "s" },
+                    ));
+                }
+                value = v;
+            }
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok(value)
+    Ok((value, notes))
 }
 
-fn render_value_or_error(value: Result<PipelineValue, String>) -> Vec<Line<'static>> {
-    match value {
-        Ok(v) => render_pipeline_value(v),
-        Err(e) => vec![Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("filter error: {e}"),
-                Style::default().fg(Color::Red),
-            ),
-        ])],
-    }
+fn note_line(message: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("      "),
+        Span::styled("ⓘ ", Style::default().fg(Color::Yellow)),
+        Span::styled(message.to_string(), Style::default().fg(Color::Yellow)),
+    ])
+}
+
+fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        Span::raw("      "),
+        Span::styled(
+            format!("filter error: {message}"),
+            Style::default().fg(Color::Red),
+        ),
+    ])]
 }
 
 fn render_raw_lines(bytes: &bytes::Bytes, max: usize) -> Vec<Line<'static>> {
@@ -1754,16 +1780,15 @@ fn compute_preview_lines(
         (Some(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
         _ => {}
     }
-    let value = apply_pipeline(&capture.stdout, &hypothetical);
-    match value {
-        Ok(v) => render_pipeline_value_with_max(v, max),
-        Err(e) => vec![Line::from(vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("filter error: {e}"),
-                Style::default().fg(Color::Red),
-            ),
-        ])],
+    match apply_pipeline(&capture.stdout, &hypothetical) {
+        Ok((value, notes)) => {
+            let mut lines = render_pipeline_value_with_max(value, max);
+            for note in &notes {
+                lines.push(note_line(note));
+            }
+            lines
+        }
+        Err(e) => filter_error_lines(&e),
     }
 }
 
