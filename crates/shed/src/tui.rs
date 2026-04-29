@@ -321,6 +321,15 @@ const ACTIONS: &[Action] = &[
         },
     },
     Action {
+        name: "Edit command in place",
+        description: "Edit the selected block's argv; re-runs it and any pinned-name dependents",
+        enabled: block_selected,
+        handler: |app| {
+            app.focus = Focus::BlockCursor;
+            open_cmd_edit(app);
+        },
+    },
+    Action {
         name: "Rerun command",
         description: "Re-run the block's command (edited) with the same pipeline",
         enabled: block_selected,
@@ -1336,6 +1345,12 @@ struct App {
     rerun_input: String,
     rerun_source_id: Option<BlockId>,
     pending_rerun: Option<RerunRequest>,
+    /// True when the BlockCursor's "filter cursor" has been pulled left
+    /// past the first filter onto the command itself. Visually highlights
+    /// the argv span; Enter opens the in-place command editor.
+    command_focused: bool,
+    cmd_edit_input_mode: bool,
+    cmd_edit_input: String,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
     note_edit: Option<NoteEditState>,
@@ -1419,6 +1434,9 @@ impl App {
             rerun_input: String::new(),
             rerun_source_id: None,
             pending_rerun: None,
+            command_focused: false,
+            cmd_edit_input_mode: false,
+            cmd_edit_input: String::new(),
             last_cwd: None,
             env_edit: None,
             note_edit: None,
@@ -1475,6 +1493,7 @@ impl App {
     }
 
     fn reset_pipeline_cursor(&mut self) {
+        self.command_focused = false;
         self.pipeline_cursor = self
             .session
             .cursor()
@@ -1631,6 +1650,113 @@ fn build_run_chain(session: &Session, target: BlockId, visited: &mut HashSet<Blo
     }
     chain.push(target);
     chain
+}
+
+/// Walk *downward* from `source` to find every block whose argv is
+/// `@<source's name>` (recursively, so dependents-of-dependents are
+/// included). Output is in BFS order so a downstream rebuild runs
+/// closest first. Source must be pinned for the search to find anything.
+fn collect_dependents_recursive(
+    session: &Session,
+    source: BlockId,
+    out: &mut Vec<BlockId>,
+    visited: &mut HashSet<BlockId>,
+) {
+    if !visited.insert(source) {
+        return;
+    }
+    let Some(name) = session.block(source).and_then(|b| b.name.clone()) else {
+        return;
+    };
+    let target = format!("@{name}");
+    let direct: Vec<BlockId> = session
+        .blocks()
+        .filter(|b| b.argv.len() == 1 && b.argv[0] == target)
+        .map(|b| b.id)
+        .collect();
+    for id in &direct {
+        if !out.contains(id) {
+            out.push(*id);
+        }
+    }
+    for id in direct {
+        collect_dependents_recursive(session, id, out, visited);
+    }
+}
+
+/// Like `queue_run_chain`, but additionally re-runs any `@-ref`
+/// dependents of `target` after `target` itself completes. Used by the
+/// in-place command editor: changing a source's argv makes any snapshot
+/// of it stale, so dependents need a refresh too.
+fn queue_edit_chain(app: &mut App, target: BlockId) {
+    let mut chain: Vec<BlockId> = Vec::new();
+    let mut visited = HashSet::new();
+    chain.extend(build_run_chain(&app.session, target, &mut visited));
+
+    let mut down_visited: HashSet<BlockId> = HashSet::new();
+    let mut downward: Vec<BlockId> = Vec::new();
+    collect_dependents_recursive(&app.session, target, &mut downward, &mut down_visited);
+    chain.extend(downward);
+
+    let n = chain.len();
+    if n > 1 {
+        let dependents = n - 1;
+        let plural = if dependents == 1 { "block" } else { "blocks" };
+        app.flash = Some(format!(
+            "re-running %{} and {dependents} dependent {plural}",
+            target.0
+        ));
+    }
+
+    for id in chain {
+        if app.chain_in_flight != Some(id) && !app.pending_run_chain.contains(&id) {
+            app.pending_run_chain.push_back(id);
+        }
+    }
+}
+
+fn open_cmd_edit(app: &mut App) {
+    let Some(id) = app.session.cursor() else {
+        app.flash = Some("no block selected".into());
+        return;
+    };
+    let Some(block) = app.session.block(id) else { return };
+    if block.argv.is_empty() {
+        app.flash = Some("nothing to edit".into());
+        return;
+    }
+    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
+        .unwrap_or_else(|_| block.argv.join(" "));
+    app.cmd_edit_input = joined;
+    app.cmd_edit_input_mode = true;
+}
+
+/// Apply the edited command to the cursor block in place, then queue
+/// the block plus any pinned-name dependents for re-run.
+fn commit_cmd_edit(app: &mut App) {
+    let input = std::mem::take(&mut app.cmd_edit_input);
+    app.cmd_edit_input_mode = false;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        app.flash = Some("command required".into());
+        return;
+    }
+    let Some(argv) = shlex::split(trimmed) else {
+        app.flash = Some("unmatched quote".into());
+        return;
+    };
+    if argv.is_empty() {
+        return;
+    }
+    let Some(id) = app.session.cursor() else { return };
+    if let Some(block) = app.session.block_mut(id) {
+        block.argv = argv;
+    } else {
+        return;
+    }
+    app.command_focused = false;
+    app.mark_dirty();
+    queue_edit_chain(app, id);
 }
 
 fn queue_run_chain(app: &mut App, target: BlockId) {
@@ -2424,10 +2550,26 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    if app.cmd_edit_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.cmd_edit_input_mode = false;
+                app.cmd_edit_input.clear();
+            }
+            KeyCode::Enter => commit_cmd_edit(app),
+            KeyCode::Char(c) => app.cmd_edit_input.push(c),
+            KeyCode::Backspace => {
+                app.cmd_edit_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             app.focus = Focus::Prompt;
             app.session.set_cursor(None);
+            app.command_focused = false;
         }
         KeyCode::Up => app.move_cursor(-1),
         KeyCode::Down => app.move_cursor(1),
@@ -2437,7 +2579,13 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => delete_block_at_cursor(app),
         KeyCode::Char('n') => open_note_edit(app, NotePosition::Pre),
         KeyCode::Char('N') => open_note_edit(app, NotePosition::Post),
-        KeyCode::Char('f') | KeyCode::Enter => open_filter_edit(app),
+        KeyCode::Char('f') | KeyCode::Enter => {
+            if app.command_focused {
+                open_cmd_edit(app);
+            } else {
+                open_filter_edit(app);
+            }
+        }
         KeyCode::Char('i') => open_filter_insert(app),
         KeyCode::Char('d') => drop_filter_at_cursor(app),
         KeyCode::Char('<') => move_filter_in_pipeline(app, -1),
@@ -2997,6 +3145,19 @@ fn move_filter_cursor(app: &mut App, delta: i32) {
     let Some(len) = app.cursor_block_pipeline_len() else {
         return;
     };
+    // Pulling left at filter index 0 jumps onto the command itself; the
+    // command sits one virtual slot to the left of the first filter.
+    if app.command_focused {
+        if delta > 0 {
+            app.command_focused = false;
+            app.pipeline_cursor = 0;
+        }
+        return;
+    }
+    if delta < 0 && app.pipeline_cursor == 0 {
+        app.command_focused = true;
+        return;
+    }
     let max = len as i32;
     let new = (app.pipeline_cursor as i32 + delta).clamp(0, max) as usize;
     app.pipeline_cursor = new;
@@ -4398,7 +4559,8 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
         } else {
             None
         };
-        lines.extend(render_block(block, selected, pipeline_cursor));
+        let command_focused = selected && app.command_focused;
+        lines.extend(render_block(block, selected, pipeline_cursor, command_focused));
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, area);
@@ -4408,6 +4570,7 @@ fn render_block(
     block: &Block,
     selected: bool,
     pipeline_cursor: Option<usize>,
+    command_focused: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -4451,7 +4614,12 @@ fn render_block(
         Span::raw(" "),
         Span::styled(
             block.argv.join(" "),
-            if selected {
+            if command_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -4459,7 +4627,11 @@ fn render_block(
         ),
     ];
     // Inline pipeline filters: command │ from-fields │ where … │ + add
-    let show_pipeline = !block.pipeline.is_empty() || pipeline_cursor.is_some();
+    // When command_focused is true the cursor is on the argv; treat the
+    // pipeline as unfocused so no filter wears the magenta highlight and
+    // the `+ add` slot is suppressed.
+    let effective_cursor = if command_focused { None } else { pipeline_cursor };
+    let show_pipeline = !block.pipeline.is_empty() || effective_cursor.is_some();
     if show_pipeline {
         let highlight = Style::default()
             .fg(Color::Black)
@@ -4471,7 +4643,7 @@ fn render_block(
 
         for (i, f) in block.pipeline.iter().enumerate() {
             header.push(Span::styled(" │ ", dim));
-            let style = if pipeline_cursor == Some(i) {
+            let style = if effective_cursor == Some(i) {
                 highlight
             } else {
                 normal
@@ -4482,9 +4654,9 @@ fn render_block(
                 header.push(Span::styled(format!(" ⓘ-{n}"), warn));
             }
         }
-        if pipeline_cursor.is_some() {
+        if effective_cursor.is_some() {
             header.push(Span::styled(" │ ", dim));
-            let style = if pipeline_cursor == Some(block.pipeline.len()) {
+            let style = if effective_cursor == Some(block.pipeline.len()) {
                 highlight
             } else {
                 dim
@@ -5526,6 +5698,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(widget, area);
         return;
     }
+    if app.cmd_edit_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "edit cmd: ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.cmd_edit_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Magenta)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if app.pin_input_mode {
         let widget = Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -5611,9 +5799,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::BlockCursor => vec![
+        Focus::BlockCursor if app.command_focused => vec![
             ("↑↓", "blocks"),
             ("←→", "filters"),
+            ("f / Enter", "edit cmd"),
+            ("Space", "run"),
+            ("x", "delete"),
+            ("r", "rerun copy"),
+            ("Esc", "back"),
+        ],
+        Focus::BlockCursor => vec![
+            ("↑↓", "blocks"),
+            ("←→", "filters / cmd"),
             ("Space", "run"),
             ("<>", "reorder"),
             ("f", "add/edit"),
@@ -6820,6 +7017,86 @@ mod tests {
         }
         commit_note_edit(&mut app);
         assert!(app.session.block(id).unwrap().pre_text.is_none());
+    }
+
+    #[test]
+    fn move_filter_cursor_jumps_left_to_command() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["ls".into()]);
+        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session.set_cursor(Some(id));
+        app.pipeline_cursor = 0;
+        app.command_focused = false;
+
+        // Pull left at index 0 → command_focused becomes true.
+        move_filter_cursor(&mut app, -1);
+        assert!(app.command_focused);
+
+        // Push right → returns to filter index 0.
+        move_filter_cursor(&mut app, 1);
+        assert!(!app.command_focused);
+        assert_eq!(app.pipeline_cursor, 0);
+    }
+
+    #[test]
+    fn collect_dependents_finds_recursive_at_refs() {
+        let mut s = Session::new();
+        let root = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        s.pin(root, "root".into());
+
+        let a = s.add_block(vec!["@root".into()]);
+        s.pin(a, "a".into());
+
+        let b = s.add_block(vec!["@a".into()]);
+
+        // Unrelated:
+        let _other = s.add_block(vec!["echo".into()]);
+
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        collect_dependents_recursive(&s, root, &mut out, &mut visited);
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn commit_cmd_edit_updates_argv_and_queues_self_plus_dependents() {
+        let mut app = App::new();
+        app.history.clear();
+        let src = app.session.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        app.session.set_state(src, BlockState::Done(0));
+        app.session.pin(src, "src".into());
+
+        let dep = app.session.add_block(vec!["@src".into()]);
+        app.session.set_state(dep, BlockState::Done(0));
+
+        app.session.set_cursor(Some(src));
+        app.cmd_edit_input = "seq 1 5".into();
+        app.cmd_edit_input_mode = true;
+        commit_cmd_edit(&mut app);
+
+        assert!(!app.cmd_edit_input_mode);
+        assert_eq!(
+            app.session.block(src).unwrap().argv,
+            vec!["seq", "1", "5"]
+        );
+        // Both source (re-run) and dependent (re-snapshot) queued.
+        let queued: Vec<_> = app.pending_run_chain.iter().copied().collect();
+        assert_eq!(queued, vec![src, dep]);
+    }
+
+    #[test]
+    fn commit_cmd_edit_rejects_unmatched_quote() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        app.cmd_edit_input = r#"echo "unclosed"#.into();
+        app.cmd_edit_input_mode = true;
+        commit_cmd_edit(&mut app);
+        // argv unchanged, flash set, mode cleared.
+        assert_eq!(app.session.block(id).unwrap().argv, vec!["echo"]);
+        assert!(app.flash.as_deref().unwrap_or("").contains("unmatched"));
     }
 
     #[test]

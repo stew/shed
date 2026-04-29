@@ -302,7 +302,8 @@ so you don't lose data without noticing.
 | Key       | Action |
 |-----------|--------|
 | `↑↓`      | navigate between blocks |
-| `←→`      | navigate filters within the selected block (and the `+ add` slot) |
+| `←→`      | navigate filters within the selected block (and the `+ add` slot). Pulling left at the first filter steps onto the command itself (highlighted in magenta); right returns to the filter row. |
+| `f` / Enter on the command | open an in-place command editor (input bar pre-fills with the shlex-quoted argv). Commit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
 | Space     | run the selected block in place (re-spawns its argv, replaces the capture). Use this to execute Idle blocks loaded from a notebook, or to re-run a finished block without typing it again. For `@name` snapshot blocks this re-snapshots from the source. |
 | `f` / Enter | edit selected filter / add new |
 | `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
