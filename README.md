@@ -207,6 +207,8 @@ so you don't lose data without noticing.
 | `↑↓`      | navigate between blocks |
 | `←→`      | navigate filters within the selected block (and the `+ add` slot) |
 | `f` / Enter | edit selected filter / add new |
+| `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
+| `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
 | `d`       | drop the filter at cursor (or last if on add slot) |
 | `e`       | expand the selected block to a fullscreen pager |
 | Ctrl-C    | cancel a running command (kills the child) |
@@ -314,9 +316,6 @@ Known gaps and likely next steps, in rough priority order:
 - vt100 emulation for cursor-positioning programs (cargo progress
   bars, etc.) — captured output currently shows the
   flattened-and-stacked version
-- Insert filter at a specific index (currently you can append or
-  replace, not insert in the middle)
-- Reorder existing pipeline filters (Alt-↑/↓)
 - Persistent prompt history (currently in-memory only; lost on quit)
 - Command palette (universal `Space` / `Ctrl-K` action menu)
 - Saved/named pipelines as reusable computations

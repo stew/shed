@@ -460,6 +460,21 @@ fn value_to_input_string(v: &Value) -> String {
     }
 }
 
+/// How the in-progress filter will be committed when the user presses
+/// Enter. Set when entering FilterEdit and respected by `apply_filter_edit`,
+/// the live preview's hypothetical pipeline, and the stack-pane renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    /// Append to the end of the pipeline (`f` from `+ add` slot).
+    Add,
+    /// Replace the existing filter at this index (`f` on a filter).
+    Edit(usize),
+    /// Insert as a new filter before the existing one at this index
+    /// (`i` on a filter); existing filters from this index onward
+    /// shift right by one.
+    Insert(usize),
+}
+
 struct FilterEditState {
     block_id: BlockId,
     kind: FilterKind,
@@ -478,11 +493,11 @@ struct FilterEditState {
     rename_cursor: usize,
     available_columns: Vec<String>,
     field: FormField,
-    editing_index: Option<usize>,
+    mode: EditMode,
 }
 
 impl FilterEditState {
-    fn empty(block_id: BlockId, available_columns: Vec<String>, editing_index: Option<usize>) -> Self {
+    fn empty(block_id: BlockId, available_columns: Vec<String>, mode: EditMode) -> Self {
         let column_selections = vec![false; available_columns.len()];
         Self {
             block_id,
@@ -506,13 +521,24 @@ impl FilterEditState {
             rename_cursor: 0,
             available_columns,
             field: FormField::Kind,
-            editing_index,
+            mode,
         }
     }
 
     fn for_add(block: &Block) -> Self {
         let available_columns = compute_schema_at(block, block.pipeline.len());
-        let mut state = Self::empty(block.id, available_columns, None);
+        let mut state = Self::empty(block.id, available_columns, EditMode::Add);
+        state.kind = if state.available_columns.is_empty() {
+            FilterKind::FromLines
+        } else {
+            FilterKind::Where
+        };
+        state
+    }
+
+    fn for_insert(block: &Block, index: usize) -> Self {
+        let available_columns = compute_schema_at(block, index);
+        let mut state = Self::empty(block.id, available_columns, EditMode::Insert(index));
         state.kind = if state.available_columns.is_empty() {
             FilterKind::FromLines
         } else {
@@ -523,7 +549,7 @@ impl FilterEditState {
 
     fn for_edit(block: &Block, index: usize) -> Self {
         let available_columns = compute_schema_at(block, index);
-        let mut state = Self::empty(block.id, available_columns, Some(index));
+        let mut state = Self::empty(block.id, available_columns, EditMode::Edit(index));
         match block.pipeline.get(index) {
             Some(FilterSpec::FromLines) => state.kind = FilterKind::FromLines,
             Some(FilterSpec::FromFields) => state.kind = FilterKind::FromFields,
@@ -1208,7 +1234,10 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Left => move_filter_cursor(app, -1),
         KeyCode::Right => move_filter_cursor(app, 1),
         KeyCode::Char('f') | KeyCode::Enter => open_filter_edit(app),
+        KeyCode::Char('i') => open_filter_insert(app),
         KeyCode::Char('d') => drop_filter_at_cursor(app),
+        KeyCode::Char('<') => move_filter_in_pipeline(app, -1),
+        KeyCode::Char('>') => move_filter_in_pipeline(app, 1),
         KeyCode::Char('e') => {
             if app.session.cursor().is_some() {
                 app.expand_scroll = 0;
@@ -1480,12 +1509,8 @@ fn move_filter_cursor(app: &mut App, delta: i32) {
 }
 
 fn open_filter_edit(app: &mut App) {
-    let Some(id) = app.session.cursor() else {
-        return;
-    };
-    let Some(block) = app.session.block(id) else {
-        return;
-    };
+    let Some(id) = app.session.cursor() else { return };
+    let Some(block) = app.session.block(id) else { return };
     if block.capture.is_none() {
         let msg = match block.state {
             BlockState::Running => "still running — no capture yet",
@@ -1496,6 +1521,27 @@ fn open_filter_edit(app: &mut App) {
     }
     let state = if app.pipeline_cursor < block.pipeline.len() {
         FilterEditState::for_edit(block, app.pipeline_cursor)
+    } else {
+        FilterEditState::for_add(block)
+    };
+    app.filter_edit = Some(state);
+    app.focus = Focus::FilterEdit;
+}
+
+fn open_filter_insert(app: &mut App) {
+    let Some(id) = app.session.cursor() else { return };
+    let Some(block) = app.session.block(id) else { return };
+    if block.capture.is_none() {
+        let msg = match block.state {
+            BlockState::Running => "still running — no capture yet",
+            _ => "no captured output to filter",
+        };
+        app.flash = Some(msg.into());
+        return;
+    }
+    // On the `+ add` slot, `i` is functionally the same as `f`.
+    let state = if app.pipeline_cursor < block.pipeline.len() {
+        FilterEditState::for_insert(block, app.pipeline_cursor)
     } else {
         FilterEditState::for_add(block)
     };
@@ -1753,17 +1799,37 @@ fn apply_filter_edit(app: &mut App) {
         return;
     };
     let id = state.block_id;
-    let editing_index = state.editing_index;
+    let mode = state.mode;
     if let Some(block) = app.session.block_mut(id) {
-        match editing_index {
-            None => block.pipeline.push(spec),
-            Some(i) if i < block.pipeline.len() => block.pipeline[i] = spec,
-            Some(_) => block.pipeline.push(spec),
+        match mode {
+            EditMode::Add => block.pipeline.push(spec),
+            EditMode::Edit(i) if i < block.pipeline.len() => block.pipeline[i] = spec,
+            EditMode::Edit(_) => block.pipeline.push(spec),
+            EditMode::Insert(i) => {
+                let pos = i.min(block.pipeline.len());
+                block.pipeline.insert(pos, spec);
+            }
         }
     }
     app.filter_edit = None;
     app.focus = Focus::BlockCursor;
     app.reset_pipeline_cursor();
+}
+
+fn move_filter_in_pipeline(app: &mut App, delta: i32) {
+    let Some(id) = app.session.cursor() else { return };
+    let pos = app.pipeline_cursor;
+    let Some(block) = app.session.block_mut(id) else { return };
+    if pos >= block.pipeline.len() {
+        return; // Cursor is on the `+ add` slot, nothing to move.
+    }
+    let new_pos_signed = pos as i32 + delta;
+    if new_pos_signed < 0 || new_pos_signed as usize >= block.pipeline.len() {
+        return;
+    }
+    let new_pos = new_pos_signed as usize;
+    block.pipeline.swap(pos, new_pos);
+    app.pipeline_cursor = new_pos;
 }
 
 fn drop_filter_at_cursor(app: &mut App) {
@@ -1958,10 +2024,9 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
         return;
     };
 
-    let stack_rows = if state.editing_index.is_some() {
-        block.pipeline.len()
-    } else {
-        block.pipeline.len() + 1
+    let stack_rows = match state.mode {
+        EditMode::Add | EditMode::Insert(_) => block.pipeline.len() + 1,
+        EditMode::Edit(_) => block.pipeline.len(),
     };
     let stack_height = stack_rows.max(1) as u16 + 2;
     let form_height = state.form_lines() + 2;
@@ -1998,9 +2063,13 @@ fn hypothetical_outcome(
 ) -> Option<Result<(PipelineValue, Vec<usize>), String>> {
     let capture = block.capture.as_ref()?;
     let mut hypothetical: Vec<FilterSpec> = block.pipeline.clone();
-    match (state.editing_index, state.build_filter()) {
-        (None, Some(spec)) => hypothetical.push(spec),
-        (Some(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
+    match (state.mode, state.build_filter()) {
+        (EditMode::Add, Some(spec)) => hypothetical.push(spec),
+        (EditMode::Edit(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
+        (EditMode::Insert(i), Some(spec)) => {
+            let pos = i.min(hypothetical.len());
+            hypothetical.insert(pos, spec);
+        }
         _ => {}
     }
     Some(apply_pipeline(&capture.stdout, &hypothetical))
@@ -2485,7 +2554,31 @@ fn draw_stack_pane(
     let warn = Style::default().fg(Color::Yellow);
     let mut lines: Vec<Line> = Vec::new();
     for (i, spec) in block.pipeline.iter().enumerate() {
-        let is_editing_here = state.editing_index == Some(i);
+        // Insert mode: emit the in-progress row before the existing
+        // filter at the insert index. The hypothetical pipeline has the
+        // new filter at index i, so drops[i] reports the new filter's
+        // type-mismatch count; drops indices for existing filters at or
+        // after the insert position shift up by one.
+        if state.mode == EditMode::Insert(i) {
+            let n = drops.get(i).copied().unwrap_or(0);
+            let mut spans = vec![
+                Span::styled("  ▸ ", edit_style),
+                Span::styled(active_label.clone(), edit_style),
+                Span::styled(
+                    format!("  ← inserting before {}", circled(i + 1)),
+                    dim,
+                ),
+            ];
+            if n > 0 {
+                spans.push(Span::styled(
+                    format!("  ⓘ -{n} (type mismatch)"),
+                    warn,
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let is_editing_here = state.mode == EditMode::Edit(i);
         let (label, style, suffix) = if is_editing_here {
             (active_label.clone(), edit_style, Some("  ← editing"))
         } else {
@@ -2498,7 +2591,13 @@ fn draw_stack_pane(
         if let Some(s) = suffix {
             spans.push(Span::styled(s, dim));
         }
-        let n = drops.get(i).copied().unwrap_or(0);
+        // For Insert mode, the existing filter at original index i
+        // lives in hypothetical at i+1, so use the shifted drops index.
+        let drops_idx = match state.mode {
+            EditMode::Insert(j) if i >= j => i + 1,
+            _ => i,
+        };
+        let n = drops.get(drops_idx).copied().unwrap_or(0);
         if n > 0 {
             spans.push(Span::styled(
                 format!("  ⓘ -{n} (type mismatch)"),
@@ -2507,7 +2606,7 @@ fn draw_stack_pane(
         }
         lines.push(Line::from(spans));
     }
-    if state.editing_index.is_none() {
+    if state.mode == EditMode::Add {
         let mut spans = vec![
             Span::styled(
                 format!("  {} ", circled(block.pipeline.len() + 1)),
@@ -2948,7 +3047,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Focus::BlockCursor => vec![
             ("↑↓", "blocks"),
             ("←→", "filters"),
+            ("<>", "reorder"),
             ("f", "add/edit"),
+            ("i", "insert"),
             ("d", "drop"),
             ("e", "expand"),
             ("Ctrl-C", "cancel"),
@@ -3049,7 +3150,7 @@ mod tests {
         let block = block_with_stdout(b"a\nb\nc\n");
         let state = FilterEditState::for_add(&block);
         assert_eq!(state.kind, FilterKind::FromLines);
-        assert_eq!(state.editing_index, None);
+        assert_eq!(state.mode, EditMode::Add);
     }
 
     #[test]
@@ -3649,7 +3750,7 @@ mod tests {
         });
         let state = FilterEditState::for_edit(&block, 1);
         assert_eq!(state.kind, FilterKind::Where);
-        assert_eq!(state.editing_index, Some(1));
+        assert_eq!(state.mode, EditMode::Edit(1));
         assert_eq!(state.where_clauses[0].pattern, "bb");
         assert_eq!(state.available_columns, vec!["line".to_string()]);
         assert_eq!(state.selected_column(), Some("line"));
@@ -3661,6 +3762,38 @@ mod tests {
         block.pipeline.push(FilterSpec::FromLines);
         let state = FilterEditState::for_edit(&block, 0);
         assert_eq!(state.kind, FilterKind::FromLines);
-        assert_eq!(state.editing_index, Some(0));
+        assert_eq!(state.mode, EditMode::Edit(0));
+    }
+
+    #[test]
+    fn for_insert_inserts_before_existing_filter() {
+        let mut block = block_with_stdout(b"a\nb\nc\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Take { n: 5 });
+        let state = FilterEditState::for_insert(&block, 1);
+        assert_eq!(state.mode, EditMode::Insert(1));
+        // Schema is computed BEFORE index 1, i.e. after FromLines.
+        assert_eq!(state.available_columns, vec!["line".to_string()]);
+    }
+
+    #[test]
+    fn apply_filter_edit_insert_pushes_existing_right() {
+        let mut block = block_with_stdout(b"a\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Take { n: 5 });
+        // Insert a `where` between FromLines and Take.
+        let mut state = FilterEditState::for_insert(&block, 1);
+        state.kind = FilterKind::Where;
+        state.where_clauses[0].pattern = "x".into();
+        // Direct pipeline mutation (mirrors apply_filter_edit's logic).
+        let spec = state.build_filter().expect("buildable");
+        match state.mode {
+            EditMode::Insert(i) => block.pipeline.insert(i, spec),
+            _ => panic!("expected Insert"),
+        }
+        assert_eq!(block.pipeline.len(), 3);
+        assert!(matches!(block.pipeline[0], FilterSpec::FromLines));
+        assert!(matches!(block.pipeline[1], FilterSpec::Where { .. }));
+        assert!(matches!(block.pipeline[2], FilterSpec::Take { n: 5 }));
     }
 }
