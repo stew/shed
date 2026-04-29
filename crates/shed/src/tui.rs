@@ -20,6 +20,8 @@ use crate::exec::{ExecError, run_command};
 
 type CommandTask = JoinHandle<Result<Capture, ExecError>>;
 
+const MAX_SORT_KEYS: usize = 5;
+
 const FULLSCREEN_PROGRAMS: &[&str] = &[
     "top", "htop", "btop", "atop", "glances", "iotop", "iftop", "ncdu",
     "vi", "vim", "nvim", "emacs", "emacsclient", "nano", "pico",
@@ -149,8 +151,7 @@ enum FormField {
     CsvDelim,
     CsvHasHeader,
     RegexPattern,
-    SortColumn,
-    SortDir,
+    SortKeys,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,8 +278,8 @@ struct FilterEditState {
     csv_delim: char,
     csv_has_header: bool,
     regex_pattern: String,
-    sort_column: usize,
-    sort_direction: SortDirection,
+    sort_keys: Vec<(usize, SortDirection)>,
+    sort_keys_cursor: usize,
     available_columns: Vec<String>,
     field: FormField,
     editing_index: Option<usize>,
@@ -299,8 +300,12 @@ impl FilterEditState {
             csv_delim: ',',
             csv_has_header: true,
             regex_pattern: String::new(),
-            sort_column: 0,
-            sort_direction: SortDirection::Asc,
+            sort_keys: if available_columns.is_empty() {
+                Vec::new()
+            } else {
+                vec![(0, SortDirection::Asc)]
+            },
+            sort_keys_cursor: 0,
             available_columns,
             field: FormField::Kind,
             editing_index,
@@ -336,13 +341,20 @@ impl FilterEditState {
             }
             Some(FilterSpec::SortBy { keys }) => {
                 state.kind = FilterKind::SortBy;
-                if let Some(first) = keys.first() {
-                    state.sort_column = state
-                        .available_columns
-                        .iter()
-                        .position(|c| c == &first.column)
-                        .unwrap_or(0);
-                    state.sort_direction = first.direction;
+                state.sort_keys = keys
+                    .iter()
+                    .take(MAX_SORT_KEYS)
+                    .map(|k| {
+                        let idx = state
+                            .available_columns
+                            .iter()
+                            .position(|c| c == &k.column)
+                            .unwrap_or(0);
+                        (idx, k.direction)
+                    })
+                    .collect();
+                if state.sort_keys.is_empty() && !state.available_columns.is_empty() {
+                    state.sort_keys.push((0, SortDirection::Asc));
                 }
             }
             Some(FilterSpec::Uniq { by }) => {
@@ -450,23 +462,23 @@ impl FilterEditState {
                 &[FormField::Kind, FormField::Columns]
             }
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
-            FilterKind::SortBy => &[FormField::Kind, FormField::SortColumn, FormField::SortDir],
+            FilterKind::SortBy => &[FormField::Kind, FormField::SortKeys],
         }
     }
 
-    fn cycle_sort_column(&mut self, delta: i32) {
-        if self.available_columns.is_empty() {
-            return;
+    fn field_height(&self, field: FormField) -> u16 {
+        match field {
+            FormField::SortKeys => {
+                let n = self.sort_keys.len();
+                let with_add = if n < MAX_SORT_KEYS { n + 1 } else { n };
+                with_add.max(1) as u16
+            }
+            _ => 1,
         }
-        let len = self.available_columns.len() as i32;
-        self.sort_column = (self.sort_column as i32 + delta).rem_euclid(len) as usize;
     }
 
-    fn flip_sort_direction(&mut self) {
-        self.sort_direction = match self.sort_direction {
-            SortDirection::Asc => SortDirection::Desc,
-            SortDirection::Desc => SortDirection::Asc,
-        };
+    fn form_lines(&self) -> u16 {
+        self.fields().iter().map(|f| self.field_height(*f)).sum()
     }
 
     fn cycle_delim(&mut self, delta: i32) {
@@ -591,13 +603,24 @@ impl FilterEditState {
             FilterKind::Take => self.parsed_n().map(|n| FilterSpec::Take { n }),
             FilterKind::Skip => self.parsed_n().map(|n| FilterSpec::Skip { n }),
             FilterKind::SortBy => {
-                let col = self.available_columns.get(self.sort_column)?.clone();
-                Some(FilterSpec::SortBy {
-                    keys: vec![SortKey {
-                        column: col,
-                        direction: self.sort_direction,
-                    }],
-                })
+                if self.sort_keys.is_empty() {
+                    return None;
+                }
+                let keys: Vec<SortKey> = self
+                    .sort_keys
+                    .iter()
+                    .filter_map(|(idx, dir)| {
+                        self.available_columns.get(*idx).map(|col| SortKey {
+                            column: col.clone(),
+                            direction: *dir,
+                        })
+                    })
+                    .collect();
+                if keys.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::SortBy { keys })
+                }
             }
             FilterKind::Uniq => {
                 let cols = self.selected_columns();
@@ -923,24 +946,56 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::CsvDelim => handle_csv_delim_key(state, key),
             FormField::CsvHasHeader => handle_csv_has_header_key(state, key),
             FormField::RegexPattern => handle_regex_pattern_key(state, key),
-            FormField::SortColumn => handle_sort_column_key(state, key),
-            FormField::SortDir => handle_sort_dir_key(state, key),
+            FormField::SortKeys => handle_sort_keys_key(state, key),
         },
     }
 }
 
-fn handle_sort_column_key(state: &mut FilterEditState, key: KeyEvent) {
-    match key.code {
-        KeyCode::Left | KeyCode::Up => state.cycle_sort_column(-1),
-        KeyCode::Right | KeyCode::Down => state.cycle_sort_column(1),
-        _ => {}
+fn handle_sort_keys_key(state: &mut FilterEditState, key: KeyEvent) {
+    if state.available_columns.is_empty() {
+        return;
     }
-}
+    let n = state.sort_keys.len();
+    let last_visible = if n < MAX_SORT_KEYS { n } else { n.saturating_sub(1) };
 
-fn handle_sort_dir_key(state: &mut FilterEditState, key: KeyEvent) {
     match key.code {
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Char(' ') => {
-            state.flip_sort_direction();
+        KeyCode::Up => {
+            state.sort_keys_cursor = state.sort_keys_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            state.sort_keys_cursor = (state.sort_keys_cursor + 1).min(last_visible);
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if state.sort_keys_cursor < n {
+                let cols = state.available_columns.len() as i32;
+                let delta: i32 = if matches!(key.code, KeyCode::Right) { 1 } else { -1 };
+                let cur = state.sort_keys[state.sort_keys_cursor].0 as i32;
+                let new = (cur + delta).rem_euclid(cols) as usize;
+                state.sort_keys[state.sort_keys_cursor].0 = new;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if state.sort_keys_cursor < n {
+                let cur = state.sort_keys[state.sort_keys_cursor].1;
+                state.sort_keys[state.sort_keys_cursor].1 = match cur {
+                    SortDirection::Asc => SortDirection::Desc,
+                    SortDirection::Desc => SortDirection::Asc,
+                };
+            }
+        }
+        KeyCode::Char('a') => {
+            if n < MAX_SORT_KEYS {
+                state.sort_keys.push((0, SortDirection::Asc));
+                state.sort_keys_cursor = state.sort_keys.len() - 1;
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
+            if state.sort_keys_cursor < n && state.sort_keys.len() > 1 {
+                state.sort_keys.remove(state.sort_keys_cursor);
+                if state.sort_keys_cursor >= state.sort_keys.len() {
+                    state.sort_keys_cursor = state.sort_keys.len().saturating_sub(1);
+                }
+            }
         }
         _ => {}
     }
@@ -1157,7 +1212,7 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
         block.pipeline.len() + 1
     };
     let stack_height = stack_rows.max(1) as u16 + 2;
-    let form_height = (state.fields().len() as u16) + 2;
+    let form_height = state.form_lines() + 2;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1702,10 +1757,99 @@ fn draw_form_pane(f: &mut Frame, area: Rect, state: &FilterEditState) {
 
     let mut lines: Vec<Line> = Vec::new();
     for field in state.fields() {
-        lines.push(render_form_row(state, *field));
+        if *field == FormField::SortKeys {
+            lines.extend(render_sort_keys_field(state));
+        } else {
+            lines.push(render_form_row(state, *field));
+        }
     }
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
+}
+
+fn render_sort_keys_field(state: &FilterEditState) -> Vec<Line<'static>> {
+    let active = state.field == FormField::SortKeys;
+    let label_first = format!("  {:>8}: ", "keys");
+    let label_rest: String = " ".repeat(label_first.chars().count());
+
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    if state.available_columns.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(label_first, label_style),
+            Span::styled(
+                "(no columns — pipeline output is bytes; add a parser)",
+                Style::default().fg(Color::Red),
+            ),
+        ])];
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    for (i, (col_idx, dir)) in state.sort_keys.iter().enumerate() {
+        let on_cursor = active && i == state.sort_keys_cursor;
+        let label = if i == 0 {
+            Span::styled(label_first.clone(), label_style)
+        } else {
+            Span::raw(label_rest.clone())
+        };
+        let col = state
+            .available_columns
+            .get(*col_idx)
+            .map(String::as_str)
+            .unwrap_or("?");
+        let dir_glyph = match dir {
+            SortDirection::Asc => "↑",
+            SortDirection::Desc => "↓",
+        };
+        let mut spans = vec![label];
+        if on_cursor {
+            spans.push(Span::styled("◂ ", Style::default().fg(Color::Magenta)));
+        }
+        spans.push(Span::styled(
+            format!("{col} {dir_glyph}"),
+            if on_cursor { highlight } else { normal },
+        ));
+        if on_cursor {
+            spans.push(Span::styled(" ▸", Style::default().fg(Color::Magenta)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if state.sort_keys.len() < MAX_SORT_KEYS {
+        let on_cursor = active && state.sort_keys_cursor == state.sort_keys.len();
+        let label = if state.sort_keys.is_empty() {
+            Span::styled(label_first.clone(), label_style)
+        } else {
+            Span::raw(label_rest.clone())
+        };
+        let mut spans = vec![label];
+        if on_cursor {
+            spans.push(Span::styled("◂ ", Style::default().fg(Color::Magenta)));
+        }
+        spans.push(Span::styled(
+            "+ add (a)".to_string(),
+            if on_cursor { highlight } else { dim },
+        ));
+        if on_cursor {
+            spans.push(Span::styled(" ▸", Style::default().fg(Color::Magenta)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
 }
 
 fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
@@ -1720,8 +1864,7 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::CsvDelim => "delim",
         FormField::CsvHasHeader => "header",
         FormField::RegexPattern => "regex",
-        FormField::SortColumn => "column",
-        FormField::SortDir => "direction",
+        FormField::SortKeys => "keys",
     };
     let label_style = if active {
         Style::default()
@@ -1775,27 +1918,9 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             active,
             "(empty: matches nothing — use named groups like (?<col>…))",
         ),
-        FormField::SortColumn => {
-            if state.available_columns.is_empty() {
-                vec![Span::styled(
-                    "(no columns — pipeline output is bytes; add a parser)",
-                    Style::default().fg(Color::Red),
-                )]
-            } else {
-                let col = state
-                    .available_columns
-                    .get(state.sort_column)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                render_select_value(col, "", active)
-            }
-        }
-        FormField::SortDir => {
-            let (label, desc) = match state.sort_direction {
-                SortDirection::Asc => ("asc ↑", "smallest first"),
-                SortDirection::Desc => ("desc ↓", "largest first"),
-            };
-            render_select_value(label, desc, active)
+        FormField::SortKeys => {
+            // Multi-line — handled by render_form_field instead.
+            return Line::from("");
         }
     };
 
@@ -2047,12 +2172,12 @@ mod tests {
     }
 
     #[test]
-    fn build_filter_sort_by_includes_direction() {
+    fn build_filter_sort_by_single_key() {
         let mut block = block_with_stdout(b"a\n");
         block.pipeline.push(FilterSpec::FromLines);
         let mut state = FilterEditState::for_add(&block);
         state.kind = FilterKind::SortBy;
-        state.sort_direction = SortDirection::Desc;
+        state.sort_keys = vec![(0, SortDirection::Desc)];
         match state.build_filter() {
             Some(FilterSpec::SortBy { keys }) => {
                 assert_eq!(keys.len(), 1);
@@ -2061,6 +2186,39 @@ mod tests {
             }
             _ => panic!("expected SortBy"),
         }
+    }
+
+    #[test]
+    fn build_filter_sort_by_multi_key_preserves_order() {
+        let mut block = block_with_stdout(b"a b c\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::SortBy;
+        state.sort_keys = vec![
+            (1, SortDirection::Asc),
+            (0, SortDirection::Desc),
+            (2, SortDirection::Asc),
+        ];
+        match state.build_filter() {
+            Some(FilterSpec::SortBy { keys }) => {
+                assert_eq!(keys.len(), 3);
+                assert_eq!(keys[0].column, "_2");
+                assert_eq!(keys[0].direction, SortDirection::Asc);
+                assert_eq!(keys[1].column, "_1");
+                assert_eq!(keys[1].direction, SortDirection::Desc);
+                assert_eq!(keys[2].column, "_3");
+            }
+            _ => panic!("expected SortBy with 3 keys"),
+        }
+    }
+
+    #[test]
+    fn build_filter_sort_by_empty_keys_is_none() {
+        let block = block_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::SortBy;
+        state.sort_keys.clear();
+        assert!(state.build_filter().is_none());
     }
 
     #[test]
@@ -2081,19 +2239,27 @@ mod tests {
     }
 
     #[test]
-    fn for_edit_prepopulates_sort_by() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
+    fn for_edit_prepopulates_multi_key_sort_by() {
+        let mut block = block_with_stdout(b"a b c\n");
+        block.pipeline.push(FilterSpec::FromFields);
         block.pipeline.push(FilterSpec::SortBy {
-            keys: vec![SortKey {
-                column: "line".into(),
-                direction: SortDirection::Desc,
-            }],
+            keys: vec![
+                SortKey {
+                    column: "_3".into(),
+                    direction: SortDirection::Desc,
+                },
+                SortKey {
+                    column: "_1".into(),
+                    direction: SortDirection::Asc,
+                },
+            ],
         });
         let state = FilterEditState::for_edit(&block, 1);
         assert_eq!(state.kind, FilterKind::SortBy);
-        assert_eq!(state.sort_direction, SortDirection::Desc);
-        assert_eq!(state.available_columns, vec!["line"]);
+        assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
+        assert_eq!(state.sort_keys.len(), 2);
+        assert_eq!(state.sort_keys[0], (2, SortDirection::Desc));
+        assert_eq!(state.sort_keys[1], (0, SortDirection::Asc));
     }
 
     #[test]
