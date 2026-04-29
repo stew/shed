@@ -794,17 +794,41 @@ async fn reap_completed(app: &mut App) {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
-    {
-        app.quit = true;
-        return;
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('d') => {
+                app.quit = true;
+                return;
+            }
+            KeyCode::Char('c') => {
+                if app.focus == Focus::BlockCursor && cancel_at_cursor(app) {
+                    return;
+                }
+                app.quit = true;
+                return;
+            }
+            _ => {}
+        }
     }
     match app.focus {
         Focus::Prompt => handle_prompt_key(app, key),
         Focus::BlockCursor => handle_cursor_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
     }
+}
+
+fn cancel_at_cursor(app: &mut App) -> bool {
+    let Some(id) = app.session.cursor() else {
+        return false;
+    };
+    let Some(handle) = app.running.remove(&id) else {
+        return false;
+    };
+    handle.abort();
+    app.session
+        .set_state(id, BlockState::Failed("cancelled".into()));
+    app.flash = Some(format!("cancelled %{}", id.0));
+    true
 }
 
 fn handle_prompt_key(app: &mut App, key: KeyEvent) {
@@ -1881,6 +1905,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("←→", "filters"),
             ("f", "add/edit"),
             ("d", "drop"),
+            ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
         ],
