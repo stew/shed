@@ -3006,6 +3006,17 @@ fn render_block(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
+    // Compute pipeline outcome up-front so we can show inline drop counts.
+    let pipeline_outcome = block
+        .capture
+        .as_ref()
+        .map(|c| apply_pipeline(&c.stdout, &block.pipeline));
+    let drops: Vec<usize> = pipeline_outcome
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| vec![0; block.pipeline.len()]);
+
     let glyph = match &block.state {
         BlockState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
         BlockState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
@@ -3037,6 +3048,40 @@ fn render_block(
             },
         ),
     ];
+    // Inline pipeline filters: command │ from-fields │ where … │ + add
+    let show_pipeline = !block.pipeline.is_empty() || pipeline_cursor.is_some();
+    if show_pipeline {
+        let highlight = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let normal = Style::default().fg(Color::LightCyan);
+        let dim = Style::default().fg(Color::DarkGray);
+        let warn = Style::default().fg(Color::Yellow);
+
+        for (i, f) in block.pipeline.iter().enumerate() {
+            header.push(Span::styled(" │ ", dim));
+            let style = if pipeline_cursor == Some(i) {
+                highlight
+            } else {
+                normal
+            };
+            header.push(Span::styled(format!(" {} ", describe_filter(f)), style));
+            let n = drops.get(i).copied().unwrap_or(0);
+            if n > 0 {
+                header.push(Span::styled(format!(" ⓘ-{n}"), warn));
+            }
+        }
+        if pipeline_cursor.is_some() {
+            header.push(Span::styled(" │ ", dim));
+            let style = if pipeline_cursor == Some(block.pipeline.len()) {
+                highlight
+            } else {
+                dim
+            };
+            header.push(Span::styled(" + add ", style));
+        }
+    }
     if let Some(name) = &block.name {
         header.push(Span::styled(
             format!("  ◉ {name}"),
@@ -3044,20 +3089,6 @@ fn render_block(
         ));
     }
     lines.push(Line::from(header));
-
-    let pipeline_outcome = block
-        .capture
-        .as_ref()
-        .map(|c| apply_pipeline(&c.stdout, &block.pipeline));
-    let drops: Vec<usize> = pipeline_outcome
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .map(|(_, d)| d.clone())
-        .unwrap_or_else(|| vec![0; block.pipeline.len()]);
-
-    if !block.pipeline.is_empty() || pipeline_cursor.is_some() {
-        lines.push(pipeline_line(&block.pipeline, pipeline_cursor, &drops));
-    }
 
     match pipeline_outcome {
         Some(Ok((value, _))) => lines.extend(render_pipeline_value(value)),
@@ -3102,45 +3133,6 @@ fn render_block(
 
     lines.push(Line::from(""));
     lines
-}
-
-fn pipeline_line(
-    pipeline: &[FilterSpec],
-    selected: Option<usize>,
-    drops: &[usize],
-) -> Line<'static> {
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-    let normal = Style::default().fg(Color::LightCyan);
-    let dim = Style::default().fg(Color::DarkGray);
-    let warn = Style::default().fg(Color::Yellow);
-
-    let mut spans = vec![Span::raw("      ")];
-    for (i, f) in pipeline.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", dim));
-        }
-        let style = if selected == Some(i) { highlight } else { normal };
-        spans.push(Span::styled(format!(" {} ", describe_filter(f)), style));
-        let n = drops.get(i).copied().unwrap_or(0);
-        if n > 0 {
-            spans.push(Span::styled(format!(" ⓘ-{n}"), warn));
-        }
-    }
-    if selected.is_some() {
-        if !pipeline.is_empty() {
-            spans.push(Span::styled(" │ ", dim));
-        }
-        let style = if selected == Some(pipeline.len()) {
-            highlight
-        } else {
-            dim
-        };
-        spans.push(Span::styled(" + add ", style));
-    }
-    Line::from(spans)
 }
 
 /// Apply a pipeline of filters. Returns the final value plus per-filter
