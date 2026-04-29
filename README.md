@@ -84,6 +84,8 @@ Each command spawns a *block* with:
 
 Blocks live in a session-wide store. Unnamed blocks evict on memory
 pressure (LRU); pinned blocks count toward the budget but never evict.
+Pin a block with `p` from BlockCursor — it renders with `◉ <name>`
+next to its command. `u` unpins.
 
 ### Pipelines
 
@@ -233,6 +235,8 @@ so you don't lose data without noticing.
 | `d`       | drop the filter at cursor (or last if on add slot) |
 | `e`       | expand the selected block to a fullscreen pager |
 | `w`       | write the block's filtered output (plain text, one row per line) to a file path you type |
+| `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render with `◉ name` and never evict on capture-budget pressure. Empty name unpins. |
+| `u`       | unpin the selected block (clear its name) |
 | Ctrl-C    | cancel a running command (kills the child) |
 | Esc       | back to prompt |
 | Ctrl-D    | quit |

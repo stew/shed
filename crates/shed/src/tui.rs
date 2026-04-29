@@ -1030,6 +1030,8 @@ struct App {
     history_cursor: Option<usize>,
     write_input_mode: bool,
     write_input: String,
+    pin_input_mode: bool,
+    pin_input: String,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
     focus: Focus,
@@ -1070,6 +1072,8 @@ impl App {
             history_cursor: None,
             write_input_mode: false,
             write_input: String::new(),
+            pin_input_mode: false,
+            pin_input: String::new(),
             last_cwd: None,
             env_edit: None,
             focus: Focus::Prompt,
@@ -1380,6 +1384,21 @@ fn history_step(app: &mut App, delta: i32) {
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
+    if app.pin_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.pin_input_mode = false;
+                app.pin_input.clear();
+            }
+            KeyCode::Enter => commit_pin(app),
+            KeyCode::Char(c) => app.pin_input.push(c),
+            KeyCode::Backspace => {
+                app.pin_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
     if app.write_input_mode {
         match key.code {
             KeyCode::Esc => {
@@ -1421,8 +1440,53 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 app.write_input.clear();
             }
         }
+        KeyCode::Char('p') => {
+            if let Some(id) = app.session.cursor() {
+                let existing = app
+                    .session
+                    .block(id)
+                    .and_then(|b| b.name.clone())
+                    .unwrap_or_default();
+                app.pin_input = existing;
+                app.pin_input_mode = true;
+            }
+        }
+        KeyCode::Char('u') => {
+            if let Some(id) = app.session.cursor() {
+                let was_named = app.session.block(id).and_then(|b| b.name.clone());
+                app.session.unpin(id);
+                app.flash = Some(match was_named {
+                    Some(name) => format!("unpinned %{} (was @{})", id.0, name),
+                    None => format!("%{} was not pinned", id.0),
+                });
+            }
+        }
         _ => {}
     }
+}
+
+fn commit_pin(app: &mut App) {
+    let name = std::mem::take(&mut app.pin_input).trim().to_string();
+    app.pin_input_mode = false;
+    let Some(id) = app.session.cursor() else { return };
+
+    if name.is_empty() {
+        app.session.unpin(id);
+        app.flash = Some(format!("unpinned %{}", id.0));
+        return;
+    }
+
+    let previous_owner = app.session.lookup_by_name(&name);
+    if !app.session.pin(id, name.clone()) {
+        app.flash = Some(format!("pin failed: unknown block %{}", id.0));
+        return;
+    }
+
+    app.flash = Some(match previous_owner {
+        Some(prev) if prev != id => format!("pinned %{} as @{} (was on %{})", id.0, name, prev.0),
+        Some(_) => format!("re-pinned %{} as @{}", id.0, name),
+        None => format!("pinned %{} as @{}", id.0, name),
+    });
 }
 
 fn commit_write(app: &mut App) {
@@ -3647,6 +3711,22 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.pin_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "pin name: ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.pin_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Magenta)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if app.write_input_mode {
         let widget = Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -3722,6 +3802,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("d", "drop"),
             ("e", "expand"),
             ("w", "write"),
+            ("p/u", "pin/unpin"),
             ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
