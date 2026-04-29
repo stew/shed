@@ -175,6 +175,8 @@ Detection has three paths, in order:
 | `sort-by`     | rows        | `keys` (up to 5)          | each key is (column, asc/desc); numeric coercion when both sides parse |
 | `uniq`        | rows        | `by` (optional)           | dedupe by all columns by default; if `by` set, dedupe keyed by those columns |
 | `count`       | aggregation | (none)                    | single row `{count: N}` |
+| `split`       | rows        | `column`, `delimiter`     | each row's `column` is split into pieces; one row per piece, other columns duplicated |
+| `join`        | rows        | `column`, `delimiter`     | concatenate every row's `column` value with `delimiter` into a single row; other columns dropped |
 
 ### The `⓲ -N` annotation
 

@@ -79,6 +79,14 @@ pub enum FilterSpec {
     /// Rename columns. Each `(from, to)` pair renames `from` to `to`
     /// in every record where it appears.
     Rename { pairs: Vec<(String, String)> },
+    /// Split each row's `column` value by `delimiter`, emitting one row
+    /// per piece. Other columns are duplicated across the resulting rows.
+    /// Rows whose `column` is missing pass through unchanged.
+    Split { column: String, delimiter: String },
+    /// Collapse all input rows into a single row whose `column` value is
+    /// every input row's `column` joined by `delimiter`. Other columns
+    /// are dropped.
+    Join { column: String, delimiter: String },
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
@@ -220,6 +228,8 @@ impl Filter for FilterSpec {
             FilterSpec::Uniq { by } => apply_uniq(input, by.as_deref()),
             FilterSpec::Count => apply_count(input),
             FilterSpec::Rename { pairs } => apply_rename(input, pairs),
+            FilterSpec::Split { column, delimiter } => apply_split(input, column, delimiter),
+            FilterSpec::Join { column, delimiter } => apply_join(input, column, delimiter),
         }
     }
 }
@@ -689,6 +699,74 @@ fn apply_count(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let items = require_list(input)?;
     let mut rec = IndexMap::with_capacity(1);
     rec.insert("count".to_string(), Value::Int(items.len() as i64));
+    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
+}
+
+fn value_to_display_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        _ => format!("{v:?}"),
+    }
+}
+
+fn apply_split(
+    input: PipelineValue,
+    column: &str,
+    delimiter: &str,
+) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    let mut out: Vec<Value> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Record(r) => {
+                let val = r.get(column);
+                match val {
+                    Some(value) => {
+                        let s = value_to_display_string(value);
+                        let parts: Vec<String> = if delimiter.is_empty() {
+                            vec![s]
+                        } else {
+                            s.split(delimiter).map(|p| p.to_string()).collect()
+                        };
+                        for part in parts {
+                            let mut new_rec = r.clone();
+                            new_rec.insert(column.to_string(), Value::String(part));
+                            out.push(Value::Record(new_rec));
+                        }
+                    }
+                    None => out.push(Value::Record(r)),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(PipelineValue::Structured(Value::List(out)))
+}
+
+fn apply_join(
+    input: PipelineValue,
+    column: &str,
+    delimiter: &str,
+) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    if items.is_empty() {
+        return Ok(PipelineValue::Structured(Value::List(Vec::new())));
+    }
+    let parts: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Record(r) => r.get(column).map(value_to_display_string),
+            _ => None,
+        })
+        .collect();
+    let joined = parts.join(delimiter);
+    let mut rec = IndexMap::with_capacity(1);
+    rec.insert(column.to_string(), Value::String(joined));
     Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
 }
 
@@ -1573,6 +1651,108 @@ mod tests {
         // String-typed numbers — sort_by uses compare_values which coerces.
         let result = run(&pipeline, b"10\n2\n1\n100\n");
         assert_eq!(lines_of(result), vec!["1", "2", "10", "100"]);
+    }
+
+    #[test]
+    fn split_emits_one_row_per_piece_duplicating_other_columns() {
+        let pipeline = vec![
+            FilterSpec::FromFields,
+            FilterSpec::Split {
+                column: "_2".into(),
+                delimiter: ",".into(),
+            },
+        ];
+        // Each row's _2 = "a,b,c" splits into 3 rows; _1 duplicates.
+        let result = run(&pipeline, b"alice a,b,c\nbob d,e\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 5); // 3 + 2
+        let firsts: Vec<String> = items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Record(r) => match r.get("_1") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(firsts, vec!["alice", "alice", "alice", "bob", "bob"]);
+        let seconds: Vec<String> = items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Record(r) => match r.get("_2") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seconds, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn split_passes_through_rows_missing_the_column() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Split {
+                column: "nope".into(),
+                delimiter: ",".into(),
+            },
+        ];
+        let result = run(&pipeline, b"a\nb\n");
+        // No row has "nope"; both rows pass through unchanged.
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn join_concatenates_all_rows_into_one() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Join {
+                column: "line".into(),
+                delimiter: ", ".into(),
+            },
+        ];
+        let result = run(&pipeline, b"alpha\nbeta\ngamma\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Value::Record(r) => {
+                assert_eq!(
+                    r.get("line"),
+                    Some(&Value::String("alpha, beta, gamma".into()))
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn join_empty_input_yields_empty_list() {
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Take { n: 0 }, // produce empty input to join
+            FilterSpec::Join {
+                column: "line".into(),
+                delimiter: ",".into(),
+            },
+        ];
+        let result = run(&pipeline, b"x\ny\n");
+        let items = match result {
+            PipelineValue::Structured(Value::List(items)) => items,
+            _ => panic!(),
+        };
+        assert_eq!(items.len(), 0);
     }
 
     #[test]

@@ -128,6 +128,8 @@ enum FilterKind {
     Uniq,
     Count,
     Rename,
+    Split,
+    Join,
 }
 
 impl FilterKind {
@@ -146,6 +148,8 @@ impl FilterKind {
         FilterKind::Uniq,
         FilterKind::Count,
         FilterKind::Rename,
+        FilterKind::Split,
+        FilterKind::Join,
     ];
 
     fn name(self) -> &'static str {
@@ -164,6 +168,8 @@ impl FilterKind {
             FilterKind::Uniq => "uniq",
             FilterKind::Count => "count",
             FilterKind::Rename => "rename",
+            FilterKind::Split => "split",
+            FilterKind::Join => "join",
         }
     }
 
@@ -183,6 +189,8 @@ impl FilterKind {
             FilterKind::Uniq => "drop duplicate rows (optionally keyed by columns)",
             FilterKind::Count => "collapse to a single row with the row count",
             FilterKind::Rename => "rename columns (leave a row blank to keep its current name)",
+            FilterKind::Split => "split each row's column value by a delimiter, one row per piece",
+            FilterKind::Join => "concatenate every row's column value with a delimiter into one row",
         }
     }
 
@@ -217,6 +225,8 @@ enum FormField {
     RenameMap,
     WhereCombine,
     WhereClauseSelect,
+    TargetColumn,
+    DelimText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +501,8 @@ struct FilterEditState {
     sort_keys_cursor: usize,
     rename_to_inputs: Vec<String>,
     rename_cursor: usize,
+    target_column: usize,
+    delim_text: String,
     available_columns: Vec<String>,
     field: FormField,
     mode: EditMode,
@@ -519,6 +531,8 @@ impl FilterEditState {
             sort_keys_cursor: 0,
             rename_to_inputs: vec![String::new(); available_columns.len()],
             rename_cursor: 0,
+            target_column: 0,
+            delim_text: String::new(),
             available_columns,
             field: FormField::Kind,
             mode,
@@ -602,6 +616,24 @@ impl FilterEditState {
                     }
                 }
             }
+            Some(FilterSpec::Split { column, delimiter }) => {
+                state.kind = FilterKind::Split;
+                state.target_column = state
+                    .available_columns
+                    .iter()
+                    .position(|c| c == column)
+                    .unwrap_or(0);
+                state.delim_text = delimiter.clone();
+            }
+            Some(FilterSpec::Join { column, delimiter }) => {
+                state.kind = FilterKind::Join;
+                state.target_column = state
+                    .available_columns
+                    .iter()
+                    .position(|c| c == column)
+                    .unwrap_or(0);
+                state.delim_text = delimiter.clone();
+            }
             Some(FilterSpec::Where { predicate }) => {
                 state.kind = FilterKind::Where;
                 let (combine, mut clauses) =
@@ -674,6 +706,11 @@ impl FilterEditState {
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
             FilterKind::SortBy => &[FormField::Kind, FormField::SortKeys],
             FilterKind::Rename => &[FormField::Kind, FormField::RenameMap],
+            FilterKind::Split | FilterKind::Join => &[
+                FormField::Kind,
+                FormField::TargetColumn,
+                FormField::DelimText,
+            ],
         }
     }
 
@@ -900,6 +937,20 @@ impl FilterEditState {
                 } else {
                     Some(FilterSpec::Rename { pairs })
                 }
+            }
+            FilterKind::Split => {
+                let column = self.available_columns.get(self.target_column)?.clone();
+                Some(FilterSpec::Split {
+                    column,
+                    delimiter: self.delim_text.clone(),
+                })
+            }
+            FilterKind::Join => {
+                let column = self.available_columns.get(self.target_column)?.clone();
+                Some(FilterSpec::Join {
+                    column,
+                    delimiter: self.delim_text.clone(),
+                })
             }
         }
     }
@@ -1576,7 +1627,32 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::RenameMap => handle_rename_map_key(state, key),
             FormField::WhereCombine => handle_where_combine_key(state, key),
             FormField::WhereClauseSelect => handle_where_clause_select_key(state, key),
+            FormField::TargetColumn => handle_target_column_key(state, key),
+            FormField::DelimText => handle_delim_text_key(state, key),
         },
+    }
+}
+
+fn handle_target_column_key(state: &mut FilterEditState, key: KeyEvent) {
+    if state.available_columns.is_empty() {
+        return;
+    }
+    let len = state.available_columns.len() as i32;
+    let delta: i32 = match key.code {
+        KeyCode::Left | KeyCode::Up => -1,
+        KeyCode::Right | KeyCode::Down => 1,
+        _ => return,
+    };
+    state.target_column = ((state.target_column as i32 + delta).rem_euclid(len)) as usize;
+}
+
+fn handle_delim_text_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => state.delim_text.push(c),
+        KeyCode::Backspace => {
+            state.delim_text.pop();
+        }
+        _ => {}
     }
 }
 
@@ -2425,6 +2501,12 @@ fn describe_filter(spec: &FilterSpec) -> String {
                 .join(", ");
             format!("rename {s}")
         }
+        FilterSpec::Split { column, delimiter } => {
+            format!("split {column} by {delimiter:?}")
+        }
+        FilterSpec::Join { column, delimiter } => {
+            format!("join {column} with {delimiter:?}")
+        }
     }
 }
 
@@ -2831,6 +2913,8 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::RenameMap => "rename",
         FormField::WhereCombine => "combine",
         FormField::WhereClauseSelect => "clause",
+        FormField::TargetColumn => "column",
+        FormField::DelimText => "delim",
     };
     let label_style = if active {
         Style::default()
@@ -2908,6 +2992,26 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             };
             render_select_value(&label, desc, active)
         }
+        FormField::TargetColumn => {
+            if state.available_columns.is_empty() {
+                vec![Span::styled(
+                    "(no columns — pipeline output is bytes; add a parser)",
+                    Style::default().fg(Color::Red),
+                )]
+            } else {
+                let col = state
+                    .available_columns
+                    .get(state.target_column)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                render_select_value(col, "", active)
+            }
+        }
+        FormField::DelimText => render_text_field(
+            &state.delim_text,
+            active,
+            "(empty: no split / no separator)",
+        ),
     };
 
     let mut all = vec![label_span];
