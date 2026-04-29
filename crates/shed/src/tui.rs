@@ -984,6 +984,8 @@ struct App {
     prompt: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
+    write_input_mode: bool,
+    write_input: String,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
@@ -1020,6 +1022,8 @@ impl App {
             prompt: String::new(),
             history: Vec::new(),
             history_cursor: None,
+            write_input_mode: false,
+            write_input: String::new(),
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
@@ -1275,6 +1279,21 @@ fn history_step(app: &mut App, delta: i32) {
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
+    if app.write_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.write_input_mode = false;
+                app.write_input.clear();
+            }
+            KeyCode::Enter => commit_write(app),
+            KeyCode::Char(c) => app.write_input.push(c),
+            KeyCode::Backspace => {
+                app.write_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             app.focus = Focus::Prompt;
@@ -1295,7 +1314,44 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 app.focus = Focus::BlockExpand;
             }
         }
+        KeyCode::Char('w') => {
+            if app.session.cursor().is_some() {
+                app.write_input_mode = true;
+                app.write_input.clear();
+            }
+        }
         _ => {}
+    }
+}
+
+fn commit_write(app: &mut App) {
+    let path = std::mem::take(&mut app.write_input);
+    app.write_input_mode = false;
+    let path = path.trim();
+    if path.is_empty() {
+        app.flash = Some("path required".into());
+        return;
+    }
+    let Some(id) = app.session.cursor() else { return };
+    let Some(block) = app.session.block(id) else { return };
+    let lines = compute_block_lines(block);
+    let mut text = String::new();
+    for line in &lines {
+        text.push_str(&line_text(line));
+        text.push('\n');
+    }
+    match std::fs::write(path, text) {
+        Ok(()) => {
+            app.flash = Some(format!(
+                "wrote %{} ({} lines) to {}",
+                id.0,
+                lines.len(),
+                path
+            ));
+        }
+        Err(e) => {
+            app.flash = Some(format!("write failed: {e}"));
+        }
     }
 }
 
@@ -3099,6 +3155,22 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.write_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "write to: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.write_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if app.search_input_mode {
         let invalid = !app.search_input.is_empty()
             && try_compile(&app.search_input, app.search_case_insensitive).is_none();
@@ -3156,6 +3228,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("i", "insert"),
             ("d", "drop"),
             ("e", "expand"),
+            ("w", "write"),
             ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
