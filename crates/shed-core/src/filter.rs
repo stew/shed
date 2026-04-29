@@ -117,6 +117,58 @@ fn require_bytes(input: PipelineValue) -> Result<Bytes, FilterError> {
     }
 }
 
+// Strip ANSI escape sequences (CSI and OSC) and stray CR bytes. Parsers see
+// clean text regardless of whether the upstream capture came from a pipe (no
+// escapes) or a PTY (terminal-aware programs emit colors).
+fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !matches!(bytes[i], 0x40..=0x7E) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b
+                            && i + 1 < bytes.len()
+                            && bytes[i + 1] == b'\\'
+                        {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        } else if b == b'\r' {
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn require_list(input: PipelineValue) -> Result<Vec<Value>, FilterError> {
     let value = match input {
         PipelineValue::Structured(v) => v,
@@ -130,7 +182,8 @@ fn require_list(input: PipelineValue) -> Result<Vec<Value>, FilterError> {
 
 fn apply_from_lines(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| FilterError::InvalidUtf8)?;
+    let stripped = strip_ansi(&bytes);
+    let text = std::str::from_utf8(&stripped).map_err(|_| FilterError::InvalidUtf8)?;
     let records: Vec<Value> = text
         .lines()
         .map(|line| {
@@ -144,7 +197,8 @@ fn apply_from_lines(input: PipelineValue) -> Result<PipelineValue, FilterError> 
 
 fn apply_from_fields(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| FilterError::InvalidUtf8)?;
+    let stripped = strip_ansi(&bytes);
+    let text = std::str::from_utf8(&stripped).map_err(|_| FilterError::InvalidUtf8)?;
 
     let lines_fields: Vec<Vec<&str>> = text
         .lines()
@@ -244,13 +298,14 @@ fn apply_from_csv(
     has_header: bool,
 ) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
+    let stripped = strip_ansi(&bytes);
     let mut builder = csv::ReaderBuilder::new();
     builder.has_headers(has_header);
     builder.flexible(true);
     if delim.is_ascii() {
         builder.delimiter(delim as u8);
     }
-    let mut reader = builder.from_reader(bytes.as_ref());
+    let mut reader = builder.from_reader(stripped.as_slice());
 
     let headers: Vec<String> = if has_header {
         reader
@@ -291,8 +346,9 @@ fn apply_from_csv(
 
 fn apply_from_json(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
+    let stripped = strip_ansi(&bytes);
     let json: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| FilterError::ParseError {
+        serde_json::from_slice(&stripped).map_err(|e| FilterError::ParseError {
             format: "json",
             error: e.to_string(),
         })?;
@@ -414,7 +470,8 @@ fn apply_count(input: PipelineValue) -> Result<PipelineValue, FilterError> {
 
 fn apply_from_regex(input: PipelineValue, pattern: &str) -> Result<PipelineValue, FilterError> {
     let bytes = require_bytes(input)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| FilterError::InvalidUtf8)?;
+    let stripped = strip_ansi(&bytes);
+    let text = std::str::from_utf8(&stripped).map_err(|_| FilterError::InvalidUtf8)?;
     let regex = Regex::new(pattern).map_err(|e| FilterError::BadRegex {
         pattern: pattern.to_string(),
         error: e.to_string(),
@@ -637,6 +694,30 @@ mod tests {
             }
         }
         panic!("expected UnknownColumn error");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text() {
+        assert_eq!(strip_ansi(b"hello world"), b"hello world");
+    }
+
+    #[test]
+    fn strip_ansi_drops_csi_sequences() {
+        let input = b"\x1b[31mred\x1b[0m text \x1b[1;32mbold green\x1b[m";
+        assert_eq!(strip_ansi(input), b"red text bold green");
+    }
+
+    #[test]
+    fn strip_ansi_drops_osc_and_cr() {
+        let input = b"\x1b]0;title\x07hello\r\nworld\r\n";
+        assert_eq!(strip_ansi(input), b"hello\nworld\n");
+    }
+
+    #[test]
+    fn from_lines_strips_ansi_from_pty_output() {
+        let pipeline = vec![FilterSpec::FromLines];
+        let result = run(&pipeline, b"\x1b[32malpha\x1b[0m\r\nbeta\r\n");
+        assert_eq!(lines_of(result), vec!["alpha", "beta"]);
     }
 
     #[test]

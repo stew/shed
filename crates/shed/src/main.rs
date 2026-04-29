@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+mod ansi;
 mod exec;
 mod tui;
 

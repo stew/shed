@@ -16,9 +16,15 @@ use shed_core::{
 };
 use tokio::task::JoinHandle;
 
-use crate::exec::{ExecError, run_command};
+use crate::ansi;
+use crate::exec::{self, ExecError, Killer};
 
 type CommandTask = JoinHandle<Result<Capture, ExecError>>;
+
+struct RunningCommand {
+    handle: CommandTask,
+    killer: Killer,
+}
 
 const MAX_SORT_KEYS: usize = 5;
 
@@ -664,16 +670,19 @@ struct App {
     pipeline_cursor: usize,
     flash: Option<String>,
     quit: bool,
-    running: HashMap<BlockId, CommandTask>,
+    running: HashMap<BlockId, RunningCommand>,
     pending_handover: Option<Vec<String>>,
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Aborting JoinHandles drops each task's locals (the tokio Child),
-        // and Child has kill_on_drop(true), so child processes get killed too.
-        for (_, handle) in self.running.drain() {
-            handle.abort();
+        // Kill any still-running children; the blocking PTY-reader tasks will
+        // then exit on their own as the slave closes. Abort the JoinHandles
+        // for good measure (the spawn_blocking task will continue briefly
+        // until reader returns, which is fine — we're exiting).
+        for (_, mut cmd) in self.running.drain() {
+            let _ = cmd.killer.kill();
+            cmd.handle.abort();
         }
     }
 }
@@ -752,7 +761,7 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.flash = None;
-                    handle_key(&mut app, key);
+                    handle_key(&mut app, key).await;
                 }
             }
         }
@@ -791,14 +800,14 @@ async fn reap_completed(app: &mut App) {
     let finished_ids: Vec<BlockId> = app
         .running
         .iter()
-        .filter(|(_, h)| h.is_finished())
+        .filter(|(_, c)| c.handle.is_finished())
         .map(|(id, _)| *id)
         .collect();
     for id in finished_ids {
-        let Some(handle) = app.running.remove(&id) else {
+        let Some(cmd) = app.running.remove(&id) else {
             continue;
         };
-        match handle.await {
+        match cmd.handle.await {
             Ok(Ok(capture)) => {
                 let exit = capture.exit_code.unwrap_or(-1);
                 app.session.set_capture(id, capture);
@@ -816,7 +825,7 @@ async fn reap_completed(app: &mut App) {
     }
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) {
+async fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') => {
@@ -834,7 +843,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
     match app.focus {
-        Focus::Prompt => handle_prompt_key(app, key),
+        Focus::Prompt => handle_prompt_key(app, key).await,
         Focus::BlockCursor => handle_cursor_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
     }
@@ -844,17 +853,18 @@ fn cancel_at_cursor(app: &mut App) -> bool {
     let Some(id) = app.session.cursor() else {
         return false;
     };
-    let Some(handle) = app.running.remove(&id) else {
+    let Some(mut cmd) = app.running.remove(&id) else {
         return false;
     };
-    handle.abort();
+    let _ = cmd.killer.kill();
+    cmd.handle.abort();
     app.session
         .set_state(id, BlockState::Failed("cancelled".into()));
     app.flash = Some(format!("cancelled %{}", id.0));
     true
 }
 
-fn handle_prompt_key(app: &mut App, key: KeyEvent) {
+async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
@@ -869,7 +879,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             app.prompt.pop();
         }
-        KeyCode::Enter => spawn_prompt(app),
+        KeyCode::Enter => spawn_prompt(app).await,
         _ => {}
     }
 }
@@ -1144,7 +1154,7 @@ fn drop_filter_at_cursor(app: &mut App) {
     }
 }
 
-fn spawn_prompt(app: &mut App) {
+async fn spawn_prompt(app: &mut App) {
     let trimmed = app.prompt.trim();
     if trimmed.is_empty() {
         return;
@@ -1170,8 +1180,15 @@ fn spawn_prompt(app: &mut App) {
     }
 
     let id = app.session.add_block(argv.clone());
-    let handle = tokio::spawn(async move { run_command(&argv, CAPTURE_CAP).await });
-    app.running.insert(id, handle);
+    match exec::spawn_command(argv, CAPTURE_CAP).await {
+        Ok((handle, killer)) => {
+            app.running.insert(id, RunningCommand { handle, killer });
+        }
+        Err(e) => {
+            app.session
+                .set_state(id, BlockState::Failed(e.to_string()));
+        }
+    }
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -1425,19 +1442,11 @@ fn render_value_or_error(value: Result<PipelineValue, String>) -> Vec<Line<'stat
 }
 
 fn render_raw_lines(bytes: &bytes::Bytes, max: usize) -> Vec<Line<'static>> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut out = Vec::new();
-    let preview: Vec<&str> = text.lines().take(max).collect();
-    for line in &preview {
-        out.push(Line::from(vec![
-            Span::raw("      "),
-            Span::raw(line.to_string()),
-        ]));
-    }
-    let total = text.lines().count();
-    if total > max {
+    let parsed = ansi::parse_to_lines(bytes, "      ", max);
+    let mut out = parsed.lines;
+    if parsed.truncated {
         out.push(Line::from(Span::styled(
-            format!("      … {} more lines", total - max),
+            format!("      … {} more lines", parsed.total - max),
             Style::default().fg(Color::DarkGray),
         )));
     }
