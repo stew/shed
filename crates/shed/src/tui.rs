@@ -20,6 +20,27 @@ use crate::exec::{ExecError, run_command};
 
 type CommandTask = JoinHandle<Result<Capture, ExecError>>;
 
+const FULLSCREEN_PROGRAMS: &[&str] = &[
+    "top", "htop", "btop", "atop", "glances", "iotop", "iftop", "ncdu",
+    "vi", "vim", "nvim", "emacs", "emacsclient", "nano", "pico",
+    "helix", "hx", "micro", "kak",
+    "less", "more", "most", "view",
+    "man", "info", "pinfo",
+    "tmux", "screen", "byobu", "zellij",
+    "ssh", "mosh", "telnet", "rlogin",
+    "tig", "lazygit", "gitui",
+    "ranger", "nnn", "lf",
+    "fzf", "sk",
+];
+
+fn needs_fullscreen(argv: &[String]) -> bool {
+    let Some(prog) = argv.first() else {
+        return false;
+    };
+    let basename = prog.rsplit('/').next().unwrap_or(prog);
+    FULLSCREEN_PROGRAMS.contains(&basename)
+}
+
 const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const PREVIEW_LINES: usize = 8;
@@ -621,6 +642,7 @@ struct App {
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, CommandTask>,
+    pending_handover: Option<Vec<String>>,
 }
 
 impl Drop for App {
@@ -644,6 +666,7 @@ impl App {
             flash: None,
             quit: false,
             running: HashMap::new(),
+            pending_handover: None,
         }
     }
 
@@ -694,6 +717,9 @@ pub async fn run() -> io::Result<()> {
 async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
     loop {
+        if let Some(argv) = app.pending_handover.take() {
+            perform_handover(terminal, &mut app, argv).await?;
+        }
         reap_completed(&mut app).await;
         terminal.draw(|f| draw(f, &app))?;
         if app.quit {
@@ -708,6 +734,34 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
             }
         }
     }
+}
+
+async fn perform_handover(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    argv: Vec<String>,
+) -> io::Result<()> {
+    ratatui::restore();
+
+    let id = app.session.add_block(argv.clone());
+    let status_result = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .await;
+
+    *terminal = ratatui::init();
+
+    match status_result {
+        Ok(status) => {
+            app.session
+                .set_state(id, BlockState::Done(status.code().unwrap_or(-1)));
+        }
+        Err(e) => {
+            app.session
+                .set_state(id, BlockState::Failed(format!("spawn: {e}")));
+        }
+    }
+    Ok(())
 }
 
 async fn reap_completed(app: &mut App) {
@@ -805,6 +859,14 @@ fn open_filter_edit(app: &mut App) {
     let Some(block) = app.session.block(id) else {
         return;
     };
+    if block.capture.is_none() {
+        let msg = match block.state {
+            BlockState::Running => "still running — no capture yet",
+            _ => "no captured output to filter",
+        };
+        app.flash = Some(msg.into());
+        return;
+    }
     let state = if app.pipeline_cursor < block.pipeline.len() {
         FilterEditState::for_edit(block, app.pipeline_cursor)
     } else {
@@ -1008,7 +1070,13 @@ fn spawn_prompt(app: &mut App) {
     if trimmed.is_empty() {
         return;
     }
-    let Some(argv) = shlex::split(trimmed) else {
+
+    let (force_fullscreen, command_str) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, trimmed),
+    };
+
+    let Some(argv) = shlex::split(command_str) else {
         app.flash = Some("unmatched quote".into());
         return;
     };
@@ -1016,6 +1084,12 @@ fn spawn_prompt(app: &mut App) {
         return;
     }
     app.prompt.clear();
+
+    if force_fullscreen || needs_fullscreen(&argv) {
+        app.pending_handover = Some(argv);
+        return;
+    }
+
     let id = app.session.add_block(argv.clone());
     let handle = tokio::spawn(async move { run_command(&argv, CAPTURE_CAP).await });
     app.running.insert(id, handle);
@@ -1182,6 +1256,18 @@ fn render_block(
                 )));
             }
         }
+    } else if let BlockState::Done(code) = &block.state {
+        let mut spans = vec![Span::styled(
+            "      (no captured output)",
+            Style::default().fg(Color::DarkGray),
+        )];
+        if *code != 0 {
+            spans.push(Span::styled(
+                format!("  exit {code}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     if let BlockState::Failed(msg) = &block.state {
         lines.push(Line::from(vec![
@@ -1786,6 +1872,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let hints: Vec<(&str, &str)> = match app.focus {
         Focus::Prompt => vec![
             ("Enter", "run"),
+            ("!cmd", "fullscreen"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
@@ -1899,6 +1986,26 @@ mod tests {
         let mut state = FilterEditState::for_add(&block);
         state.kind = FilterKind::Where;
         assert!(state.build_filter().is_none());
+    }
+
+    #[test]
+    fn needs_fullscreen_for_blacklisted_program() {
+        assert!(needs_fullscreen(&["top".into()]));
+        assert!(needs_fullscreen(&["vim".into(), "file.txt".into()]));
+        assert!(needs_fullscreen(&["less".into()]));
+    }
+
+    #[test]
+    fn needs_fullscreen_uses_basename() {
+        assert!(needs_fullscreen(&["/usr/bin/vim".into()]));
+        assert!(needs_fullscreen(&["/opt/htop".into()]));
+    }
+
+    #[test]
+    fn needs_fullscreen_false_for_capture_friendly() {
+        assert!(!needs_fullscreen(&["ls".into()]));
+        assert!(!needs_fullscreen(&["seq".into(), "1".into(), "10".into()]));
+        assert!(!needs_fullscreen(&["cargo".into(), "build".into()]));
     }
 
     #[test]
