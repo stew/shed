@@ -29,25 +29,49 @@ enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterKind {
     FromLines,
+    FromFields,
     Where,
+    Select,
+    Drop,
+    Take,
+    Skip,
 }
 
 impl FilterKind {
-    const ALL: &'static [FilterKind] = &[FilterKind::FromLines, FilterKind::Where];
+    const ALL: &'static [FilterKind] = &[
+        FilterKind::FromLines,
+        FilterKind::FromFields,
+        FilterKind::Where,
+        FilterKind::Select,
+        FilterKind::Drop,
+        FilterKind::Take,
+        FilterKind::Skip,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             FilterKind::FromLines => "from-lines",
+            FilterKind::FromFields => "from-fields",
             FilterKind::Where => "where",
+            FilterKind::Select => "select",
+            FilterKind::Drop => "drop",
+            FilterKind::Take => "take",
+            FilterKind::Skip => "skip",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            FilterKind::FromLines => "parse raw bytes into one record per line",
+            FilterKind::FromLines => "parse bytes into one record per line",
+            FilterKind::FromFields => "parse bytes into records by whitespace (auto-named _1, _2, …)",
             FilterKind::Where => "keep rows whose column matches a regex",
+            FilterKind::Select => "keep only the chosen columns",
+            FilterKind::Drop => "remove the chosen columns",
+            FilterKind::Take => "keep the first N rows",
+            FilterKind::Skip => "drop the first N rows",
         }
     }
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +79,8 @@ enum FormField {
     Kind,
     Column,
     Pattern,
+    N,
+    Columns,
 }
 
 struct FilterEditState {
@@ -62,67 +88,101 @@ struct FilterEditState {
     kind: FilterKind,
     where_column: usize,
     where_pattern: String,
+    n_input: String,
+    column_selections: Vec<bool>,
+    column_cursor: usize,
     available_columns: Vec<String>,
     field: FormField,
     editing_index: Option<usize>,
 }
 
 impl FilterEditState {
+    fn empty(block_id: BlockId, available_columns: Vec<String>, editing_index: Option<usize>) -> Self {
+        let column_selections = vec![false; available_columns.len()];
+        Self {
+            block_id,
+            kind: FilterKind::FromLines,
+            where_column: 0,
+            where_pattern: String::new(),
+            n_input: String::new(),
+            column_selections,
+            column_cursor: 0,
+            available_columns,
+            field: FormField::Kind,
+            editing_index,
+        }
+    }
+
     fn for_add(block: &Block) -> Self {
         let available_columns = compute_schema_at(block, block.pipeline.len());
-        let kind = if available_columns.is_empty() {
+        let mut state = Self::empty(block.id, available_columns, None);
+        state.kind = if state.available_columns.is_empty() {
             FilterKind::FromLines
         } else {
             FilterKind::Where
         };
-        Self {
-            block_id: block.id,
-            kind,
-            where_column: 0,
-            where_pattern: String::new(),
-            available_columns,
-            field: FormField::Kind,
-            editing_index: None,
-        }
+        state
     }
 
     fn for_edit(block: &Block, index: usize) -> Self {
         let available_columns = compute_schema_at(block, index);
-        let (kind, where_column, where_pattern) = match block.pipeline.get(index) {
-            Some(FilterSpec::FromLines) => (FilterKind::FromLines, 0, String::new()),
+        let mut state = Self::empty(block.id, available_columns, Some(index));
+        match block.pipeline.get(index) {
+            Some(FilterSpec::FromLines) => state.kind = FilterKind::FromLines,
+            Some(FilterSpec::FromFields) => state.kind = FilterKind::FromFields,
             Some(FilterSpec::Where {
                 predicate: Predicate::Matches { column, pattern },
             }) => {
-                let col_idx = available_columns
+                state.kind = FilterKind::Where;
+                state.where_column = state
+                    .available_columns
                     .iter()
                     .position(|c| c == column)
                     .unwrap_or(0);
-                (FilterKind::Where, col_idx, pattern.clone())
+                state.where_pattern = pattern.clone();
             }
-            Some(FilterSpec::Where { .. }) | None => {
-                let kind = if available_columns.is_empty() {
+            Some(FilterSpec::Where { .. }) => state.kind = FilterKind::Where,
+            Some(FilterSpec::Select { columns }) => {
+                state.kind = FilterKind::Select;
+                for col in columns {
+                    if let Some(i) = state.available_columns.iter().position(|c| c == col) {
+                        state.column_selections[i] = true;
+                    }
+                }
+            }
+            Some(FilterSpec::Drop { columns }) => {
+                state.kind = FilterKind::Drop;
+                for col in columns {
+                    if let Some(i) = state.available_columns.iter().position(|c| c == col) {
+                        state.column_selections[i] = true;
+                    }
+                }
+            }
+            Some(FilterSpec::Take { n }) => {
+                state.kind = FilterKind::Take;
+                state.n_input = n.to_string();
+            }
+            Some(FilterSpec::Skip { n }) => {
+                state.kind = FilterKind::Skip;
+                state.n_input = n.to_string();
+            }
+            None => {
+                state.kind = if state.available_columns.is_empty() {
                     FilterKind::FromLines
                 } else {
                     FilterKind::Where
                 };
-                (kind, 0, String::new())
             }
-        };
-        Self {
-            block_id: block.id,
-            kind,
-            where_column,
-            where_pattern,
-            available_columns,
-            field: FormField::Kind,
-            editing_index: Some(index),
         }
+        state
     }
 
     fn fields(&self) -> &'static [FormField] {
         match self.kind {
-            FilterKind::FromLines => &[FormField::Kind],
+            FilterKind::FromLines | FilterKind::FromFields => &[FormField::Kind],
             FilterKind::Where => &[FormField::Kind, FormField::Column, FormField::Pattern],
+            FilterKind::Select | FilterKind::Drop => &[FormField::Kind, FormField::Columns],
+            FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
         }
     }
 
@@ -159,9 +219,28 @@ impl FilterEditState {
         self.available_columns.get(self.where_column).map(|s| s.as_str())
     }
 
+    fn selected_columns(&self) -> Vec<String> {
+        self.column_selections
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sel)| {
+                if *sel {
+                    self.available_columns.get(i).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn parsed_n(&self) -> Option<usize> {
+        self.n_input.trim().parse().ok()
+    }
+
     fn build_filter(&self) -> Option<FilterSpec> {
         match self.kind {
             FilterKind::FromLines => Some(FilterSpec::FromLines),
+            FilterKind::FromFields => Some(FilterSpec::FromFields),
             FilterKind::Where => {
                 let column = self.selected_column()?;
                 Some(FilterSpec::Where {
@@ -171,6 +250,24 @@ impl FilterEditState {
                     },
                 })
             }
+            FilterKind::Select => {
+                let cols = self.selected_columns();
+                if cols.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::Select { columns: cols })
+                }
+            }
+            FilterKind::Drop => {
+                let cols = self.selected_columns();
+                if cols.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::Drop { columns: cols })
+                }
+            }
+            FilterKind::Take => self.parsed_n().map(|n| FilterSpec::Take { n }),
+            FilterKind::Skip => self.parsed_n().map(|n| FilterSpec::Skip { n }),
         }
     }
 }
@@ -375,6 +472,8 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::Kind => handle_kind_key(state, key),
             FormField::Column => handle_column_key(state, key),
             FormField::Pattern => handle_pattern_key(state, key),
+            FormField::N => handle_n_key(state, key),
+            FormField::Columns => handle_columns_key(state, key),
         },
     }
 }
@@ -400,6 +499,37 @@ fn handle_pattern_key(state: &mut FilterEditState, key: KeyEvent) {
         KeyCode::Char(c) => state.where_pattern.push(c),
         KeyCode::Backspace => {
             state.where_pattern.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_n_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii_digit() => state.n_input.push(c),
+        KeyCode::Backspace => {
+            state.n_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_columns_key(state: &mut FilterEditState, key: KeyEvent) {
+    if state.available_columns.is_empty() {
+        return;
+    }
+    let len = state.available_columns.len();
+    match key.code {
+        KeyCode::Up | KeyCode::Left => {
+            state.column_cursor = (state.column_cursor + len - 1) % len;
+        }
+        KeyCode::Down | KeyCode::Right => {
+            state.column_cursor = (state.column_cursor + 1) % len;
+        }
+        KeyCode::Char(' ') => {
+            if let Some(sel) = state.column_selections.get_mut(state.column_cursor) {
+                *sel = !*sel;
+            }
         }
         _ => {}
     }
@@ -828,7 +958,12 @@ fn format_scalar(v: &Value) -> String {
 fn describe_filter(spec: &FilterSpec) -> String {
     match spec {
         FilterSpec::FromLines => "from-lines".into(),
+        FilterSpec::FromFields => "from-fields".into(),
         FilterSpec::Where { predicate } => format!("where {}", describe_predicate(predicate)),
+        FilterSpec::Select { columns } => format!("select {}", columns.join(", ")),
+        FilterSpec::Drop { columns } => format!("drop {}", columns.join(", ")),
+        FilterSpec::Take { n } => format!("take {n}"),
+        FilterSpec::Skip { n } => format!("skip {n}"),
     }
 }
 
@@ -1012,6 +1147,8 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::Kind => "filter",
         FormField::Column => "column",
         FormField::Pattern => "pattern",
+        FormField::N => "n",
+        FormField::Columns => "columns",
     };
     let label_style = if active {
         Style::default()
@@ -1039,32 +1176,65 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
                 render_select_value(col, "", active)
             }
         }
-        FormField::Pattern => {
-            let cursor_marker = if active { "▏" } else { "" };
-            let value_style = if active {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let mut spans = Vec::new();
-            spans.push(Span::styled(state.where_pattern.clone(), value_style));
-            spans.push(Span::styled(
-                cursor_marker,
-                Style::default().fg(Color::Magenta),
-            ));
-            if state.where_pattern.is_empty() && !active {
-                spans.push(Span::styled(
-                    "(empty: matches everything)",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            spans
-        }
+        FormField::Pattern => render_text_field(&state.where_pattern, active, "(empty: matches everything)"),
+        FormField::N => render_text_field(&state.n_input, active, "(unset)"),
+        FormField::Columns => render_columns_field(state, active),
     };
 
     let mut all = vec![label_span];
     all.extend(value_spans);
     Line::from(all)
+}
+
+fn render_text_field(value: &str, active: bool, empty_hint: &'static str) -> Vec<Span<'static>> {
+    let cursor_marker = if active { "▏" } else { "" };
+    let value_style = if active {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let mut spans = Vec::new();
+    spans.push(Span::styled(value.to_string(), value_style));
+    spans.push(Span::styled(
+        cursor_marker,
+        Style::default().fg(Color::Magenta),
+    ));
+    if value.is_empty() && !active {
+        spans.push(Span::styled(
+            empty_hint,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+fn render_columns_field(state: &FilterEditState, active: bool) -> Vec<Span<'static>> {
+    if state.available_columns.is_empty() {
+        return vec![Span::styled(
+            "(no columns — pipeline output is bytes; add a parser)",
+            Style::default().fg(Color::Red),
+        )];
+    }
+    let mut spans = Vec::new();
+    for (i, col) in state.available_columns.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let check = if state.column_selections[i] { "☑" } else { "☐" };
+        let on_cursor = active && i == state.column_cursor;
+        let style = if on_cursor {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else if state.column_selections[i] {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!(" {check} {col} "), style));
+    }
+    spans
 }
 
 fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span<'static>> {
@@ -1224,15 +1394,82 @@ mod tests {
     }
 
     #[test]
-    fn cycle_kind_changes_filter_type() {
+    fn cycle_kind_walks_through_all_kinds() {
         let mut block = block_with_stdout(b"a\n");
         block.pipeline.push(FilterSpec::FromLines);
         let mut state = FilterEditState::for_add(&block);
+        // Default is Where because schema is non-empty.
         assert_eq!(state.kind, FilterKind::Where);
-        state.cycle_kind(1);
-        assert_eq!(state.kind, FilterKind::FromLines);
-        state.cycle_kind(1);
-        assert_eq!(state.kind, FilterKind::Where);
+        // ALL = [FromLines, FromFields, Where, Select, Drop, Take, Skip]
+        let order = [
+            FilterKind::Select,
+            FilterKind::Drop,
+            FilterKind::Take,
+            FilterKind::Skip,
+            FilterKind::FromLines,
+            FilterKind::FromFields,
+            FilterKind::Where,
+        ];
+        for expected in order {
+            state.cycle_kind(1);
+            assert_eq!(state.kind, expected);
+        }
+    }
+
+    #[test]
+    fn build_filter_take_requires_valid_n() {
+        let mut block = block_with_stdout(b"a\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Take;
+        assert!(state.build_filter().is_none());
+        state.n_input = "5".into();
+        match state.build_filter() {
+            Some(FilterSpec::Take { n }) => assert_eq!(n, 5),
+            _ => panic!("expected Take with n=5"),
+        }
+        state.n_input = "abc".into();
+        assert!(state.build_filter().is_none());
+    }
+
+    #[test]
+    fn build_filter_select_requires_at_least_one_column() {
+        let mut block = block_with_stdout(b"a b\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&block);
+        state.kind = FilterKind::Select;
+        assert!(state.build_filter().is_none());
+        state.column_selections[0] = true;
+        match state.build_filter() {
+            Some(FilterSpec::Select { columns }) => {
+                assert_eq!(columns, vec!["_1".to_string()]);
+            }
+            _ => panic!("expected Select with [_1]"),
+        }
+    }
+
+    #[test]
+    fn for_edit_prepopulates_take() {
+        let mut block = block_with_stdout(b"a\nb\nc\n");
+        block.pipeline.push(FilterSpec::FromLines);
+        block.pipeline.push(FilterSpec::Take { n: 2 });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::Take);
+        assert_eq!(state.n_input, "2");
+    }
+
+    #[test]
+    fn for_edit_prepopulates_select_columns() {
+        let mut block = block_with_stdout(b"a b c\n");
+        block.pipeline.push(FilterSpec::FromFields);
+        block.pipeline.push(FilterSpec::Select {
+            columns: vec!["_1".into(), "_3".into()],
+        });
+        let state = FilterEditState::for_edit(&block, 1);
+        assert_eq!(state.kind, FilterKind::Select);
+        // available_columns at index 1 = [_1, _2, _3]; selections should mark _1 and _3
+        assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
+        assert_eq!(state.column_selections, vec![true, false, true]);
     }
 
     #[test]
