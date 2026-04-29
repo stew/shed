@@ -13,9 +13,12 @@ path = "src/main.rs"
 [dependencies]
 bytes = "1.11.1"
 crossterm = "0.29.0"
+csv = "1.4.0"
+indexmap = "2.14.0"
 portable-pty = "0.9.0"
 ratatui = "0.30.0"
 regex = "1.12.3"
+serde_json = "1.0.149"
 shed-core.workspace = true
 shlex = "1.3.0"
 thiserror = "2.0.18"

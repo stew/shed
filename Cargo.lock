@@ -1256,9 +1256,12 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "crossterm",
+ "csv",
+ "indexmap",
  "portable-pty",
  "ratatui",
  "regex",
+ "serde_json",
  "shed-core",
  "shlex",
  "thiserror 2.0.18",

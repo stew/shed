@@ -234,7 +234,7 @@ so you don't lose data without noticing.
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
 | `d`       | drop the filter at cursor (or last if on add slot) |
 | `e`       | expand the selected block to a fullscreen pager |
-| `w`       | write the block's filtered output (plain text, one row per line) to a file path you type |
+| `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
 | `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render with `◉ name` and never evict on capture-budget pressure. Empty name unpins. |
 | `u`       | unpin the selected block (clear its name) |
 | Ctrl-C    | cancel a running command (kills the child) |

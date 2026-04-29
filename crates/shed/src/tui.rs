@@ -1489,6 +1489,42 @@ fn commit_pin(app: &mut App) {
     });
 }
 
+/// Output format inferred from the path extension at write time.
+/// `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty
+/// JSON, anything else → plain text (each rendered line joined with
+/// `\n`). The format only affects serialization; the underlying
+/// pipeline output is the same in all three cases.
+#[derive(Debug, Clone, Copy)]
+enum WriteFormat {
+    Plain,
+    Csv(u8),
+    Json,
+}
+
+impl WriteFormat {
+    fn from_path(path: &str) -> Self {
+        let lower = path.to_lowercase();
+        if lower.ends_with(".csv") {
+            WriteFormat::Csv(b',')
+        } else if lower.ends_with(".tsv") {
+            WriteFormat::Csv(b'\t')
+        } else if lower.ends_with(".json") {
+            WriteFormat::Json
+        } else {
+            WriteFormat::Plain
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            WriteFormat::Plain => "plain",
+            WriteFormat::Csv(b'\t') => "tsv",
+            WriteFormat::Csv(_) => "csv",
+            WriteFormat::Json => "json",
+        }
+    }
+}
+
 fn commit_write(app: &mut App) {
     let path = std::mem::take(&mut app.write_input);
     app.write_input_mode = false;
@@ -1499,24 +1535,149 @@ fn commit_write(app: &mut App) {
     }
     let Some(id) = app.session.cursor() else { return };
     let Some(block) = app.session.block(id) else { return };
-    let lines = compute_block_lines(block);
-    let mut text = String::new();
-    for line in &lines {
-        text.push_str(&line_text(line));
-        text.push('\n');
-    }
-    match std::fs::write(path, text) {
+
+    let format = WriteFormat::from_path(path);
+    let bytes = match format {
+        WriteFormat::Plain => render_plain_bytes(block),
+        WriteFormat::Csv(delim) => render_csv_bytes(block, delim),
+        WriteFormat::Json => render_json_bytes(block),
+    };
+
+    let len = bytes.len();
+    match std::fs::write(path, bytes) {
         Ok(()) => {
             app.flash = Some(format!(
-                "wrote %{} ({} lines) to {}",
+                "wrote %{} ({} bytes, {}) to {}",
                 id.0,
-                lines.len(),
+                len,
+                format.name(),
                 path
             ));
         }
         Err(e) => {
             app.flash = Some(format!("write failed: {e}"));
         }
+    }
+}
+
+fn render_plain_bytes(block: &Block) -> Vec<u8> {
+    let lines = compute_block_lines(block);
+    let mut text = String::new();
+    for line in &lines {
+        text.push_str(&line_text(line));
+        text.push('\n');
+    }
+    text.into_bytes()
+}
+
+fn render_csv_bytes(block: &Block, delim: u8) -> Vec<u8> {
+    let Some(capture) = block.capture.as_ref() else {
+        return Vec::new();
+    };
+    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+        Ok((v, _)) => v,
+        Err(e) => return e.into_bytes(),
+    };
+    let items = match value {
+        PipelineValue::Structured(Value::List(items)) => items,
+        // Bytes / non-list structured: fall back to plain.
+        _ => return render_plain_bytes(block),
+    };
+
+    let mut out = Vec::new();
+    {
+        let mut writer = csv::WriterBuilder::new()
+            .delimiter(delim)
+            .from_writer(&mut out);
+
+        let columns: Vec<String> = items
+            .iter()
+            .find_map(|v| match v {
+                Value::Record(r) => Some(r.keys().cloned().collect::<Vec<_>>()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        if !columns.is_empty() {
+            let _ = writer.write_record(&columns);
+        }
+        for item in &items {
+            match item {
+                Value::Record(r) => {
+                    let row: Vec<String> = columns
+                        .iter()
+                        .map(|c| r.get(c).map(value_to_field_string).unwrap_or_default())
+                        .collect();
+                    let _ = writer.write_record(&row);
+                }
+                other => {
+                    let _ = writer.write_record(&[value_to_field_string(other)]);
+                }
+            }
+        }
+        let _ = writer.flush();
+    }
+    out
+}
+
+fn render_json_bytes(block: &Block) -> Vec<u8> {
+    let Some(capture) = block.capture.as_ref() else {
+        return Vec::new();
+    };
+    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+        Ok((v, _)) => v,
+        Err(e) => return e.into_bytes(),
+    };
+    let json = pipeline_value_to_json(value);
+    let mut out =
+        serde_json::to_vec_pretty(&json).unwrap_or_else(|e| e.to_string().into_bytes());
+    out.push(b'\n');
+    out
+}
+
+fn pipeline_value_to_json(v: PipelineValue) -> serde_json::Value {
+    match v {
+        PipelineValue::Bytes(b) => {
+            serde_json::Value::String(String::from_utf8_lossy(&b).to_string())
+        }
+        PipelineValue::Structured(val) => value_to_json(val),
+    }
+}
+
+fn value_to_json(v: Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(b),
+        Value::Int(i) => serde_json::Value::Number(serde_json::Number::from(i)),
+        Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s),
+        Value::Bytes(b) => {
+            serde_json::Value::String(String::from_utf8_lossy(&b).to_string())
+        }
+        Value::List(items) => {
+            serde_json::Value::Array(items.into_iter().map(value_to_json).collect())
+        }
+        Value::Record(r) => {
+            let mut map = serde_json::Map::with_capacity(r.len());
+            for (k, val) in r {
+                map.insert(k, value_to_json(val));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
+fn value_to_field_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        _ => format!("{v:?}"),
     }
 }
 
@@ -4094,6 +4255,42 @@ mod tests {
                 .as_nanos()
         ));
         assert!(load_history_from(&path).is_none());
+    }
+
+    #[test]
+    fn write_format_inferred_from_extension() {
+        assert!(matches!(WriteFormat::from_path("foo.csv"), WriteFormat::Csv(b',')));
+        assert!(matches!(WriteFormat::from_path("foo.CSV"), WriteFormat::Csv(b',')));
+        assert!(matches!(WriteFormat::from_path("foo.tsv"), WriteFormat::Csv(b'\t')));
+        assert!(matches!(WriteFormat::from_path("foo.json"), WriteFormat::Json));
+        assert!(matches!(WriteFormat::from_path("foo.txt"), WriteFormat::Plain));
+        assert!(matches!(WriteFormat::from_path("foo"), WriteFormat::Plain));
+    }
+
+    #[test]
+    fn json_render_of_structured_list_of_records() {
+        // Build a structured list-of-records by hand and serialize it.
+        use shed_core::Value;
+        let mut rec1 = indexmap::IndexMap::new();
+        rec1.insert("name".to_string(), Value::String("alice".into()));
+        rec1.insert("age".to_string(), Value::Int(30));
+        let mut rec2 = indexmap::IndexMap::new();
+        rec2.insert("name".to_string(), Value::String("bob".into()));
+        rec2.insert("age".to_string(), Value::Int(25));
+        let v = PipelineValue::Structured(Value::List(vec![
+            Value::Record(rec1),
+            Value::Record(rec2),
+        ]));
+        let json = pipeline_value_to_json(v);
+        let s = serde_json::to_string(&json).unwrap();
+        // Structure check via round-trip.
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "alice");
+        assert_eq!(arr[0]["age"], 30);
+        assert_eq!(arr[1]["name"], "bob");
+        assert_eq!(arr[1]["age"], 25);
     }
 
     #[test]
