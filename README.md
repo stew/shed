@@ -198,6 +198,7 @@ so you don't lose data without noticing.
 | `←→`      | navigate filters within the selected block (and the `+ add` slot) |
 | `f` / Enter | edit selected filter / add new |
 | `d`       | drop the filter at cursor (or last if on add slot) |
+| `e`       | expand the selected block to a fullscreen pager |
 | Ctrl-C    | cancel a running command (kills the child) |
 | Esc       | back to prompt |
 | Ctrl-D    | quit |
@@ -215,6 +216,20 @@ so you don't lose data without noticing.
 | `x` / Backspace      | (on SortKeys / where-clause) remove the active row (min 1) |
 | Enter                | apply — commits the in-progress filter to the pipeline |
 | Esc                  | cancel — restores the saved filter, returns to BlockCursor |
+
+### BlockExpand (pager)
+
+Entered via `e` from BlockCursor. The selected block's full pipeline
+output fills the screen.
+
+| Key                 | Action |
+|---------------------|--------|
+| `↑↓` or `j`/`k`     | scroll one line |
+| PgUp / PgDn / Space / `b` / `f` | scroll one page (~20 lines) |
+| Home / `g`          | jump to top |
+| End / `G`           | jump to bottom |
+| Esc / `q`           | back to BlockCursor |
+| Ctrl-D              | quit |
 
 ## Architecture
 
@@ -288,8 +303,8 @@ Known gaps and likely next steps, in rough priority order:
 - Prompt history (Up arrow recall of previous commands)
 - Command palette (universal `Space` / `Ctrl-K` action menu)
 - Saved/named pipelines as reusable computations
-- Block expand-to-fullscreen for inspecting long captures
-- Scrollback within long block previews
+- Scrollback within long block previews (sub-block scroll without
+  entering the pager)
 
 ## License
 

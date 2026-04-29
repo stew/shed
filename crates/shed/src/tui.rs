@@ -10,6 +10,7 @@
 //! | `Prompt`      | type commands; Enter spawns                      |
 //! | `BlockCursor` | navigate blocks (↑↓), filters within (←→), edit |
 //! | `FilterEdit`  | schema-aware form for the active filter          |
+//! | `BlockExpand` | fullscreen pager for the selected block          |
 //!
 //! Focus transitions: `Esc` from `Prompt` enters `BlockCursor` on the
 //! newest block; `Esc` from `BlockCursor` returns to `Prompt`; `f`/Enter
@@ -99,6 +100,7 @@ enum Focus {
     Prompt,
     BlockCursor,
     FilterEdit,
+    BlockExpand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,6 +899,7 @@ struct App {
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
+    expand_scroll: usize,
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
@@ -924,6 +927,7 @@ impl App {
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
+            expand_scroll: 0,
             flash: None,
             quit: false,
             running: HashMap::new(),
@@ -1075,6 +1079,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::Prompt => handle_prompt_key(app, key).await,
         Focus::BlockCursor => handle_cursor_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
+        Focus::BlockExpand => handle_block_expand_key(app, key),
     }
 }
 
@@ -1125,6 +1130,41 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right => move_filter_cursor(app, 1),
         KeyCode::Char('f') | KeyCode::Enter => open_filter_edit(app),
         KeyCode::Char('d') => drop_filter_at_cursor(app),
+        KeyCode::Char('e') => {
+            if app.session.cursor().is_some() {
+                app.expand_scroll = 0;
+                app.focus = Focus::BlockExpand;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
+    const PAGE: usize = 20;
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.expand_scroll = 0;
+            app.focus = Focus::BlockCursor;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.expand_scroll = app.expand_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.expand_scroll = app.expand_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp | KeyCode::Char('b') => {
+            app.expand_scroll = app.expand_scroll.saturating_sub(PAGE);
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+            app.expand_scroll = app.expand_scroll.saturating_add(PAGE);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.expand_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            app.expand_scroll = usize::MAX;
+        }
         _ => {}
     }
 }
@@ -1494,8 +1534,70 @@ async fn spawn_prompt(app: &mut App) {
 fn draw(f: &mut Frame, app: &App) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
+        Focus::BlockExpand => draw_block_expand(f, app),
         _ => draw_repl(f, app),
     }
+}
+
+fn draw_block_expand(f: &mut Frame, app: &App) {
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(block) = app.session.block(id) else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    // Compute the full pipeline output (no row cap) and the lines to render.
+    let all_lines: Vec<Line<'static>> = match block.capture.as_ref() {
+        Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
+            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX),
+            Err(e) => filter_error_lines(&e),
+        },
+        None => vec![Line::from(Span::styled(
+            "      (no capture)",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let total = all_lines.len();
+    let body_area = chunks[1];
+    let visible = body_area.height as usize;
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.expand_scroll.min(max_scroll);
+    let visible_end = (scroll + visible).min(total);
+
+    let title = if total == 0 {
+        format!("inspect  %{}  {}", block.id.0, block.argv.join(" "))
+    } else {
+        format!(
+            "inspect  %{}  {}    lines {}-{} of {}",
+            block.id.0,
+            block.argv.join(" "),
+            scroll + 1,
+            visible_end,
+            total,
+        )
+    };
+    draw_header(f, chunks[0], &title);
+
+    let visible_lines: Vec<Line<'static>> = all_lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible)
+        .collect();
+    let para = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+    f.render_widget(para, body_area);
+
+    draw_status(f, chunks[2], app);
 }
 
 fn draw_repl(f: &mut Frame, app: &App) {
@@ -1983,7 +2085,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Focus::FilterEdit => Line::from(""),
+        Focus::FilterEdit | Focus::BlockExpand => Line::from(""),
     };
     let widget = Paragraph::new(line).block(border);
     f.render_widget(widget, area);
@@ -2482,6 +2584,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("←→", "filters"),
             ("f", "add/edit"),
             ("d", "drop"),
+            ("e", "expand"),
             ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
@@ -2491,6 +2594,13 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("←→", "cycle"),
             ("Enter", "apply"),
             ("Esc", "cancel"),
+        ],
+        Focus::BlockExpand => vec![
+            ("↑↓ / jk", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("g/G", "top/bot"),
+            ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
         ],
     };
     let mut spans = Vec::new();
