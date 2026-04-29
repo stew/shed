@@ -78,6 +78,16 @@ struct HandoverRequest {
     reuse_block: Option<BlockId>,
 }
 
+/// Re-run a command with an edited argv but inherit the original
+/// block's pipeline. Created in BlockCursor by `r`; consumed at the
+/// top of app_loop so we can spawn from an async context.
+#[derive(Debug, Clone)]
+struct RerunRequest {
+    argv: Vec<String>,
+    pipeline: Vec<FilterSpec>,
+    force_fullscreen: bool,
+}
+
 const MAX_SORT_KEYS: usize = 5;
 
 const FULLSCREEN_PROGRAMS: &[&str] = &[
@@ -1032,6 +1042,10 @@ struct App {
     write_input: String,
     pin_input_mode: bool,
     pin_input: String,
+    rerun_input_mode: bool,
+    rerun_input: String,
+    rerun_source_id: Option<BlockId>,
+    pending_rerun: Option<RerunRequest>,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
     focus: Focus,
@@ -1074,6 +1088,10 @@ impl App {
             write_input: String::new(),
             pin_input_mode: false,
             pin_input: String::new(),
+            rerun_input_mode: false,
+            rerun_input: String::new(),
+            rerun_source_id: None,
+            pending_rerun: None,
             last_cwd: None,
             env_edit: None,
             focus: Focus::Prompt,
@@ -1143,6 +1161,9 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
         if let Some(req) = app.pending_handover.take() {
             perform_handover(terminal, &mut app, req).await?;
         }
+        if let Some(req) = app.pending_rerun.take() {
+            perform_rerun(&mut app, req).await;
+        }
         reap_completed(&mut app).await;
         terminal.draw(|f| draw(f, &app))?;
         if app.quit {
@@ -1155,6 +1176,53 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     handle_key(&mut app, key).await;
                 }
             }
+        }
+    }
+}
+
+async fn perform_rerun(app: &mut App, req: RerunRequest) {
+    if req.force_fullscreen || needs_fullscreen(&req.argv) {
+        app.pending_handover = Some(HandoverRequest {
+            argv: req.argv,
+            reuse_block: None,
+        });
+        return;
+    }
+
+    // Builtins are state changes; re-running them as a copy doesn't make
+    // sense, so just dispatch through the same path as a typed command.
+    match req.argv[0].as_str() {
+        "cd" => {
+            run_cd_builtin(app, &req.argv);
+            return;
+        }
+        "exit" | "quit" => {
+            run_exit_builtin(app);
+            return;
+        }
+        "export" => {
+            run_export_builtin(app, &req.argv);
+            return;
+        }
+        "unset" => {
+            run_unset_builtin(app, &req.argv);
+            return;
+        }
+        _ => {}
+    }
+
+    let id = app.session.add_block(req.argv.clone());
+    if !req.pipeline.is_empty() {
+        if let Some(block) = app.session.block_mut(id) {
+            block.pipeline = req.pipeline;
+        }
+    }
+    match exec::spawn_command(req.argv, CAPTURE_CAP).await {
+        Ok((handle, killer)) => {
+            app.running.insert(id, RunningCommand { handle, killer });
+        }
+        Err(e) => {
+            app.session.set_state(id, BlockState::Failed(e.to_string()));
         }
     }
 }
@@ -1384,6 +1452,22 @@ fn history_step(app: &mut App, delta: i32) {
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
+    if app.rerun_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.rerun_input_mode = false;
+                app.rerun_input.clear();
+                app.rerun_source_id = None;
+            }
+            KeyCode::Enter => commit_rerun(app),
+            KeyCode::Char(c) => app.rerun_input.push(c),
+            KeyCode::Backspace => {
+                app.rerun_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
     if app.pin_input_mode {
         match key.code {
             KeyCode::Esc => {
@@ -1461,8 +1545,50 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 });
             }
         }
+        KeyCode::Char('r') => {
+            if let Some(id) = app.session.cursor() {
+                if let Some(block) = app.session.block(id) {
+                    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
+                        .unwrap_or_else(|_| block.argv.join(" "));
+                    app.rerun_input = joined;
+                    app.rerun_input_mode = true;
+                    app.rerun_source_id = Some(id);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+fn commit_rerun(app: &mut App) {
+    let input = std::mem::take(&mut app.rerun_input);
+    app.rerun_input_mode = false;
+    let source_id = app.rerun_source_id.take();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        app.flash = Some("command required".into());
+        return;
+    }
+    let (force_fullscreen, command_str) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, trimmed),
+    };
+    let Some(argv) = shlex::split(command_str) else {
+        app.flash = Some("unmatched quote".into());
+        return;
+    };
+    if argv.is_empty() {
+        return;
+    }
+    let pipeline: Vec<FilterSpec> = source_id
+        .and_then(|id| app.session.block(id))
+        .map(|b| b.pipeline.clone())
+        .unwrap_or_default();
+    app.pending_rerun = Some(RerunRequest {
+        argv,
+        pipeline,
+        force_fullscreen,
+    });
 }
 
 fn commit_pin(app: &mut App) {
@@ -3991,6 +4117,22 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.rerun_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "rerun: ",
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.rerun_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::LightCyan)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if app.pin_input_mode {
         let widget = Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -4083,6 +4225,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("e", "expand"),
             ("w", "write"),
             ("p/u", "pin/unpin"),
+            ("r", "rerun"),
             ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),

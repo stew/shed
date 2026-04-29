@@ -237,6 +237,7 @@ so you don't lose data without noticing.
 | `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
 | `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render with `◉ name` and never evict on capture-budget pressure. Empty name unpins. |
 | `u`       | unpin the selected block (clear its name) |
+| `r`       | open a rerun input bar pre-filled with the block's argv (shlex-quoted). Edit and Enter to spawn a new block with the edited command and the same pipeline copied over; Esc cancels. The original block is unchanged. |
 | Ctrl-C    | cancel a running command (kills the child) |
 | Esc       | back to prompt |
 | Ctrl-D    | quit |
