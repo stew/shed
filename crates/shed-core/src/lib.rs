@@ -29,6 +29,7 @@
 pub mod block;
 pub mod capture;
 pub mod filter;
+pub mod notebook;
 pub mod session;
 pub mod value;
 
@@ -38,5 +39,6 @@ pub use filter::{
     CompareOp, Filter, FilterError, FilterNotes, FilterSpec, PipelineValue, Predicate,
     SortDirection, SortKey, apply_with_notes,
 };
+pub use notebook::{NOTEBOOK_VERSION, Notebook, NotebookEntry, NotebookError};
 pub use session::{DEFAULT_CAPTURE_BUDGET_BYTES, Session};
 pub use value::Value;

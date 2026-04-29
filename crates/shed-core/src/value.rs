@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 /// A piece of structured data flowing through a filter pipeline.
 ///
@@ -8,7 +9,7 @@ use indexmap::IndexMap;
 /// Scalars (`Int`, `String`, etc.) appear when a parser produces them
 /// (e.g., `from-json` on a top-level number) or when a filter cell holds
 /// one. Column order in `Record` is preserved via [`IndexMap`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),

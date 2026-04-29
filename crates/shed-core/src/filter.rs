@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use indexmap::IndexMap;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::value::Value;
@@ -32,7 +33,7 @@ pub enum PipelineValue {
 /// - **Column transforms** (`Select`, `Drop`, `Rename`) reshape the
 ///   schema of each row.
 /// - **Aggregations** (`Count`) collapse the row stream to a summary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterSpec {
     /// One record per line; column `line` holds the line text.
     FromLines,
@@ -90,14 +91,14 @@ pub enum FilterSpec {
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortKey {
     pub column: String,
     pub direction: SortDirection,
 }
 
 /// Sort direction for a [`SortKey`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortDirection {
     Asc,
     Desc,
@@ -115,7 +116,7 @@ pub enum SortDirection {
 /// build flat And-chains and Or-chains (with a single combine
 /// operator across all clauses); arbitrary nesting and `Not` are
 /// data-model features that have to be constructed programmatically.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Predicate {
     Matches { column: String, pattern: String },
     Contains { column: String, substring: String },
@@ -130,7 +131,7 @@ pub enum Predicate {
 }
 
 /// Comparison operator for [`Predicate::Compare`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompareOp {
     Eq,
     Ne,

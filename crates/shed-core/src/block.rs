@@ -10,12 +10,15 @@ pub struct BlockId(pub u64);
 
 /// Lifecycle state of the spawned process behind a block.
 ///
-/// `Running` blocks have no [`Capture`] yet. `Done` carries the exit code;
-/// `Failed` carries a human-readable reason (spawn error, cancellation,
-/// task error, …). `Snapshotted` is reserved for a future feature where
-/// the user freezes a streaming capture mid-flight.
+/// `Idle` blocks were loaded from a notebook but have not been run in this
+/// session — they have no capture and the user must trigger them
+/// explicitly. `Running` blocks have no [`Capture`] yet. `Done` carries the
+/// exit code; `Failed` carries a human-readable reason (spawn error,
+/// cancellation, task error, …). `Snapshotted` is reserved for a future
+/// feature where the user freezes a streaming capture mid-flight.
 #[derive(Debug, Clone)]
 pub enum BlockState {
+    Idle,
     Running,
     Snapshotted,
     Done(i32),
@@ -43,6 +46,11 @@ pub struct Block {
     pub pipeline: Vec<FilterSpec>,
     pub state: BlockState,
     pub last_touched: Instant,
+    /// Free-form note rendered above the block. Persisted to notebooks.
+    pub pre_text: Option<String>,
+    /// Free-form note rendered below the block's content. Persisted to
+    /// notebooks.
+    pub post_text: Option<String>,
 }
 
 impl Block {

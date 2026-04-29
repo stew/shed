@@ -57,6 +57,8 @@ impl Session {
             pipeline: Vec::new(),
             state: BlockState::Running,
             last_touched: Instant::now(),
+            pre_text: None,
+            post_text: None,
         };
         self.blocks.insert(id, block);
         id
@@ -140,6 +142,20 @@ impl Session {
                 self.names.remove(&name);
             }
         }
+    }
+
+    /// Remove a block from the session entirely. Drops the names entry if
+    /// the block was pinned, clears the cursor if it pointed at this id.
+    /// Returns the removed block, or `None` if the id was unknown.
+    pub fn remove_block(&mut self, id: BlockId) -> Option<Block> {
+        let block = self.blocks.remove(&id)?;
+        if let Some(name) = &block.name {
+            self.names.remove(name);
+        }
+        if self.cursor == Some(id) {
+            self.cursor = None;
+        }
+        Some(block)
     }
 
     pub fn lookup_by_name(&self, name: &str) -> Option<BlockId> {
@@ -290,6 +306,32 @@ mod tests {
         assert!(s.block(a).unwrap().capture.is_some(), "pinned never evicts");
         assert!(s.block(b).unwrap().capture.is_none(), "oldest unpinned evicts");
         assert!(s.block(c).unwrap().capture.is_some());
+    }
+
+    #[test]
+    fn remove_block_drops_capture_and_name() {
+        let mut s = Session::new();
+        let a = s.add_block(vec!["a".into()]);
+        s.pin(a, "saved".into());
+        let removed = s.remove_block(a).expect("removed");
+        assert_eq!(removed.id, a);
+        assert!(s.block(a).is_none());
+        assert!(s.lookup_by_name("saved").is_none());
+    }
+
+    #[test]
+    fn remove_block_clears_cursor_when_pointing_at_it() {
+        let mut s = Session::new();
+        let a = s.add_block(vec!["a".into()]);
+        s.set_cursor(Some(a));
+        s.remove_block(a);
+        assert!(s.cursor().is_none());
+    }
+
+    #[test]
+    fn remove_unknown_block_returns_none() {
+        let mut s = Session::new();
+        assert!(s.remove_block(BlockId(99)).is_none());
     }
 
     #[test]

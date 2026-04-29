@@ -16,6 +16,7 @@
 //! - [`ansi`] — ANSI escape parser using `vte`. Walks captured bytes and
 //!   emits ratatui-styled `Span`s with SGR colors and modifiers.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod ansi;
@@ -24,9 +25,30 @@ mod tui;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if let Err(e) = tui::run().await {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let notebook = match parse_args(&args) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("shed: {msg}");
+            eprintln!("usage: shed [NOTEBOOK.json]");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = tui::run(notebook).await {
         eprintln!("shed: {e}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+fn parse_args(args: &[String]) -> Result<Option<PathBuf>, String> {
+    match args {
+        [] => Ok(None),
+        [arg] if arg == "-h" || arg == "--help" => {
+            println!("usage: shed [NOTEBOOK.json]");
+            std::process::exit(0);
+        }
+        [path] => Ok(Some(PathBuf::from(path))),
+        _ => Err(format!("unexpected args: {}", args[1..].join(" "))),
+    }
 }

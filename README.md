@@ -45,7 +45,8 @@ the top of `ls -la`'s output).
 ```bash
 git clone <repo> shed
 cd shed
-cargo run        # opens the TUI
+cargo run                          # fresh empty session
+cargo run -- ./demo.json           # open a notebook (created if absent)
 ```
 
 A walkthrough:
@@ -157,6 +158,75 @@ Most other "shell-isms" (`|`, `>`, `&&`, `$(…)`) are deliberately not
 supported — see the design constraints below. Use `bash -c '…'` if you
 need real shell semantics.
 
+### Pinned references (`@name`)
+
+A pinned block (`p` to pin) gets a name. Type `@name` at the prompt and
+shed creates a new block whose capture is a *snapshot* of `@name`'s
+current pipeline output:
+
+- structured output (rows from a parser) is rendered as pretty JSON, so
+  the snapshot block typically starts with `from-json`
+- raw bytes are passed through unchanged
+
+The snapshot is taken at create time. It does *not* re-evaluate when the
+source changes — to refresh, focus the snapshot block and press `Space`
+(re-run in place re-snapshots from the source's current state). If the
+source is gone or has no capture, the snapshot block lands in `Failed`
+state with a message saying so.
+
+**Dependency auto-run.** If you run a snapshot block (`Space` or typing
+`@name`) and the source itself hasn't run yet, shed walks the chain and
+runs the prereqs first, in dep order. A flash message tells you what's
+about to happen (`running 2 deps first, then %5`). If a prereq fails, the
+rest of the chain is dropped rather than running against a stale source.
+Cycles (`@a` pinned as `a`) terminate via cycle-detection.
+
+`@name` blocks save and load through notebooks like any other block (the
+argv is just `@name`); on re-open they're `Idle` and re-snapshot when
+you run them.
+
+### Block notes (pre / post text)
+
+Each block can carry two free-form text notes — `pre_text` shown above
+the block, `post_text` shown below. Use them for section headers,
+running commentary, observations about the output, or anything else you
+want to preserve alongside the command.
+
+| Key | Action |
+|-----|--------|
+| `n` | edit the pre-note (above the block) |
+| `N` | edit the post-note (below the block) |
+
+In the editor: type to insert at the cursor, `Enter` for newline,
+`Backspace` / `Delete`, `←→ ↑↓ Home End` to navigate, `Ctrl-S` to save,
+`Esc` (or `Ctrl-C`) to cancel. An empty buffer clears the note.
+
+Notes render dimmed and italicized with a `▎` left edge so they're
+visually distinct from command output. They round-trip through
+notebooks alongside argv, name, and pipeline.
+
+### Notebooks
+
+A *notebook* is the saveable form of a session: an ordered list of
+commands plus the retroactive pipeline you built around each one. The
+on-disk format is JSON (versioned via a top-level `version` field) and
+holds *only* structure — argv, optional pinned name, pipeline. Captures,
+exit codes, and timestamps are not persisted on purpose: a notebook is a
+recipe, not a frozen view.
+
+| Action                 | How |
+|------------------------|-----|
+| Open a notebook on launch | `shed PATH.json` (the file is created if it doesn't exist; it just binds the save target) |
+| Save                   | `Ctrl-S` — saves to the bound path; if none, opens an input bar to pick one |
+| Save as / open another | `Ctrl-O` — input bar to load a different notebook (replaces the current session) |
+| Run a loaded block     | move the cursor onto it (`Esc`, `↑↓`) and press `Space` (or `x`). Loaded blocks start in `Idle` state with a hollow `○` glyph; running them swaps the capture in place. |
+| Quit with unsaved work | `Ctrl-D` shows `unsaved changes — save before quitting? [y]es [n]o [c]ancel` instead of quitting straight away |
+
+Block re-runs and pipeline edits set a *dirty* flag. Save clears it;
+quitting while dirty triggers the confirmation prompt. `Ctrl-S` from
+anywhere (Prompt, BlockCursor, even mid-FilterEdit) writes the current
+session out.
+
 ### Fullscreen handover
 
 For interactive programs (`top`, `vim`, `less`, `man`, `tmux`, `ssh`,
@@ -219,10 +289,13 @@ so you don't lose data without noticing.
 | Enter     | run command |
 | `↑` / `↓` | recall previous / next command from history (persisted across sessions in `$XDG_CACHE_HOME/shed/history`, default `~/.cache/shed/history`) |
 | `!cmd`    | force fullscreen handover (typed prefix) |
+| `@name`   | snapshot the output of pinned block `@name` into a new block (see Pinned references) |
 | Esc       | focus newest block |
-| Ctrl-D    | quit |
+| Ctrl-D    | quit (or prompt if unsaved) |
 | Ctrl-C    | quit (no running selection) |
 | Ctrl-K    | open the command palette |
+| Ctrl-S    | save notebook (input bar if no path bound) |
+| Ctrl-O    | open notebook (replaces the current session) |
 
 ### BlockCursor
 
@@ -230,18 +303,23 @@ so you don't lose data without noticing.
 |-----------|--------|
 | `↑↓`      | navigate between blocks |
 | `←→`      | navigate filters within the selected block (and the `+ add` slot) |
+| Space     | run the selected block in place (re-spawns its argv, replaces the capture). Use this to execute Idle blocks loaded from a notebook, or to re-run a finished block without typing it again. For `@name` snapshot blocks this re-snapshots from the source. |
 | `f` / Enter | edit selected filter / add new |
 | `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
 | `d`       | drop the filter at cursor (or last if on add slot) |
+| `x`       | delete the selected block from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
 | `e`       | expand the selected block to a fullscreen pager |
 | `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
 | `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render with `◉ name` and never evict on capture-budget pressure. Empty name unpins. |
 | `u`       | unpin the selected block (clear its name) |
 | `r`       | open a rerun input bar pre-filled with the block's argv (shlex-quoted). Edit and Enter to spawn a new block with the edited command and the same pipeline copied over; Esc cancels. The original block is unchanged. |
+| `n` / `N` | edit the block's pre-note / post-note (multi-line text rendered above / below the block, persisted to the notebook) |
 | Ctrl-C    | cancel a running command (kills the child) |
+| Ctrl-S    | save notebook |
+| Ctrl-O    | open notebook |
 | Esc       | back to prompt |
-| Ctrl-D    | quit |
+| Ctrl-D    | quit (or prompt if unsaved) |
 
 ### FilterEdit
 
@@ -324,7 +402,8 @@ shed/
 │   │   ├── value.rs    Value enum
 │   │   ├── capture.rs  Capture struct
 │   │   ├── filter.rs   FilterSpec, Predicate, Filter trait, apply_with_notes
-│   │   ├── block.rs    Block, BlockId, BlockState
+│   │   ├── block.rs    Block, BlockId, BlockState (incl. Idle for loaded notebooks)
+│   │   ├── notebook.rs Notebook save/load (JSON, structure-only)
 │   │   └── session.rs  Session with LRU eviction
 │   └── shed/           bin: TUI + exec + ANSI
 │       ├── main.rs     entry point
@@ -348,6 +427,7 @@ shed/
 | `regex`        | `from-regex` and `where matches` |
 | `bytes`        | zero-copy byte slices for capture buffers |
 | `indexmap`     | ordered map for `Record` (preserves column order) |
+| `serde` / `serde_json` | notebook persistence (JSON) and `from-json` parsing |
 | `thiserror`    | error types |
 
 ### Design choices
@@ -380,6 +460,9 @@ Known gaps and likely next steps, in rough priority order:
   cargo-style progress bars; tools that update several lines via
   cursor up still produce stacked output.
 - Saved/named pipelines as reusable computations
+- Standalone note entries between blocks (today notes attach as
+  pre / post text on a specific command block — fine for commentary
+  alongside a command but not for prose-only sections)
 - Scrollback within long block previews (sub-block scroll without
   entering the pager)
 

@@ -40,11 +40,12 @@
 //! - **Multi-select** — Columns (Select/Drop/Uniq): ↑↓ moves cursor, Space toggles
 //! - **Multi-line list** — SortKeys, RenameMap: each row has its own state
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -54,8 +55,8 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Block, BlockId, BlockState, CompareOp, Filter, FilterSpec, PipelineValue, Predicate,
-    Session, SortDirection, SortKey, Value, apply_with_notes,
+    Block, BlockId, BlockState, Capture, CompareOp, Filter, FilterSpec, Notebook, PipelineValue,
+    Predicate, Session, SortDirection, SortKey, Value, apply_with_notes,
 };
 use tokio::task::JoinHandle;
 
@@ -123,6 +124,42 @@ enum Focus {
     BlockExpand,
     EnvEdit,
     Palette,
+    NoteEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotePosition {
+    Pre,
+    Post,
+}
+
+/// Multi-line text buffer state for editing a block's pre or post note.
+/// Cursor is a char index into `buffer`. Up/down navigation isn't
+/// supported in v0; horizontal nav + backspace/delete cover most short
+/// notes.
+#[derive(Debug, Clone)]
+struct NoteEditState {
+    block_id: BlockId,
+    position: NotePosition,
+    buffer: Vec<char>,
+    cursor: usize,
+}
+
+impl NoteEditState {
+    fn new(block_id: BlockId, position: NotePosition, initial: Option<&str>) -> Self {
+        let buffer: Vec<char> = initial.map(|s| s.chars().collect()).unwrap_or_default();
+        let cursor = buffer.len();
+        Self {
+            block_id,
+            position,
+            buffer,
+            cursor,
+        }
+    }
+
+    fn buffer_string(&self) -> String {
+        self.buffer.iter().collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +344,56 @@ const ACTIONS: &[Action] = &[
         handler: |app| {
             let _ = cancel_at_cursor(app);
             app.focus = Focus::BlockCursor;
+        },
+    },
+    Action {
+        name: "Run block in place",
+        description: "Re-spawn the selected block's command, replacing its capture",
+        enabled: block_selected,
+        handler: |app| {
+            app.focus = Focus::BlockCursor;
+            run_cursor_block_in_place(app);
+        },
+    },
+    Action {
+        name: "Delete block",
+        description: "Remove the selected block from the session",
+        enabled: block_selected,
+        handler: |app| {
+            app.focus = Focus::BlockCursor;
+            delete_block_at_cursor(app);
+        },
+    },
+    Action {
+        name: "Edit pre-note",
+        description: "Edit the note rendered above the selected block",
+        enabled: block_selected,
+        handler: |app| {
+            open_note_edit(app, NotePosition::Pre);
+        },
+    },
+    Action {
+        name: "Edit post-note",
+        description: "Edit the note rendered below the selected block",
+        enabled: block_selected,
+        handler: |app| {
+            open_note_edit(app, NotePosition::Post);
+        },
+    },
+    Action {
+        name: "Save notebook",
+        description: "Save the session as a notebook (.json)",
+        enabled: always_enabled,
+        handler: |app| {
+            begin_save(app);
+        },
+    },
+    Action {
+        name: "Open notebook",
+        description: "Load a notebook from disk (replaces the current session)",
+        enabled: always_enabled,
+        handler: |app| {
+            begin_open(app);
         },
     },
 ];
@@ -1251,6 +1338,7 @@ struct App {
     pending_rerun: Option<RerunRequest>,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
+    note_edit: Option<NoteEditState>,
     palette_state: Option<PaletteState>,
     palette_prev_focus: Option<Focus>,
     focus: Focus,
@@ -1267,6 +1355,40 @@ struct App {
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
     pending_handover: Option<HandoverRequest>,
+    /// Path the notebook is bound to (set by `--open`, by Ctrl-O, or by
+    /// the first Ctrl-S that prompted for a path). Subsequent Ctrl-S
+    /// saves silently to this path.
+    notebook_path: Option<PathBuf>,
+    /// `true` when the session has unsaved changes. Set whenever a block
+    /// is added, edited, pinned/unpinned, re-run, or its pipeline mutated.
+    /// Cleared on save/load.
+    dirty: bool,
+    /// Queue of blocks to run in sequence (head first). Built by walking
+    /// `@-ref` deps so a snapshot block runs its source before itself.
+    /// The event loop kicks off one at a time and gates on terminal state.
+    pending_run_chain: VecDeque<BlockId>,
+    /// Block currently being processed by the run-in-place machinery.
+    /// While `Some`, the next chain item won't start. Cleared once the
+    /// block reaches a terminal state.
+    chain_in_flight: Option<BlockId>,
+    /// Save-as input bar (Ctrl-S without a bound path).
+    save_input_mode: bool,
+    save_input: String,
+    /// Open input bar (Ctrl-O).
+    open_input_mode: bool,
+    open_input: String,
+    /// "Save before quitting?" exit prompt. Showing while non-None;
+    /// keys map to y / n / c (cancel).
+    exit_prompt: Option<ExitPrompt>,
+}
+
+/// Disposition of the save-on-quit prompt. `AwaitingPath` is the rare
+/// case where the user said "save" but no notebook path is bound, so we
+/// reuse the save input bar to ask for one before quitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitPrompt {
+    Confirm,
+    AwaitingPath,
 }
 
 impl Drop for App {
@@ -1299,6 +1421,7 @@ impl App {
             pending_rerun: None,
             last_cwd: None,
             env_edit: None,
+            note_edit: None,
             palette_state: None,
             palette_prev_focus: None,
             focus: Focus::Prompt,
@@ -1315,7 +1438,20 @@ impl App {
             quit: false,
             running: HashMap::new(),
             pending_handover: None,
+            notebook_path: None,
+            dirty: false,
+            pending_run_chain: VecDeque::new(),
+            chain_in_flight: None,
+            save_input_mode: false,
+            save_input: String::new(),
+            open_input_mode: false,
+            open_input: String::new(),
+            exit_prompt: None,
         }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     fn newest_block_id(&self) -> Option<BlockId> {
@@ -1355,15 +1491,25 @@ impl App {
     }
 }
 
-pub async fn run() -> io::Result<()> {
+pub async fn run(notebook: Option<PathBuf>) -> io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = app_loop(&mut terminal).await;
+    let result = app_loop(&mut terminal, notebook).await;
     ratatui::restore();
     result
 }
 
-async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
+async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> io::Result<()> {
     let mut app = App::new();
+    if let Some(path) = notebook {
+        // Best-effort: if the file doesn't exist yet, treat the path as a
+        // not-yet-saved location (so Ctrl-S writes there). Otherwise load
+        // the notebook into the session.
+        if path.exists() {
+            load_from_path(&mut app, &path);
+        } else {
+            app.notebook_path = Some(path);
+        }
+    }
     loop {
         if let Some(req) = app.pending_handover.take() {
             perform_handover(terminal, &mut app, req).await?;
@@ -1371,7 +1517,14 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
         if let Some(req) = app.pending_rerun.take() {
             perform_rerun(&mut app, req).await;
         }
+        if app.chain_in_flight.is_none() {
+            if let Some(next) = app.pending_run_chain.pop_front() {
+                app.chain_in_flight = Some(next);
+                perform_run_in_place(&mut app, next).await;
+            }
+        }
         reap_completed(&mut app).await;
+        advance_run_chain(&mut app);
         terminal.draw(|f| draw(f, &app))?;
         if app.quit {
             return Ok(());
@@ -1419,12 +1572,293 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
     }
 
     let id = app.session.add_block(req.argv.clone());
+    app.mark_dirty();
     if !req.pipeline.is_empty() {
         if let Some(block) = app.session.block_mut(id) {
             block.pipeline = req.pipeline;
         }
     }
     match exec::spawn_command(req.argv, CAPTURE_CAP).await {
+        Ok((handle, killer)) => {
+            app.running.insert(id, RunningCommand { handle, killer });
+        }
+        Err(e) => {
+            app.session.set_state(id, BlockState::Failed(e.to_string()));
+        }
+    }
+}
+
+/// True if `argv` is a single token starting with `@` — shed's syntax for
+/// "snapshot the output of pinned block @name". The bare prefix `@`
+/// (length 1) is rejected as nameless.
+fn is_pinned_ref(argv: &[String]) -> bool {
+    argv.len() == 1 && argv[0].len() > 1 && argv[0].starts_with('@')
+}
+
+/// `Done`/`Failed`/`Snapshotted` are terminal — the run-chain machinery
+/// uses this to decide when to advance. `Idle` and `Running` are not.
+fn is_terminal_state(state: &BlockState) -> bool {
+    matches!(
+        state,
+        BlockState::Done(_) | BlockState::Failed(_) | BlockState::Snapshotted
+    )
+}
+
+/// Walk `@-ref` deps to compute the run order for `target`. Sources that
+/// are `Idle` or `Running` get added before the target so the chain
+/// either runs them first or simply waits on them. `Done`/`Failed`
+/// sources are not re-run — the snapshot will use the existing capture
+/// or fail with a clear error. Cycles are guarded via `visited`.
+fn build_run_chain(session: &Session, target: BlockId, visited: &mut HashSet<BlockId>) -> Vec<BlockId> {
+    if !visited.insert(target) {
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    let block = match session.block(target) {
+        Some(b) => b,
+        None => return chain,
+    };
+    if is_pinned_ref(&block.argv) {
+        let name = &block.argv[0][1..];
+        if let Some(src_id) = session.lookup_by_name(name) {
+            if let Some(src) = session.block(src_id) {
+                if matches!(src.state, BlockState::Idle | BlockState::Running) {
+                    let mut sub = build_run_chain(session, src_id, visited);
+                    chain.append(&mut sub);
+                }
+            }
+        }
+    }
+    chain.push(target);
+    chain
+}
+
+fn queue_run_chain(app: &mut App, target: BlockId) {
+    let mut visited = HashSet::new();
+    let chain = build_run_chain(&app.session, target, &mut visited);
+    let n = chain.len();
+    if n > 1 {
+        let dep_count = n - 1;
+        let label = if dep_count == 1 { "1 dep" } else { "deps" };
+        app.flash = Some(format!("running {dep_count} {label} first, then %{}", target.0));
+    }
+    for id in chain {
+        if app.chain_in_flight != Some(id) && !app.pending_run_chain.contains(&id) {
+            app.pending_run_chain.push_back(id);
+        }
+    }
+}
+
+/// Called after `reap_completed` each tick: if the in-flight block is
+/// now terminal, clear the slot. If it failed, abort the rest of the
+/// chain since dependents would just see a stale or missing source.
+fn advance_run_chain(app: &mut App) {
+    let Some(id) = app.chain_in_flight else { return };
+    let state = app.session.block(id).map(|b| b.state.clone());
+    let terminal = match &state {
+        Some(s) => is_terminal_state(s),
+        None => true, // block was deleted mid-chain
+    };
+    if !terminal {
+        return;
+    }
+    let failed = matches!(state, Some(BlockState::Failed(_)));
+    if failed && !app.pending_run_chain.is_empty() {
+        let n = app.pending_run_chain.len();
+        app.pending_run_chain.clear();
+        let plural = if n == 1 { "block" } else { "blocks" };
+        app.flash = Some(format!("skipped {n} dependent {plural} — prereq failed"));
+    }
+    app.chain_in_flight = None;
+}
+
+/// Apply `name`'s pipeline to its current capture and serialize the
+/// result to bytes — JSON-pretty for structured values, raw passthrough
+/// for byte streams. Errors describe what went wrong so the caller can
+/// route them into a `Failed` block state.
+fn snapshot_pinned(session: &Session, name: &str) -> Result<Vec<u8>, String> {
+    let id = session
+        .lookup_by_name(name)
+        .ok_or_else(|| format!("no pinned block named @{name}"))?;
+    let block = session
+        .block(id)
+        .ok_or_else(|| format!("@{name} missing from session"))?;
+    let capture = block
+        .capture
+        .as_ref()
+        .ok_or_else(|| format!("@{name} has no captured output yet"))?;
+
+    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+        Ok((v, _)) => v,
+        Err(e) => return Err(format!("@{name} pipeline error: {e}")),
+    };
+
+    let bytes = match value {
+        PipelineValue::Bytes(b) => b.to_vec(),
+        other @ PipelineValue::Structured(_) => {
+            let json = pipeline_value_to_json(other);
+            let mut out = serde_json::to_vec_pretty(&json)
+                .unwrap_or_else(|e| e.to_string().into_bytes());
+            out.push(b'\n');
+            out
+        }
+    };
+    Ok(bytes)
+}
+
+/// Run `snapshot_pinned` and write the result onto `id` as a synthetic
+/// capture. Used both at create time (typing `@name`) and on re-run
+/// (Space on a snapshot block).
+fn populate_snapshot(app: &mut App, id: BlockId, name: &str) {
+    let started_at = Instant::now();
+    match snapshot_pinned(&app.session, name) {
+        Ok(bytes) => {
+            let capture = Capture {
+                stdout: Bytes::from(bytes),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at,
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: true,
+            };
+            app.session.set_capture(id, capture);
+            app.session.set_state(id, BlockState::Done(0));
+        }
+        Err(e) => {
+            if let Some(b) = app.session.block_mut(id) {
+                b.capture = None;
+            }
+            app.session.set_state(id, BlockState::Failed(e));
+        }
+    }
+}
+
+/// Append a new snapshot block referencing pinned `@name` and queue it
+/// (along with any deps) on the run chain. The actual snapshot runs from
+/// `perform_run_in_place` so the source's pipeline output is fresh.
+fn spawn_pinned_snapshot(app: &mut App, name: &str) {
+    let argv = vec![format!("@{name}")];
+    let id = app.session.add_block(argv);
+    app.session.set_state(id, BlockState::Idle);
+    app.mark_dirty();
+    queue_run_chain(app, id);
+}
+
+/// Remove the cursor block from the session. Kills any running child
+/// for that id, advances the cursor to the next surviving block (or the
+/// previous one if there is no next), or returns to the prompt if the
+/// session is now empty.
+fn delete_block_at_cursor(app: &mut App) {
+    let Some(id) = app.session.cursor() else {
+        app.flash = Some("no block selected".into());
+        return;
+    };
+    if let Some(mut cmd) = app.running.remove(&id) {
+        let _ = cmd.killer.kill();
+        cmd.handle.abort();
+    }
+    app.pending_run_chain.retain(|x| *x != id);
+    if app.chain_in_flight == Some(id) {
+        app.chain_in_flight = None;
+    }
+    let ids = app.block_ids_in_order();
+    let next_cursor = ids
+        .iter()
+        .position(|x| *x == id)
+        .and_then(|i| ids.get(i + 1).copied().or_else(|| {
+            if i == 0 { None } else { ids.get(i - 1).copied() }
+        }));
+    let removed = app.session.remove_block(id);
+    if removed.is_none() {
+        return;
+    }
+    app.mark_dirty();
+    app.session.set_cursor(next_cursor);
+    if next_cursor.is_some() {
+        app.reset_pipeline_cursor();
+    } else {
+        app.focus = Focus::Prompt;
+    }
+    app.flash = Some(format!("deleted %{}", id.0));
+}
+
+/// Queue a re-spawn of the cursor's block argv along with any unrun
+/// `@-ref` dependencies, so deps run first. Idempotent: if the block is
+/// already running or already queued, this flashes a message instead.
+fn run_cursor_block_in_place(app: &mut App) {
+    let Some(id) = app.session.cursor() else {
+        app.flash = Some("no block selected".into());
+        return;
+    };
+    if app.running.contains_key(&id) {
+        app.flash = Some(format!("%{} is still running", id.0));
+        return;
+    }
+    if app.chain_in_flight == Some(id) || app.pending_run_chain.contains(&id) {
+        app.flash = Some(format!("%{} already queued", id.0));
+        return;
+    }
+    queue_run_chain(app, id);
+}
+
+async fn perform_run_in_place(app: &mut App, id: BlockId) {
+    // The chain machinery may queue an already-running block (e.g. when a
+    // user requests a snapshot of @logs while @logs is running) — that's a
+    // wait, not a re-spawn. Bail without touching capture or state.
+    if app.running.contains_key(&id) {
+        return;
+    }
+    let Some(block) = app.session.block(id) else { return };
+    let argv = block.argv.clone();
+    if argv.is_empty() {
+        return;
+    }
+
+    if is_pinned_ref(&argv) {
+        let name = argv[0][1..].to_string();
+        app.mark_dirty();
+        populate_snapshot(app, id, &name);
+        return;
+    }
+
+    // Builtins: dispatch through their existing handlers so cd/export/unset
+    // can take effect on shed's own state. They allocate fresh blocks rather
+    // than reusing the cursor block, matching prompt-spawn semantics.
+    match argv[0].as_str() {
+        "cd" => {
+            run_cd_builtin(app, &argv);
+            return;
+        }
+        "exit" | "quit" => {
+            run_exit_builtin(app);
+            return;
+        }
+        "export" => {
+            run_export_builtin(app, &argv);
+            return;
+        }
+        "unset" => {
+            run_unset_builtin(app, &argv);
+            return;
+        }
+        _ => {}
+    }
+
+    if needs_fullscreen(&argv) {
+        app.pending_handover = Some(HandoverRequest {
+            argv,
+            reuse_block: Some(id),
+        });
+        return;
+    }
+
+    if let Some(b) = app.session.block_mut(id) {
+        b.capture = None;
+        b.state = BlockState::Running;
+    }
+    app.mark_dirty();
+    match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer)) => {
             app.running.insert(id, RunningCommand { handle, killer });
         }
@@ -1443,7 +1877,10 @@ async fn perform_handover(
 
     let id = match req.reuse_block {
         Some(existing) => existing,
-        None => app.session.add_block(req.argv.clone()),
+        None => {
+            app.mark_dirty();
+            app.session.add_block(req.argv.clone())
+        }
     };
     let status_result = tokio::process::Command::new(&req.argv[0])
         .args(&req.argv[1..])
@@ -1516,21 +1953,49 @@ async fn reap_completed(app: &mut App) {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) {
+    // Exit confirmation takes priority over everything: y / n / c (cancel).
+    if app.exit_prompt.is_some() {
+        handle_exit_prompt_key(app, key);
+        return;
+    }
+    // Notebook save/open input bars are overlaid on top of any focus.
+    if app.save_input_mode {
+        handle_save_input_key(app, key);
+        return;
+    }
+    if app.open_input_mode {
+        handle_open_input_key(app, key);
+        return;
+    }
+    // NoteEdit consumes its own keys so Ctrl-S commits the note rather
+    // than triggering the global save-notebook binding.
+    if app.focus == Focus::NoteEdit {
+        handle_note_edit_key(app, key);
+        return;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') => {
-                app.quit = true;
+                request_quit(app);
                 return;
             }
             KeyCode::Char('c') => {
                 if app.focus == Focus::BlockCursor && cancel_at_cursor(app) {
                     return;
                 }
-                app.quit = true;
+                request_quit(app);
                 return;
             }
             KeyCode::Char('k') => {
                 open_palette(app);
+                return;
+            }
+            KeyCode::Char('s') => {
+                begin_save(app);
+                return;
+            }
+            KeyCode::Char('o') => {
+                begin_open(app);
                 return;
             }
             _ => {}
@@ -1543,6 +2008,184 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::BlockExpand => handle_block_expand_key(app, key),
         Focus::EnvEdit => handle_env_edit_key(app, key),
         Focus::Palette => handle_palette_key(app, key),
+        Focus::NoteEdit => handle_note_edit_key(app, key),
+    }
+}
+
+/// Quit if clean; otherwise show the save-changes confirmation.
+fn request_quit(app: &mut App) {
+    if app.dirty {
+        app.exit_prompt = Some(ExitPrompt::Confirm);
+    } else {
+        app.quit = true;
+    }
+}
+
+/// Open the save input bar — or, if a notebook path is already bound,
+/// save immediately and flash the result.
+fn begin_save(app: &mut App) {
+    if let Some(path) = app.notebook_path.clone() {
+        save_to_path(app, &path);
+        return;
+    }
+    app.save_input.clear();
+    app.save_input_mode = true;
+}
+
+/// Always open the input bar; the user must type or paste a path.
+fn begin_open(app: &mut App) {
+    app.open_input = app
+        .notebook_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    app.open_input_mode = true;
+}
+
+fn save_to_path(app: &mut App, path: &std::path::Path) {
+    let nb = Notebook::from_session(&app.session);
+    match nb.save(path) {
+        Ok(()) => {
+            app.notebook_path = Some(path.to_path_buf());
+            app.dirty = false;
+            app.flash = Some(format!("saved → {}", path.display()));
+        }
+        Err(e) => {
+            app.flash = Some(format!("save failed: {e}"));
+        }
+    }
+}
+
+fn load_from_path(app: &mut App, path: &std::path::Path) {
+    match Notebook::load(path) {
+        Ok(nb) => {
+            // Replace the session entirely. Cancel any running children
+            // first so we don't leak handles when their blocks vanish.
+            for (_, mut cmd) in app.running.drain() {
+                let _ = cmd.killer.kill();
+                cmd.handle.abort();
+            }
+            app.pending_run_chain.clear();
+            app.chain_in_flight = None;
+            app.session = Session::new();
+            nb.apply_to_session(&mut app.session);
+            app.notebook_path = Some(path.to_path_buf());
+            app.dirty = false;
+            app.session.set_cursor(app.newest_block_id());
+            app.reset_pipeline_cursor();
+            // Refocus on the loaded blocks if any exist; otherwise stay
+            // on the prompt.
+            app.focus = if app.session.cursor().is_some() {
+                Focus::BlockCursor
+            } else {
+                Focus::Prompt
+            };
+            let n = app.session.blocks().count();
+            app.flash = Some(format!("loaded {n} block(s) from {}", path.display()));
+        }
+        Err(e) => {
+            app.flash = Some(format!("open failed: {e}"));
+        }
+    }
+}
+
+fn handle_save_input_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.save_input_mode = false;
+            app.save_input.clear();
+            // If the save was triggered by the exit prompt and the user
+            // bailed out, drop the exit prompt rather than continuing to
+            // hold them hostage.
+            if app.exit_prompt == Some(ExitPrompt::AwaitingPath) {
+                app.exit_prompt = None;
+            }
+        }
+        KeyCode::Enter => {
+            let path_str = std::mem::take(&mut app.save_input);
+            app.save_input_mode = false;
+            let trimmed = path_str.trim();
+            if trimmed.is_empty() {
+                app.flash = Some("path required".into());
+                return;
+            }
+            let path = PathBuf::from(expand_tilde(trimmed));
+            save_to_path(app, &path);
+            // If we were saving on exit, complete the quit now that the
+            // file is on disk (or fall through if save failed).
+            if app.exit_prompt == Some(ExitPrompt::AwaitingPath) && !app.dirty {
+                app.exit_prompt = None;
+                app.quit = true;
+            }
+        }
+        KeyCode::Char(c) => app.save_input.push(c),
+        KeyCode::Backspace => {
+            app.save_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_open_input_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.open_input_mode = false;
+            app.open_input.clear();
+        }
+        KeyCode::Enter => {
+            let path_str = std::mem::take(&mut app.open_input);
+            app.open_input_mode = false;
+            let trimmed = path_str.trim();
+            if trimmed.is_empty() {
+                app.flash = Some("path required".into());
+                return;
+            }
+            let path = PathBuf::from(expand_tilde(trimmed));
+            load_from_path(app, &path);
+        }
+        KeyCode::Char(c) => app.open_input.push(c),
+        KeyCode::Backspace => {
+            app.open_input.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_exit_prompt_key(app: &mut App, key: KeyEvent) {
+    let prompt = match app.exit_prompt {
+        Some(p) => p,
+        None => return,
+    };
+    if prompt == ExitPrompt::AwaitingPath {
+        // Shouldn't normally land here — handle_save_input_key takes over
+        // once save_input_mode is true. Treat any key as cancel.
+        app.exit_prompt = None;
+        return;
+    }
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Save then quit. If no path is bound, switch to "awaiting path"
+            // and reuse the save input bar.
+            if let Some(path) = app.notebook_path.clone() {
+                save_to_path(app, &path);
+                if !app.dirty {
+                    app.exit_prompt = None;
+                    app.quit = true;
+                }
+            } else {
+                app.exit_prompt = Some(ExitPrompt::AwaitingPath);
+                app.save_input.clear();
+                app.save_input_mode = true;
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.exit_prompt = None;
+            app.quit = true;
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => {
+            app.exit_prompt = None;
+        }
+        _ => {}
     }
 }
 
@@ -1790,6 +2433,10 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down => app.move_cursor(1),
         KeyCode::Left => move_filter_cursor(app, -1),
         KeyCode::Right => move_filter_cursor(app, 1),
+        KeyCode::Char(' ') => run_cursor_block_in_place(app),
+        KeyCode::Char('x') => delete_block_at_cursor(app),
+        KeyCode::Char('n') => open_note_edit(app, NotePosition::Pre),
+        KeyCode::Char('N') => open_note_edit(app, NotePosition::Post),
         KeyCode::Char('f') | KeyCode::Enter => open_filter_edit(app),
         KeyCode::Char('i') => open_filter_insert(app),
         KeyCode::Char('d') => drop_filter_at_cursor(app),
@@ -1822,6 +2469,9 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             if let Some(id) = app.session.cursor() {
                 let was_named = app.session.block(id).and_then(|b| b.name.clone());
                 app.session.unpin(id);
+                if was_named.is_some() {
+                    app.mark_dirty();
+                }
                 app.flash = Some(match was_named {
                     Some(name) => format!("unpinned %{} (was @{})", id.0, name),
                     None => format!("%{} was not pinned", id.0),
@@ -1881,6 +2531,7 @@ fn commit_pin(app: &mut App) {
 
     if name.is_empty() {
         app.session.unpin(id);
+        app.mark_dirty();
         app.flash = Some(format!("unpinned %{}", id.0));
         return;
     }
@@ -1890,6 +2541,7 @@ fn commit_pin(app: &mut App) {
         app.flash = Some(format!("pin failed: unknown block %{}", id.0));
         return;
     }
+    app.mark_dirty();
 
     app.flash = Some(match previous_owner {
         Some(prev) if prev != id => format!("pinned %{} as @{} (was on %{})", id.0, name, prev.0),
@@ -2718,6 +3370,7 @@ fn apply_filter_edit(app: &mut App) {
             }
         }
     }
+    app.mark_dirty();
     app.filter_edit = None;
     app.focus = Focus::BlockCursor;
     app.reset_pipeline_cursor();
@@ -2737,6 +3390,7 @@ fn move_filter_in_pipeline(app: &mut App, delta: i32) {
     let new_pos = new_pos_signed as usize;
     block.pipeline.swap(pos, new_pos);
     app.pipeline_cursor = new_pos;
+    app.mark_dirty();
 }
 
 fn drop_filter_at_cursor(app: &mut App) {
@@ -2757,6 +3411,8 @@ fn drop_filter_at_cursor(app: &mut App) {
     };
     if !dropped {
         app.flash = Some("no filters to drop".into());
+    } else {
+        app.mark_dirty();
     }
     let new_len = app
         .session
@@ -2807,6 +3463,12 @@ async fn spawn_prompt(app: &mut App) {
         return;
     }
 
+    if is_pinned_ref(&argv) {
+        let name = argv[0][1..].to_string();
+        spawn_pinned_snapshot(app, &name);
+        return;
+    }
+
     match argv[0].as_str() {
         "cd" => {
             run_cd_builtin(app, &argv);
@@ -2828,6 +3490,7 @@ async fn spawn_prompt(app: &mut App) {
     }
 
     let id = app.session.add_block(argv.clone());
+    app.mark_dirty();
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer)) => {
             app.running.insert(id, RunningCommand { handle, killer });
@@ -2847,6 +3510,7 @@ async fn spawn_prompt(app: &mut App) {
 /// $OLDPWD env, to avoid the unsafe-set_var dance).
 fn run_cd_builtin(app: &mut App, argv: &[String]) {
     let id = app.session.add_block(argv.to_vec());
+    app.mark_dirty();
     let prev_cwd = std::env::current_dir().ok();
 
     let target: Result<PathBuf, String> = match argv.get(1).map(String::as_str) {
@@ -2877,6 +3541,176 @@ fn run_cd_builtin(app: &mut App, argv: &[String]) {
 
 fn run_exit_builtin(app: &mut App) {
     app.quit = true;
+}
+
+/// Open the note editor for the cursor block at `position`. Pre-fills
+/// the buffer with any existing note text.
+fn open_note_edit(app: &mut App, position: NotePosition) {
+    let Some(id) = app.session.cursor() else {
+        app.flash = Some("no block selected".into());
+        return;
+    };
+    let initial = app.session.block(id).and_then(|b| match position {
+        NotePosition::Pre => b.pre_text.as_deref(),
+        NotePosition::Post => b.post_text.as_deref(),
+    });
+    app.note_edit = Some(NoteEditState::new(id, position, initial));
+    app.focus = Focus::NoteEdit;
+}
+
+/// Commit the note buffer onto the target block and exit NoteEdit. An
+/// empty buffer clears the note (sets the field to `None`).
+fn commit_note_edit(app: &mut App) {
+    let Some(state) = app.note_edit.take() else {
+        app.focus = Focus::BlockCursor;
+        return;
+    };
+    let text = state.buffer_string();
+    let new_value = if text.is_empty() { None } else { Some(text) };
+    if let Some(block) = app.session.block_mut(state.block_id) {
+        let changed = match state.position {
+            NotePosition::Pre => {
+                let prev = block.pre_text.clone();
+                block.pre_text = new_value.clone();
+                prev != new_value
+            }
+            NotePosition::Post => {
+                let prev = block.post_text.clone();
+                block.post_text = new_value.clone();
+                prev != new_value
+            }
+        };
+        if changed {
+            app.mark_dirty();
+        }
+    }
+    app.focus = Focus::BlockCursor;
+}
+
+fn cancel_note_edit(app: &mut App) {
+    app.note_edit = None;
+    app.focus = Focus::BlockCursor;
+}
+
+fn handle_note_edit_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('s') => {
+                commit_note_edit(app);
+                return;
+            }
+            KeyCode::Char('c') | KeyCode::Char('d') => {
+                cancel_note_edit(app);
+                return;
+            }
+            _ => return,
+        }
+    }
+    let Some(state) = app.note_edit.as_mut() else {
+        app.focus = Focus::BlockCursor;
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            cancel_note_edit(app);
+        }
+        KeyCode::Enter => {
+            state.buffer.insert(state.cursor, '\n');
+            state.cursor += 1;
+        }
+        KeyCode::Char(c) => {
+            state.buffer.insert(state.cursor, c);
+            state.cursor += 1;
+        }
+        KeyCode::Backspace => {
+            if state.cursor > 0 {
+                state.buffer.remove(state.cursor - 1);
+                state.cursor -= 1;
+            }
+        }
+        KeyCode::Delete => {
+            if state.cursor < state.buffer.len() {
+                state.buffer.remove(state.cursor);
+            }
+        }
+        KeyCode::Left => {
+            state.cursor = state.cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            state.cursor = (state.cursor + 1).min(state.buffer.len());
+        }
+        KeyCode::Home => {
+            // Move to start of current line.
+            while state.cursor > 0 && state.buffer[state.cursor - 1] != '\n' {
+                state.cursor -= 1;
+            }
+        }
+        KeyCode::End => {
+            // Move to end of current line.
+            while state.cursor < state.buffer.len() && state.buffer[state.cursor] != '\n' {
+                state.cursor += 1;
+            }
+        }
+        KeyCode::Up => {
+            move_note_cursor_vertically(state, -1);
+        }
+        KeyCode::Down => {
+            move_note_cursor_vertically(state, 1);
+        }
+        _ => {}
+    }
+}
+
+/// Move the cursor up (-1) or down (+1) one line, preserving column where
+/// possible. Column = chars from the start of the current line.
+fn move_note_cursor_vertically(state: &mut NoteEditState, delta: i32) {
+    let (line_start, col) = {
+        let mut start = 0usize;
+        let mut col = 0usize;
+        for (i, ch) in state.buffer[..state.cursor].iter().enumerate() {
+            if *ch == '\n' {
+                start = i + 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (start, col)
+    };
+    if delta < 0 {
+        if line_start == 0 {
+            state.cursor = 0;
+            return;
+        }
+        // line_start - 1 is the '\n' ending the previous line.
+        let prev_line_end = line_start - 1;
+        let mut prev_line_start = 0;
+        for (i, ch) in state.buffer[..prev_line_end].iter().enumerate() {
+            if *ch == '\n' {
+                prev_line_start = i + 1;
+            }
+        }
+        let prev_line_len = prev_line_end - prev_line_start;
+        state.cursor = prev_line_start + col.min(prev_line_len);
+    } else {
+        // Find end of current line.
+        let mut line_end = state.cursor;
+        while line_end < state.buffer.len() && state.buffer[line_end] != '\n' {
+            line_end += 1;
+        }
+        if line_end >= state.buffer.len() {
+            state.cursor = state.buffer.len();
+            return;
+        }
+        // Next line starts at line_end + 1.
+        let next_line_start = line_end + 1;
+        let mut next_line_end = next_line_start;
+        while next_line_end < state.buffer.len() && state.buffer[next_line_end] != '\n' {
+            next_line_end += 1;
+        }
+        let next_line_len = next_line_end - next_line_start;
+        state.cursor = next_line_start + col.min(next_line_len);
+    }
 }
 
 fn handle_env_edit_key(app: &mut App, key: KeyEvent) {
@@ -3008,6 +3842,7 @@ fn commit_env_input(app: &mut App) {
 /// export distinction since every var we hold is automatically inherited.
 fn run_export_builtin(app: &mut App, argv: &[String]) {
     let id = app.session.add_block(argv.to_vec());
+    app.mark_dirty();
     if argv.len() < 2 {
         app.session.set_state(
             id,
@@ -3045,6 +3880,7 @@ fn run_export_builtin(app: &mut App, argv: &[String]) {
 
 fn run_unset_builtin(app: &mut App, argv: &[String]) {
     let id = app.session.add_block(argv.to_vec());
+    app.mark_dirty();
     if argv.len() < 2 {
         app.session.set_state(
             id,
@@ -3081,8 +3917,88 @@ fn draw(f: &mut Frame, app: &App) {
         Focus::BlockExpand => draw_block_expand(f, app),
         Focus::EnvEdit => draw_env_edit(f, app),
         Focus::Palette => draw_palette(f, app),
+        Focus::NoteEdit => draw_note_edit(f, app),
         _ => draw_repl(f, app),
     }
+}
+
+fn draw_note_edit(f: &mut Frame, app: &App) {
+    let Some(state) = app.note_edit.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let title = match state.position {
+        NotePosition::Pre => format!("note before %{}", state.block_id.0),
+        NotePosition::Post => format!("note after %{}", state.block_id.0),
+    };
+    draw_header(f, chunks[0], &title);
+
+    // Render buffer with an inline cursor marker. Walk the chars and
+    // emit lines split on '\n'; the cursor sits between two characters
+    // (or at start / end) and shows as a colored "▏".
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let cursor_span = Span::styled(
+        "▏",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut current_line_text = String::new();
+    let mut cursor_emitted = false;
+
+    let push_line = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
+        let mut prefixed = vec![Span::styled(
+            "▎ ",
+            Style::default().fg(Color::DarkGray),
+        )];
+        prefixed.extend(spans);
+        lines.push(Line::from(prefixed));
+    };
+
+    for (i, &c) in state.buffer.iter().enumerate() {
+        if i == state.cursor && !cursor_emitted {
+            if !current_line_text.is_empty() {
+                current.push(Span::raw(current_line_text.clone()));
+                current_line_text.clear();
+            }
+            current.push(cursor_span.clone());
+            cursor_emitted = true;
+        }
+        if c == '\n' {
+            if !current_line_text.is_empty() {
+                current.push(Span::raw(current_line_text.clone()));
+                current_line_text.clear();
+            }
+            push_line(&mut lines, std::mem::take(&mut current));
+        } else {
+            current_line_text.push(c);
+        }
+    }
+    if !cursor_emitted && state.cursor == state.buffer.len() {
+        if !current_line_text.is_empty() {
+            current.push(Span::raw(current_line_text.clone()));
+            current_line_text.clear();
+        }
+        current.push(cursor_span.clone());
+    } else if !current_line_text.is_empty() {
+        current.push(Span::raw(current_line_text.clone()));
+    }
+    push_line(&mut lines, current);
+
+    let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(widget, chunks[1]);
+
+    draw_status(f, chunks[2], app);
 }
 
 fn draw_palette(f: &mut Frame, app: &App) {
@@ -3495,6 +4411,10 @@ fn render_block(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
+    if let Some(text) = block.pre_text.as_deref() {
+        lines.extend(render_note_lines(text));
+    }
+
     // Compute pipeline outcome up-front so we can show inline drop counts.
     let pipeline_outcome = block
         .capture
@@ -3507,6 +4427,7 @@ fn render_block(
         .unwrap_or_else(|| vec![0; block.pipeline.len()]);
 
     let glyph = match &block.state {
+        BlockState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
         BlockState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
         BlockState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
         BlockState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
@@ -3619,9 +4540,50 @@ fn render_block(
             Span::styled(msg.clone(), Style::default().fg(Color::Red)),
         ]));
     }
+    if matches!(block.state, BlockState::Idle) && selected {
+        lines.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                "▸ ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to run",
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+    }
+
+    if let Some(text) = block.post_text.as_deref() {
+        lines.extend(render_note_lines(text));
+    }
 
     lines.push(Line::from(""));
     lines
+}
+
+/// Render a note string as a series of dim, italicized lines with a
+/// `▎` left edge so they're visually distinct from command output.
+fn render_note_lines(text: &str) -> Vec<Line<'static>> {
+    let edge = Style::default().fg(Color::DarkGray);
+    let body = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::ITALIC);
+    text.split('\n')
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("  ▎ ", edge),
+                Span::styled(line.to_string(), body),
+            ])
+        })
+        .collect()
 }
 
 /// Apply a pipeline of filters. Returns the final value plus per-filter
@@ -3950,9 +4912,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Focus::FilterEdit | Focus::BlockExpand | Focus::EnvEdit | Focus::Palette => {
-            Line::from("")
-        }
+        Focus::FilterEdit
+        | Focus::BlockExpand
+        | Focus::EnvEdit
+        | Focus::Palette
+        | Focus::NoteEdit => Line::from(""),
     };
     let widget = Paragraph::new(line).block(border);
     f.render_widget(widget, area);
@@ -4482,6 +5446,70 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(prompt) = app.exit_prompt {
+        if prompt == ExitPrompt::Confirm {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "unsaved changes — save before quitting?",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[y]es",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[n]o",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[c]ancel",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, area);
+            return;
+        }
+        // AwaitingPath falls through; the save_input_mode bar takes over.
+    }
+    if app.save_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "save to: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.save_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Green)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
+    if app.open_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "open: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.open_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Green)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if app.rerun_input_mode {
         let widget = Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -4578,20 +5606,26 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("!cmd", "fullscreen"),
             ("Ctrl-E", "env"),
             ("Ctrl-K", "palette"),
+            ("Ctrl-S", "save"),
+            ("Ctrl-O", "open"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
         Focus::BlockCursor => vec![
             ("↑↓", "blocks"),
             ("←→", "filters"),
+            ("Space", "run"),
             ("<>", "reorder"),
             ("f", "add/edit"),
             ("i", "insert"),
             ("d", "drop"),
+            ("x", "delete"),
             ("e", "expand"),
             ("w", "write"),
             ("p/u", "pin/unpin"),
             ("r", "rerun"),
+            ("n/N", "pre/post note"),
+            ("Ctrl-S/O", "save/open"),
             ("Ctrl-C", "cancel"),
             ("Esc", "back"),
             ("Ctrl-D", "quit"),
@@ -4628,6 +5662,15 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Enter", "run"),
             ("Esc", "cancel"),
             ("Ctrl-D", "quit"),
+        ],
+        Focus::NoteEdit => vec![
+            ("type", "edit"),
+            ("Enter", "newline"),
+            ("←→ ↑↓", "move"),
+            ("Home/End", "line ends"),
+            ("Backspace", "delete"),
+            ("Ctrl-S", "save"),
+            ("Esc / Ctrl-C", "cancel"),
         ],
     };
     let mut spans = Vec::new();
@@ -4670,6 +5713,8 @@ mod tests {
             pipeline: Vec::new(),
             state: BlockState::Done(0),
             last_touched: Instant::now(),
+            pre_text: None,
+            post_text: None,
         }
     }
 
@@ -5492,5 +6537,299 @@ mod tests {
         assert!(matches!(block.pipeline[0], FilterSpec::FromLines));
         assert!(matches!(block.pipeline[1], FilterSpec::Where { .. }));
         assert!(matches!(block.pipeline[2], FilterSpec::Take { n: 5 }));
+    }
+
+    #[test]
+    fn save_and_load_round_trips_through_app() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("shed-tui-test-{}.json", std::process::id()));
+
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["echo".into(), "hi".into()]);
+        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.mark_dirty();
+        assert!(app.dirty);
+
+        save_to_path(&mut app, &path);
+        assert!(!app.dirty, "save clears dirty");
+        assert_eq!(app.notebook_path.as_deref(), Some(path.as_path()));
+
+        // Open into a fresh app: blocks come back as Idle with the pipeline intact.
+        let mut other = App::new();
+        other.history.clear();
+        load_from_path(&mut other, &path);
+        assert!(!other.dirty);
+        let blocks: Vec<_> = other.session.blocks().collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].argv, vec!["echo", "hi"]);
+        assert!(matches!(blocks[0].state, BlockState::Idle));
+        assert_eq!(blocks[0].pipeline.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_cursor_block_in_place_queues_pending_request() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["true".into()]);
+        app.session.set_state(id, BlockState::Idle);
+        app.session.set_cursor(Some(id));
+
+        run_cursor_block_in_place(&mut app);
+        assert_eq!(app.pending_run_chain.front().copied(), Some(id));
+    }
+
+    #[test]
+    fn build_run_chain_walks_at_ref_dep_first() {
+        let mut s = Session::new();
+        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(src, BlockState::Idle);
+        s.pin(src, "src".into());
+
+        let dep = s.add_block(vec!["@src".into()]);
+        s.set_state(dep, BlockState::Idle);
+
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, dep, &mut visited);
+        assert_eq!(chain, vec![src, dep]);
+    }
+
+    #[test]
+    fn build_run_chain_skips_done_source() {
+        let mut s = Session::new();
+        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(src, BlockState::Done(0));
+        s.pin(src, "src".into());
+
+        let dep = s.add_block(vec!["@src".into()]);
+        s.set_state(dep, BlockState::Idle);
+
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, dep, &mut visited);
+        // Done sources are not re-run; only the dep itself goes in.
+        assert_eq!(chain, vec![dep]);
+    }
+
+    #[test]
+    fn build_run_chain_chains_two_levels_of_at_refs() {
+        let mut s = Session::new();
+        let root = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(root, BlockState::Idle);
+        s.pin(root, "root".into());
+
+        let mid = s.add_block(vec!["@root".into()]);
+        s.set_state(mid, BlockState::Idle);
+        s.pin(mid, "mid".into());
+
+        let leaf = s.add_block(vec!["@mid".into()]);
+        s.set_state(leaf, BlockState::Idle);
+
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, leaf, &mut visited);
+        assert_eq!(chain, vec![root, mid, leaf]);
+    }
+
+    #[test]
+    fn build_run_chain_handles_self_cycle() {
+        let mut s = Session::new();
+        let id = s.add_block(vec!["@loop".into()]);
+        s.set_state(id, BlockState::Idle);
+        s.pin(id, "loop".into());
+
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, id, &mut visited);
+        assert_eq!(chain, vec![id]);
+    }
+
+    #[test]
+    fn advance_run_chain_aborts_dependents_when_prereq_fails() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["false".into()]);
+        let b = app.session.add_block(vec!["true".into()]);
+        app.session.set_state(a, BlockState::Failed("boom".into()));
+        app.chain_in_flight = Some(a);
+        app.pending_run_chain.push_back(b);
+
+        advance_run_chain(&mut app);
+        assert!(app.pending_run_chain.is_empty(), "dependents dropped");
+        assert!(app.chain_in_flight.is_none());
+        assert!(app.flash.as_deref().unwrap_or("").contains("skipped"));
+    }
+
+    #[test]
+    fn is_pinned_ref_only_for_single_at_token() {
+        assert!(is_pinned_ref(&["@logs".into()]));
+        assert!(!is_pinned_ref(&["@logs".into(), "extra".into()]));
+        assert!(!is_pinned_ref(&["@".into()]));
+        assert!(!is_pinned_ref(&["logs".into()]));
+        assert!(!is_pinned_ref(&[]));
+    }
+
+    #[test]
+    fn snapshot_pinned_renders_structured_as_json() {
+        let mut s = Session::new();
+        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_capture(src, Capture {
+            stdout: Bytes::from_static(b"1\n2\n3\n"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+        });
+        s.block_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
+        s.pin(src, "nums".into());
+
+        let bytes = snapshot_pinned(&s, "nums").expect("snapshot");
+        let text = String::from_utf8(bytes).unwrap();
+        // from-lines yields a list of records {line: ...}. Pretty JSON.
+        assert!(text.contains("\"line\""));
+        assert!(text.contains("\"1\""));
+        assert!(text.contains("\"2\""));
+        assert!(text.contains("\"3\""));
+    }
+
+    #[test]
+    fn snapshot_pinned_passes_raw_bytes_through_when_unparsed() {
+        let mut s = Session::new();
+        let src = s.add_block(vec!["echo".into(), "hi".into()]);
+        s.set_capture(src, Capture {
+            stdout: Bytes::from_static(b"hello\n"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+        });
+        s.pin(src, "h".into());
+
+        let bytes = snapshot_pinned(&s, "h").expect("snapshot");
+        assert_eq!(bytes, b"hello\n");
+    }
+
+    #[test]
+    fn snapshot_pinned_errors_on_unknown_name() {
+        let s = Session::new();
+        let err = snapshot_pinned(&s, "nope").unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn delete_block_at_cursor_removes_and_advances() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        let b = app.session.add_block(vec!["b".into()]);
+        let c = app.session.add_block(vec!["c".into()]);
+        app.session.set_cursor(Some(b));
+        delete_block_at_cursor(&mut app);
+        assert!(app.session.block(b).is_none());
+        // Cursor advances to next sibling (c).
+        assert_eq!(app.session.cursor(), Some(c));
+        assert!(app.dirty);
+        // Sanity: a still exists.
+        assert!(app.session.block(a).is_some());
+    }
+
+    #[test]
+    fn delete_last_block_returns_to_prompt_focus() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        app.session.set_cursor(Some(a));
+        app.focus = Focus::BlockCursor;
+        delete_block_at_cursor(&mut app);
+        assert!(app.session.cursor().is_none());
+        assert_eq!(app.focus, Focus::Prompt);
+    }
+
+    #[test]
+    fn note_edit_inserts_chars_and_newlines_at_cursor() {
+        let mut state = NoteEditState::new(BlockId(1), NotePosition::Pre, None);
+        // Synthesize key events through handle_note_edit_key by running it
+        // via a minimal app shim. Easier to test the helpers directly.
+        for c in "abc".chars() {
+            state.buffer.insert(state.cursor, c);
+            state.cursor += 1;
+        }
+        state.buffer.insert(state.cursor, '\n');
+        state.cursor += 1;
+        state.buffer.insert(state.cursor, 'd');
+        state.cursor += 1;
+        assert_eq!(state.buffer_string(), "abc\nd");
+        assert_eq!(state.cursor, 5);
+    }
+
+    #[test]
+    fn note_edit_vertical_move_preserves_column() {
+        let mut state = NoteEditState::new(BlockId(1), NotePosition::Pre, Some("abcdef\nghij\nkl"));
+        // Cursor on second line at column 4 (right after "ghij").
+        state.cursor = 11;
+        // Up: should go to column 4 of "abcdef" → index 4.
+        move_note_cursor_vertically(&mut state, -1);
+        assert_eq!(state.cursor, 4);
+        // Down twice: back to col 4 of "ghij" then col 2 of "kl" (length 2,
+        // clamped to len).
+        move_note_cursor_vertically(&mut state, 1);
+        assert_eq!(state.cursor, 11);
+        move_note_cursor_vertically(&mut state, 1);
+        assert_eq!(state.cursor, 14); // len("abcdef\nghij\nkl") = 14
+    }
+
+    #[test]
+    fn commit_note_edit_writes_to_block_and_marks_dirty() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        open_note_edit(&mut app, NotePosition::Pre);
+        let st = app.note_edit.as_mut().expect("opened");
+        for c in "hello".chars() {
+            st.buffer.insert(st.cursor, c);
+            st.cursor += 1;
+        }
+        // Reset dirty so we can confirm commit flips it.
+        app.dirty = false;
+        commit_note_edit(&mut app);
+        let block = app.session.block(id).unwrap();
+        assert_eq!(block.pre_text.as_deref(), Some("hello"));
+        assert!(app.dirty);
+        assert_eq!(app.focus, Focus::BlockCursor);
+        assert!(app.note_edit.is_none());
+    }
+
+    #[test]
+    fn empty_note_buffer_clears_existing_text() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["echo".into()]);
+        if let Some(b) = app.session.block_mut(id) {
+            b.pre_text = Some("old text".into());
+        }
+        app.session.set_cursor(Some(id));
+        open_note_edit(&mut app, NotePosition::Pre);
+        // Clear the buffer.
+        if let Some(st) = app.note_edit.as_mut() {
+            st.buffer.clear();
+            st.cursor = 0;
+        }
+        commit_note_edit(&mut app);
+        assert!(app.session.block(id).unwrap().pre_text.is_none());
+    }
+
+    #[test]
+    fn run_cursor_block_in_place_queues_when_no_running_entry() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["sleep".into(), "5".into()]);
+        app.session.set_cursor(Some(id));
+        // No RunningCommand entry → queues normally.
+        run_cursor_block_in_place(&mut app);
+        assert_eq!(app.pending_run_chain.front().copied(), Some(id));
     }
 }
