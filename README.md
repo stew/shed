@@ -228,8 +228,13 @@ output fills the screen.
 | PgUp / PgDn / Space / `b` / `f` | scroll one page (~20 lines) |
 | Home / `g`          | jump to top |
 | End / `G`           | jump to bottom |
-| Esc / `q`           | back to BlockCursor |
+| `/`                 | start search (less-style); type the query, Enter to commit |
+| `n` / `N`           | jump to next / previous match (wraps) |
+| Esc                 | clear active search; or, if no search, back to BlockCursor |
+| `q`                 | back to BlockCursor (always) |
 | Ctrl-D              | quit |
+
+The header shows `/<query>  (N matches)` while a search is active, and matching lines render with reversed-video highlighting. Search is plain substring (case-sensitive), not regex.
 
 ## Architecture
 

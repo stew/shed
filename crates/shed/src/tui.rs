@@ -900,6 +900,9 @@ struct App {
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
     expand_scroll: usize,
+    search_query: String,
+    search_input: String,
+    search_input_mode: bool,
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
@@ -928,6 +931,9 @@ impl App {
             filter_edit: None,
             pipeline_cursor: 0,
             expand_scroll: 0,
+            search_query: String::new(),
+            search_input: String::new(),
+            search_input_mode: false,
             flash: None,
             quit: false,
             running: HashMap::new(),
@@ -1141,12 +1147,43 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
+    if app.search_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.search_input_mode = false;
+                app.search_input.clear();
+            }
+            KeyCode::Enter => commit_search(app),
+            KeyCode::Char(c) => app.search_input.push(c),
+            KeyCode::Backspace => {
+                app.search_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
+
     const PAGE: usize = 20;
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
+            if !app.search_query.is_empty() {
+                app.search_query.clear();
+            } else {
+                app.expand_scroll = 0;
+                app.focus = Focus::BlockCursor;
+            }
+        }
+        KeyCode::Char('q') => {
+            app.search_query.clear();
             app.expand_scroll = 0;
             app.focus = Focus::BlockCursor;
         }
+        KeyCode::Char('/') => {
+            app.search_input_mode = true;
+            app.search_input.clear();
+        }
+        KeyCode::Char('n') => jump_to_search(app, true),
+        KeyCode::Char('N') => jump_to_search(app, false),
         KeyCode::Up | KeyCode::Char('k') => {
             app.expand_scroll = app.expand_scroll.saturating_sub(1);
         }
@@ -1167,6 +1204,90 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+fn commit_search(app: &mut App) {
+    let q = std::mem::take(&mut app.search_input);
+    app.search_input_mode = false;
+    if q.is_empty() {
+        app.search_query.clear();
+        return;
+    }
+    app.search_query = q;
+    let Some(id) = app.session.cursor() else { return };
+    let Some(block) = app.session.block(id) else { return };
+    let lines = compute_block_lines(block);
+    let matches = find_matches(&lines, &app.search_query);
+    if let Some(&first) = matches.iter().find(|&&m| m >= app.expand_scroll) {
+        app.expand_scroll = first;
+    } else if let Some(&first) = matches.first() {
+        app.expand_scroll = first;
+    }
+}
+
+fn jump_to_search(app: &mut App, forward: bool) {
+    if app.search_query.is_empty() {
+        return;
+    }
+    let Some(id) = app.session.cursor() else { return };
+    let Some(block) = app.session.block(id) else { return };
+    let lines = compute_block_lines(block);
+    let matches = find_matches(&lines, &app.search_query);
+    if matches.is_empty() {
+        app.flash = Some(format!("no matches for '{}'", app.search_query));
+        return;
+    }
+    let cur = app.expand_scroll;
+    let next = if forward {
+        matches
+            .iter()
+            .find(|&&m| m > cur)
+            .copied()
+            .unwrap_or_else(|| matches[0])
+    } else {
+        matches
+            .iter()
+            .rev()
+            .find(|&&m| m < cur)
+            .copied()
+            .unwrap_or_else(|| *matches.last().unwrap())
+    };
+    app.expand_scroll = next;
+}
+
+fn compute_block_lines(block: &Block) -> Vec<Line<'static>> {
+    match block.capture.as_ref() {
+        Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
+            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX),
+            Err(e) => filter_error_lines(&e),
+        },
+        None => Vec::new(),
+    }
+}
+
+fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| line_text(l).contains(query))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn line_text(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+fn highlight_line(line: Line<'static>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|s| {
+            let content = s.content.into_owned();
+            Span::styled(content, s.style.add_modifier(Modifier::REVERSED))
+        })
+        .collect();
+    Line::from(spans)
 }
 
 fn move_filter_cursor(app: &mut App, delta: i32) {
@@ -1575,7 +1696,7 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
     let scroll = app.expand_scroll.min(max_scroll);
     let visible_end = (scroll + visible).min(total);
 
-    let title = if total == 0 {
+    let mut title = if total == 0 {
         format!("inspect  %{}  {}", block.id.0, block.argv.join(" "))
     } else {
         format!(
@@ -1587,12 +1708,29 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
             total,
         )
     };
+    if !app.search_query.is_empty() {
+        let matches = find_matches(&all_lines, &app.search_query);
+        title.push_str(&format!(
+            "    /{}  ({} match{})",
+            app.search_query,
+            matches.len(),
+            if matches.len() == 1 { "" } else { "es" },
+        ));
+    }
     draw_header(f, chunks[0], &title);
 
+    let query = app.search_query.clone();
     let visible_lines: Vec<Line<'static>> = all_lines
         .into_iter()
         .skip(scroll)
         .take(visible)
+        .map(|line| {
+            if !query.is_empty() && line_text(&line).contains(&query) {
+                highlight_line(line)
+            } else {
+                line
+            }
+        })
         .collect();
     let para = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
     f.render_widget(para, body_area);
@@ -2563,6 +2701,22 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.search_input_mode {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.search_input.clone()),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     if let Some(msg) = &app.flash {
         let widget = Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -2599,6 +2753,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("↑↓ / jk", "scroll"),
             ("PgUp/Dn", "page"),
             ("g/G", "top/bot"),
+            ("/", "search"),
+            ("n/N", "next/prev"),
             ("Esc / q", "back"),
             ("Ctrl-D", "quit"),
         ],
@@ -2698,6 +2854,27 @@ mod tests {
         let mut state = FilterEditState::for_add(&block);
         state.kind = FilterKind::Where;
         assert!(state.build_filter().is_none());
+    }
+
+    #[test]
+    fn find_matches_returns_indices_of_lines_containing_query() {
+        let lines: Vec<Line<'static>> = vec![
+            Line::from("apple"),
+            Line::from("banana"),
+            Line::from("apple pie"),
+            Line::from("cherry"),
+        ];
+        assert_eq!(find_matches(&lines, "apple"), vec![0, 2]);
+        assert_eq!(find_matches(&lines, "z"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn line_text_concatenates_spans() {
+        let line = Line::from(vec![
+            Span::raw("hello "),
+            Span::styled("world", Style::default().fg(Color::Red)),
+        ]);
+        assert_eq!(line_text(&line), "hello world");
     }
 
     #[test]
