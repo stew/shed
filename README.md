@@ -194,6 +194,7 @@ so you don't lose data without noticing.
 | Key       | Action |
 |-----------|--------|
 | Enter     | run command |
+| `↑` / `↓` | recall previous / next command from history (in-memory only) |
 | `!cmd`    | force fullscreen handover (typed prefix) |
 | Esc       | focus newest block |
 | Ctrl-D    | quit |
@@ -316,7 +317,7 @@ Known gaps and likely next steps, in rough priority order:
 - Insert filter at a specific index (currently you can append or
   replace, not insert in the middle)
 - Reorder existing pipeline filters (Alt-↑/↓)
-- Prompt history (Up arrow recall of previous commands)
+- Persistent prompt history (currently in-memory only; lost on quit)
 - Command palette (universal `Space` / `Ctrl-K` action menu)
 - Saved/named pipelines as reusable computations
 - Scrollback within long block previews (sub-block scroll without

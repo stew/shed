@@ -905,6 +905,8 @@ fn compute_schema_at(block: &Block, before_index: usize) -> Vec<String> {
 struct App {
     session: Session,
     prompt: String,
+    history: Vec<String>,
+    history_cursor: Option<usize>,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
@@ -939,6 +941,8 @@ impl App {
         Self {
             session: Session::new(),
             prompt: String::new(),
+            history: Vec::new(),
+            history_cursor: None,
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
@@ -1154,13 +1158,43 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                 app.flash = Some("no blocks yet".into());
             }
         }
-        KeyCode::Char(c) => app.prompt.push(c),
+        KeyCode::Up => history_step(app, -1),
+        KeyCode::Down => history_step(app, 1),
+        KeyCode::Char(c) => {
+            app.prompt.push(c);
+            app.history_cursor = None;
+        }
         KeyCode::Backspace => {
             app.prompt.pop();
+            app.history_cursor = None;
         }
         KeyCode::Enter => spawn_prompt(app).await,
         _ => {}
     }
+}
+
+fn history_step(app: &mut App, delta: i32) {
+    if app.history.is_empty() {
+        return;
+    }
+    let new_idx: Option<usize> = match (app.history_cursor, delta) {
+        (None, -1) => Some(app.history.len() - 1),
+        (None, _) => None,
+        (Some(i), -1) => Some(i.saturating_sub(1)),
+        (Some(i), 1) => {
+            if i + 1 >= app.history.len() {
+                None
+            } else {
+                Some(i + 1)
+            }
+        }
+        _ => app.history_cursor,
+    };
+    app.history_cursor = new_idx;
+    app.prompt = match new_idx {
+        Some(i) => app.history[i].clone(),
+        None => String::new(),
+    };
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
@@ -1779,6 +1813,14 @@ async fn spawn_prompt(app: &mut App) {
     if argv.is_empty() {
         return;
     }
+
+    // Save the original input to history before clearing the prompt.
+    // Suppress consecutive duplicates so spamming Up doesn't grow history.
+    let original = app.prompt.clone();
+    if !app.history.last().map_or(false, |last| last == &original) {
+        app.history.push(original);
+    }
+    app.history_cursor = None;
     app.prompt.clear();
 
     if force_fullscreen || needs_fullscreen(&argv) {
@@ -2898,6 +2940,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let hints: Vec<(&str, &str)> = match app.focus {
         Focus::Prompt => vec![
             ("Enter", "run"),
+            ("↑↓", "history"),
             ("!cmd", "fullscreen"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
@@ -3125,6 +3168,48 @@ mod tests {
             Span::styled("world", Style::default().fg(Color::Red)),
         ]);
         assert_eq!(line_text(&line), "hello world");
+    }
+
+    fn make_history_app() -> App {
+        let mut app = App::new();
+        app.history = vec!["one".into(), "two".into(), "three".into()];
+        app
+    }
+
+    #[test]
+    fn history_up_walks_back_from_newest() {
+        let mut app = make_history_app();
+        history_step(&mut app, -1);
+        assert_eq!(app.prompt, "three");
+        history_step(&mut app, -1);
+        assert_eq!(app.prompt, "two");
+        history_step(&mut app, -1);
+        assert_eq!(app.prompt, "one");
+        // Clamps at the oldest.
+        history_step(&mut app, -1);
+        assert_eq!(app.prompt, "one");
+    }
+
+    #[test]
+    fn history_down_returns_to_empty_buffer() {
+        let mut app = make_history_app();
+        history_step(&mut app, -1); // "three"
+        history_step(&mut app, -1); // "two"
+        history_step(&mut app, 1); // back to "three"
+        assert_eq!(app.prompt, "three");
+        history_step(&mut app, 1); // past "three" → empty
+        assert_eq!(app.prompt, "");
+        assert!(app.history_cursor.is_none());
+    }
+
+    #[test]
+    fn history_step_with_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.prompt = "typed".into();
+        history_step(&mut app, -1);
+        assert_eq!(app.prompt, "typed");
+        history_step(&mut app, 1);
+        assert_eq!(app.prompt, "typed");
     }
 
     #[test]
