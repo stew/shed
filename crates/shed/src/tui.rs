@@ -2082,9 +2082,24 @@ async fn spawn_prompt(app: &mut App) {
         return;
     }
 
-    if argv[0] == "cd" {
-        run_cd_builtin(app, &argv);
-        return;
+    match argv[0].as_str() {
+        "cd" => {
+            run_cd_builtin(app, &argv);
+            return;
+        }
+        "exit" | "quit" => {
+            run_exit_builtin(app);
+            return;
+        }
+        "export" => {
+            run_export_builtin(app, &argv);
+            return;
+        }
+        "unset" => {
+            run_unset_builtin(app, &argv);
+            return;
+        }
+        _ => {}
     }
 
     let id = app.session.add_block(argv.clone());
@@ -2133,6 +2148,70 @@ fn run_cd_builtin(app: &mut App, argv: &[String]) {
                 .set_state(id, BlockState::Failed(format!("cd: {e}")));
         }
     }
+}
+
+fn run_exit_builtin(app: &mut App) {
+    app.quit = true;
+}
+
+/// `export KEY=VALUE [KEY=VALUE ...]` sets one or more environment vars in
+/// shed's process; subsequent spawned commands inherit them. Bare `export
+/// KEY` (without `=`) is rejected — shed doesn't have POSIX's marked-for-
+/// export distinction since every var we hold is automatically inherited.
+fn run_export_builtin(app: &mut App, argv: &[String]) {
+    let id = app.session.add_block(argv.to_vec());
+    if argv.len() < 2 {
+        app.session.set_state(
+            id,
+            BlockState::Failed("export: usage: export KEY=VALUE [...]".into()),
+        );
+        return;
+    }
+    let mut errors: Vec<String> = Vec::new();
+    let mut set: Vec<String> = Vec::new();
+    for arg in &argv[1..] {
+        match arg.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                // SAFETY: env mutation has thread-safety concerns documented in
+                // std::env::set_var. shed sets vars only from the main event
+                // loop; tokio reader tasks capture cwd/env at spawn time and
+                // don't read from std::env afterward.
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                set.push(key.to_string());
+            }
+            _ => errors.push(format!("invalid arg: {arg}")),
+        }
+    }
+    if errors.is_empty() {
+        app.session.set_state(id, BlockState::Done(0));
+        if !set.is_empty() {
+            app.flash = Some(format!("export {}", set.join(", ")));
+        }
+    } else {
+        app.session
+            .set_state(id, BlockState::Failed(format!("export: {}", errors.join("; "))));
+    }
+}
+
+fn run_unset_builtin(app: &mut App, argv: &[String]) {
+    let id = app.session.add_block(argv.to_vec());
+    if argv.len() < 2 {
+        app.session.set_state(
+            id,
+            BlockState::Failed("unset: usage: unset NAME [NAME ...]".into()),
+        );
+        return;
+    }
+    for name in &argv[1..] {
+        // SAFETY: see export above.
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+    app.session.set_state(id, BlockState::Done(0));
+    app.flash = Some(format!("unset {}", argv[1..].join(", ")));
 }
 
 fn expand_tilde(s: &str) -> PathBuf {

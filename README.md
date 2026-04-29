@@ -145,6 +145,11 @@ itself:
   commands inherit the new cwd. Without an argument, `cd` goes to
   `$HOME`. `cd -` swaps with the previous cwd. `~` and `~/path` are
   expanded. The cwd shows in the header bar (`shed  ·  ~/devel/shed`).
+- **`exit`** / **`quit`** — quit shed (same as Ctrl-D).
+- **`export KEY=VALUE [KEY=VALUE ...]`** — set environment variables in
+  shed's process; subsequent spawned commands inherit them. `export`
+  with no args, or a bare key without `=`, is rejected.
+- **`unset NAME [NAME ...]`** — remove environment variables.
 
 Most other "shell-isms" (`|`, `>`, `&&`, `$(…)`) are deliberately not
 supported — see the design constraints below. Use `bash -c '…'` if you
