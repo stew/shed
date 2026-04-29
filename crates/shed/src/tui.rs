@@ -913,6 +913,8 @@ struct App {
     search_input: String,
     search_input_mode: bool,
     search_anchor_scroll: usize,
+    search_input_backward: bool,
+    search_case_insensitive: bool,
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
@@ -945,6 +947,8 @@ impl App {
             search_input: String::new(),
             search_input_mode: false,
             search_anchor_scroll: 0,
+            search_input_backward: false,
+            search_case_insensitive: false,
             flash: None,
             quit: false,
             running: HashMap::new(),
@@ -1224,9 +1228,20 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('/') => {
             app.search_input_mode = true;
+            app.search_input_backward = false;
             app.search_input.clear();
             app.search_query.clear();
             app.search_anchor_scroll = app.expand_scroll;
+        }
+        KeyCode::Char('?') => {
+            app.search_input_mode = true;
+            app.search_input_backward = true;
+            app.search_input.clear();
+            app.search_query.clear();
+            app.search_anchor_scroll = app.expand_scroll;
+        }
+        KeyCode::Char('i') => {
+            app.search_case_insensitive = !app.search_case_insensitive;
         }
         KeyCode::Char('n') => jump_to_search(app, true),
         KeyCode::Char('N') => jump_to_search(app, false),
@@ -1254,35 +1269,50 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
 
 /// Live-update the active search as the user types. Keeps `search_query`
 /// in sync with `search_input`, then (if the query compiles as a regex)
-/// jumps the scroll to the first match at or after the anchor position
-/// recorded when `/` was pressed. Invalid-regex states are left
-/// untouched: scroll doesn't move, no error is raised — the input bar
-/// just shows "(invalid regex)" until the user finishes typing.
+/// jumps the scroll: forward search jumps to the first match at-or-after
+/// the anchor; backward search jumps to the last match at-or-before.
+/// Invalid-regex states are left untouched: scroll doesn't move, no
+/// error — the input bar just shows "(invalid regex)" until the user
+/// finishes typing.
 fn update_search(app: &mut App) {
     app.search_query = app.search_input.clone();
     if app.search_query.is_empty() {
         app.expand_scroll = app.search_anchor_scroll;
         return;
     }
-    let Some(regex) = try_compile(&app.search_query) else {
+    let Some(regex) = try_compile(&app.search_query, app.search_case_insensitive) else {
         return;
     };
     let Some(id) = app.session.cursor() else { return };
     let Some(block) = app.session.block(id) else { return };
     let lines = compute_block_lines(block);
     let matches = find_matches_regex(&lines, &regex);
-    if let Some(&first) = matches.iter().find(|&&m| m >= app.search_anchor_scroll) {
-        app.expand_scroll = first;
-    } else if let Some(&first) = matches.first() {
-        app.expand_scroll = first;
+    if matches.is_empty() {
+        return;
     }
+    let anchor = app.search_anchor_scroll;
+    let target = if app.search_input_backward {
+        matches
+            .iter()
+            .rev()
+            .find(|&&m| m <= anchor)
+            .copied()
+            .unwrap_or_else(|| *matches.last().unwrap())
+    } else {
+        matches
+            .iter()
+            .find(|&&m| m >= anchor)
+            .copied()
+            .unwrap_or_else(|| matches[0])
+    };
+    app.expand_scroll = target;
 }
 
 fn jump_to_search(app: &mut App, forward: bool) {
     if app.search_query.is_empty() {
         return;
     }
-    let Some(regex) = try_compile(&app.search_query) else {
+    let Some(regex) = try_compile(&app.search_query, app.search_case_insensitive) else {
         app.flash = Some(format!("invalid regex: {}", app.search_query));
         return;
     };
@@ -1322,11 +1352,16 @@ fn compute_block_lines(block: &Block) -> Vec<Line<'static>> {
     }
 }
 
-fn try_compile(query: &str) -> Option<regex::Regex> {
+fn try_compile(query: &str, case_insensitive: bool) -> Option<regex::Regex> {
     if query.is_empty() {
         return None;
     }
-    regex::Regex::new(query).ok()
+    let pattern = if case_insensitive {
+        format!("(?i){query}")
+    } else {
+        query.to_string()
+    };
+    regex::Regex::new(&pattern).ok()
 }
 
 fn find_matches_regex(lines: &[Line<'static>], regex: &regex::Regex) -> Vec<usize> {
@@ -1342,16 +1377,63 @@ fn line_text(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-fn highlight_line(line: Line<'static>) -> Line<'static> {
-    let spans: Vec<Span<'static>> = line
-        .spans
-        .into_iter()
-        .map(|s| {
-            let content = s.content.into_owned();
-            Span::styled(content, s.style.add_modifier(Modifier::REVERSED))
-        })
+/// Walk a line's spans, splitting at regex match boundaries so that
+/// only the matched substrings get the REVERSED modifier. Non-match
+/// portions keep their original style (so ANSI colors from PTY output
+/// stay intact). Match positions are byte offsets into the line's
+/// concatenated plain text; regex guarantees they fall on UTF-8 char
+/// boundaries.
+fn highlight_matches_in_line(line: Line<'static>, regex: &regex::Regex) -> Line<'static> {
+    let plain = line_text(&line);
+    let matches: Vec<(usize, usize)> = regex
+        .find_iter(&plain)
+        .map(|m| (m.start(), m.end()))
         .collect();
-    Line::from(spans)
+    if matches.is_empty() {
+        return line;
+    }
+
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    let mut byte_offset = 0usize;
+
+    for span in line.spans {
+        let span_start = byte_offset;
+        let span_text: String = span.content.into_owned();
+        let span_len = span_text.len();
+        let span_end = span_start + span_len;
+        let span_style = span.style;
+
+        let mut local_pos = 0usize;
+        for &(m_start, m_end) in &matches {
+            if m_end <= span_start || m_start >= span_end {
+                continue;
+            }
+            let m_local_start = m_start.saturating_sub(span_start).max(local_pos);
+            let m_local_end = (m_end - span_start).min(span_len);
+            if m_local_start > local_pos {
+                new_spans.push(Span::styled(
+                    span_text[local_pos..m_local_start].to_string(),
+                    span_style,
+                ));
+            }
+            if m_local_end > m_local_start {
+                new_spans.push(Span::styled(
+                    span_text[m_local_start..m_local_end].to_string(),
+                    span_style.add_modifier(Modifier::REVERSED),
+                ));
+            }
+            local_pos = m_local_end;
+        }
+        if local_pos < span_len {
+            new_spans.push(Span::styled(
+                span_text[local_pos..].to_string(),
+                span_style,
+            ));
+        }
+        byte_offset = span_end;
+    }
+
+    Line::from(new_spans)
 }
 
 fn move_filter_cursor(app: &mut App, delta: i32) {
@@ -1775,21 +1857,20 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
             total,
         )
     };
-    let regex = try_compile(&app.search_query);
+    let regex = try_compile(&app.search_query, app.search_case_insensitive);
     if !app.search_query.is_empty() {
-        let count = match &regex {
-            Some(r) => find_matches_regex(&all_lines, r).len(),
-            None => 0,
-        };
-        let suffix = if regex.is_none() {
-            format!("    /{}  (invalid regex)", app.search_query)
-        } else {
-            format!(
-                "    /{}  ({} match{})",
-                app.search_query,
-                count,
-                if count == 1 { "" } else { "es" },
-            )
+        let flags = if app.search_case_insensitive { " (i)" } else { "" };
+        let suffix = match &regex {
+            Some(r) => {
+                let count = find_matches_regex(&all_lines, r).len();
+                format!(
+                    "    /{}{flags}  ({} match{})",
+                    app.search_query,
+                    count,
+                    if count == 1 { "" } else { "es" },
+                )
+            }
+            None => format!("    /{}{flags}  (invalid regex)", app.search_query),
         };
         title.push_str(&suffix);
     }
@@ -1800,8 +1881,8 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
         .skip(scroll)
         .take(visible)
         .map(|line| match &regex {
-            Some(r) if r.is_match(&line_text(&line)) => highlight_line(line),
-            _ => line,
+            Some(r) => highlight_matches_in_line(line, r),
+            None => line,
         })
         .collect();
     let para = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
@@ -2774,11 +2855,13 @@ fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if app.search_input_mode {
-        let invalid = !app.search_input.is_empty() && try_compile(&app.search_input).is_none();
+        let invalid = !app.search_input.is_empty()
+            && try_compile(&app.search_input, app.search_case_insensitive).is_none();
+        let prefix = if app.search_input_backward { "?" } else { "/" };
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(
-                "/",
+                prefix.to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -2786,6 +2869,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(app.search_input.clone()),
             Span::styled("▏", Style::default().fg(Color::Yellow)),
         ];
+        if app.search_case_insensitive {
+            spans.push(Span::styled(
+                "  (i)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if invalid {
             spans.push(Span::styled(
                 "  (invalid regex)",
@@ -2833,8 +2922,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("↑↓ / jk", "scroll"),
             ("PgUp/Dn", "page"),
             ("g/G", "top/bot"),
-            ("/", "search"),
+            ("/?", "search f/b"),
             ("n/N", "next/prev"),
+            ("i", "case"),
             ("Esc / q", "back"),
             ("Ctrl-D", "quit"),
         ],
@@ -2958,10 +3048,74 @@ mod tests {
 
     #[test]
     fn try_compile_handles_empty_and_invalid() {
-        assert!(try_compile("").is_none());
-        assert!(try_compile("[unclosed").is_none());
-        assert!(try_compile("valid").is_some());
-        assert!(try_compile("\\d+").is_some());
+        assert!(try_compile("", false).is_none());
+        assert!(try_compile("[unclosed", false).is_none());
+        assert!(try_compile("valid", false).is_some());
+        assert!(try_compile("\\d+", false).is_some());
+    }
+
+    #[test]
+    fn try_compile_case_insensitive_prefix_works() {
+        let r = try_compile("error", true).unwrap();
+        assert!(r.is_match("ERROR"));
+        assert!(r.is_match("Error"));
+        assert!(r.is_match("error"));
+        let r2 = try_compile("error", false).unwrap();
+        assert!(!r2.is_match("ERROR"));
+        assert!(r2.is_match("error"));
+    }
+
+    #[test]
+    fn highlight_matches_only_styles_matched_substrings() {
+        let line = Line::from(vec![
+            Span::styled("hello ", Style::default().fg(Color::Red)),
+            Span::styled("world", Style::default().fg(Color::Blue)),
+        ]);
+        let r = regex::Regex::new("ell").unwrap();
+        let highlighted = highlight_matches_in_line(line, &r);
+        // We expect: "h" (red), "ell" (red+REVERSED), "o " (red), "world" (blue)
+        let texts: Vec<String> = highlighted.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts.join(""), "hello world");
+        // The "ell" span has the REVERSED modifier set.
+        let ell = highlighted
+            .spans
+            .iter()
+            .find(|s| s.content == "ell")
+            .expect("ell span");
+        assert!(ell.style.add_modifier.contains(Modifier::REVERSED));
+        // Other spans don't have REVERSED.
+        for span in &highlighted.spans {
+            if span.content != "ell" {
+                assert!(!span.style.add_modifier.contains(Modifier::REVERSED));
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_matches_handles_match_spanning_two_spans() {
+        let line = Line::from(vec![
+            Span::styled("hel", Style::default().fg(Color::Red)),
+            Span::styled("low", Style::default().fg(Color::Blue)),
+        ]);
+        // "ello" spans the boundary between "hel" and "low".
+        let r = regex::Regex::new("ello").unwrap();
+        let highlighted = highlight_matches_in_line(line, &r);
+        let reversed_text: String = highlighted
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(reversed_text, "ello");
+    }
+
+    #[test]
+    fn highlight_matches_no_match_returns_line_unchanged() {
+        let line = Line::from(vec![Span::raw("nothing matches here")]);
+        let r = regex::Regex::new("xyz").unwrap();
+        let result = highlight_matches_in_line(line, &r);
+        assert_eq!(result.spans.len(), 1);
+        assert!(!result.spans[0].style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

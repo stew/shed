@@ -237,16 +237,17 @@ output fills the screen.
 | PgUp / PgDn / Space / `b` / `f` | scroll one page (~20 lines) |
 | Home / `g`          | jump to top |
 | End / `G`           | jump to bottom |
-| `/`                 | start incremental search (anchors at current scroll) |
-| (typing in /-mode)  | search updates live; scroll jumps to first match at-or-after the anchor |
+| `/` / `?`           | start incremental search forward / backward (anchors at current scroll) |
+| (typing in /-mode)  | search updates live; scroll jumps to first match at-or-after the anchor (forward) or last at-or-before (backward) |
 | Enter               | commit the search (exit input mode; query stays for n/N) |
 | Esc (in /-mode)     | cancel; revert scroll to anchor; clear query |
-| `n` / `N`           | jump to next / previous match (wraps) |
+| `n` / `N`           | jump to next / previous match (wraps; always forward / backward regardless of how the search was initiated) |
+| `i`                 | toggle case-insensitive matching (re-runs the active search) |
 | Esc                 | clear active search; or, if no search, back to BlockCursor |
 | `q`                 | back to BlockCursor (always) |
 | Ctrl-D              | quit |
 
-Search is **regex** (Rust `regex` crate, case-sensitive). The header shows `/<query>  (N matches)` while a query is active. Matching lines render with reversed-video highlighting. While typing, an invalid regex shows `(invalid regex)` next to the input bar but doesn't break typing — once it parses again, the search resumes.
+Search is **regex** (Rust `regex` crate). Default is case-sensitive; `i` toggles case-insensitivity (header shows `(i)` next to the query, achieved by prefixing the pattern with `(?i)`). The header shows `/<query>  (N matches)` while a query is active. Matched **substrings** within each line render with reversed video, leaving the rest of the line's ANSI styling intact. While typing, an invalid regex shows `(invalid regex)` next to the input bar but doesn't break typing — once it parses again, the search resumes.
 
 ## Architecture
 
@@ -320,8 +321,6 @@ Known gaps and likely next steps, in rough priority order:
 - Saved/named pipelines as reusable computations
 - Scrollback within long block previews (sub-block scroll without
   entering the pager)
-- Backward search (`?` à la less) — currently you type `/` then use
-  `N` to step backward through matches
 
 ## License
 
