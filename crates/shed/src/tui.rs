@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1020,7 +1021,7 @@ impl App {
         Self {
             session: Session::new(),
             prompt: String::new(),
-            history: Vec::new(),
+            history: load_history_from_default_path().unwrap_or_default(),
             history_cursor: None,
             write_input_mode: false,
             write_input: String::new(),
@@ -1252,6 +1253,53 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => spawn_prompt(app).await,
         _ => {}
     }
+}
+
+/// Resolve `$XDG_CACHE_HOME/shed/history`, falling back to
+/// `$HOME/.cache/shed/history`. Returns `None` if neither env var is set.
+fn history_file_path() -> Option<PathBuf> {
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
+        })?;
+    Some(cache_dir.join("shed").join("history"))
+}
+
+fn load_history_from_default_path() -> Option<Vec<String>> {
+    let path = history_file_path()?;
+    load_history_from(&path)
+}
+
+fn load_history_from(path: &std::path::Path) -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    Some(
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+    )
+}
+
+fn append_history_to_default_path(line: &str) -> io::Result<()> {
+    let Some(path) = history_file_path() else {
+        return Ok(());
+    };
+    append_history_to(&path, line)
+}
+
+fn append_history_to(path: &std::path::Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
 }
 
 fn history_step(app: &mut App, delta: i32) {
@@ -2016,7 +2064,10 @@ async fn spawn_prompt(app: &mut App) {
     // Suppress consecutive duplicates so spamming Up doesn't grow history.
     let original = app.prompt.clone();
     if !app.history.last().map_or(false, |last| last == &original) {
-        app.history.push(original);
+        app.history.push(original.clone());
+        // Best-effort persist to ~/.cache/shed/history; ignore failures so
+        // a missing $HOME / read-only FS / etc. doesn't break the session.
+        let _ = append_history_to_default_path(&original);
     }
     app.history_cursor = None;
     app.prompt.clear();
@@ -3478,6 +3529,56 @@ mod tests {
         history_step(&mut app, 1); // past "three" → empty
         assert_eq!(app.prompt, "");
         assert!(app.history_cursor.is_none());
+    }
+
+    #[test]
+    fn history_persistence_round_trips_via_tmpfile() {
+        let dir = std::env::temp_dir().join(format!(
+            "shed-history-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("history");
+        // Append three entries.
+        append_history_to(&path, "first").unwrap();
+        append_history_to(&path, "second").unwrap();
+        append_history_to(&path, "third").unwrap();
+        // Load them back.
+        let loaded = load_history_from(&path).unwrap();
+        assert_eq!(loaded, vec!["first", "second", "third"]);
+        // Cleanup.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn history_load_missing_file_returns_none() {
+        let path = std::env::temp_dir().join(format!(
+            "shed-history-nonexistent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(load_history_from(&path).is_none());
+    }
+
+    #[test]
+    fn history_load_filters_empty_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "shed-history-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history");
+        std::fs::write(&path, "first\n\nsecond\n\n").unwrap();
+        let loaded = load_history_from(&path).unwrap();
+        assert_eq!(loaded, vec!["first", "second"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
