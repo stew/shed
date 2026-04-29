@@ -122,6 +122,209 @@ enum Focus {
     FilterEdit,
     BlockExpand,
     EnvEdit,
+    Palette,
+}
+
+#[derive(Debug, Clone)]
+struct PaletteState {
+    input: String,
+    cursor: usize,
+}
+
+impl PaletteState {
+    fn new() -> Self {
+        Self {
+            input: String::new(),
+            cursor: 0,
+        }
+    }
+}
+
+/// One entry in the command palette. `enabled` decides whether the action
+/// shows up at all in the current app state (e.g., "Pin block" only makes
+/// sense when a block is selected); `handler` mutates `App` to perform
+/// the action — typically by setting focus / state for downstream
+/// handling, since most actions mirror existing keybindings.
+struct Action {
+    name: &'static str,
+    description: &'static str,
+    enabled: fn(&App) -> bool,
+    handler: fn(&mut App),
+}
+
+fn always_enabled(_: &App) -> bool {
+    true
+}
+
+fn any_blocks_exist(app: &App) -> bool {
+    app.session.blocks().next().is_some()
+}
+
+fn block_selected(app: &App) -> bool {
+    app.session.cursor().is_some()
+}
+
+fn block_with_capture(app: &App) -> bool {
+    app.session
+        .cursor()
+        .and_then(|id| app.session.block(id))
+        .map(|b| b.capture.is_some())
+        .unwrap_or(false)
+}
+
+const ACTIONS: &[Action] = &[
+    Action {
+        name: "Quit shed",
+        description: "Exit the program",
+        enabled: always_enabled,
+        handler: |app| {
+            app.quit = true;
+        },
+    },
+    Action {
+        name: "Focus prompt",
+        description: "Return focus to the command prompt",
+        enabled: always_enabled,
+        handler: |app| {
+            app.focus = Focus::Prompt;
+            app.session.set_cursor(None);
+        },
+    },
+    Action {
+        name: "Focus newest block",
+        description: "Move the cursor to the most recent block",
+        enabled: any_blocks_exist,
+        handler: |app| {
+            if let Some(id) = app.newest_block_id() {
+                app.session.set_cursor(Some(id));
+                app.reset_pipeline_cursor();
+                app.focus = Focus::BlockCursor;
+            }
+        },
+    },
+    Action {
+        name: "Open env editor",
+        description: "Browse and modify environment variables",
+        enabled: always_enabled,
+        handler: |app| {
+            app.env_edit = Some(EnvEditState::new());
+            app.focus = Focus::EnvEdit;
+        },
+    },
+    Action {
+        name: "Add filter",
+        description: "Add a filter to the selected block",
+        enabled: block_with_capture,
+        handler: |app| {
+            open_filter_edit(app);
+        },
+    },
+    Action {
+        name: "Insert filter",
+        description: "Insert a filter before the cursor's filter",
+        enabled: block_with_capture,
+        handler: |app| {
+            open_filter_insert(app);
+        },
+    },
+    Action {
+        name: "Drop filter",
+        description: "Remove the filter at the pipeline cursor",
+        enabled: block_with_capture,
+        handler: |app| {
+            app.focus = Focus::BlockCursor;
+            drop_filter_at_cursor(app);
+        },
+    },
+    Action {
+        name: "Expand block (pager)",
+        description: "Open the selected block in the fullscreen pager",
+        enabled: block_selected,
+        handler: |app| {
+            app.expand_scroll = 0;
+            app.focus = Focus::BlockExpand;
+        },
+    },
+    Action {
+        name: "Write block to file",
+        description: "Save filtered output (.csv, .tsv, .json, or plain)",
+        enabled: block_selected,
+        handler: |app| {
+            app.focus = Focus::BlockCursor;
+            app.write_input_mode = true;
+            app.write_input.clear();
+        },
+    },
+    Action {
+        name: "Pin block",
+        description: "Open name input for the selected block",
+        enabled: block_selected,
+        handler: |app| {
+            if let Some(id) = app.session.cursor() {
+                let existing = app
+                    .session
+                    .block(id)
+                    .and_then(|b| b.name.clone())
+                    .unwrap_or_default();
+                app.pin_input = existing;
+                app.pin_input_mode = true;
+                app.focus = Focus::BlockCursor;
+            }
+        },
+    },
+    Action {
+        name: "Unpin block",
+        description: "Clear the selected block's name",
+        enabled: block_selected,
+        handler: |app| {
+            if let Some(id) = app.session.cursor() {
+                app.session.unpin(id);
+            }
+            app.focus = Focus::BlockCursor;
+        },
+    },
+    Action {
+        name: "Rerun command",
+        description: "Re-run the block's command (edited) with the same pipeline",
+        enabled: block_selected,
+        handler: |app| {
+            if let Some(id) = app.session.cursor() {
+                if let Some(block) = app.session.block(id) {
+                    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
+                        .unwrap_or_else(|_| block.argv.join(" "));
+                    app.rerun_input = joined;
+                    app.rerun_input_mode = true;
+                    app.rerun_source_id = Some(id);
+                }
+            }
+            app.focus = Focus::BlockCursor;
+        },
+    },
+    Action {
+        name: "Cancel running command",
+        description: "Kill the selected block's child process",
+        enabled: block_selected,
+        handler: |app| {
+            let _ = cancel_at_cursor(app);
+            app.focus = Focus::BlockCursor;
+        },
+    },
+];
+
+fn matches_for_input(input: &str, app: &App) -> Vec<&'static Action> {
+    let words: Vec<String> = input
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    ACTIONS
+        .iter()
+        .filter(|a| (a.enabled)(app))
+        .filter(|a| {
+            let lower = a.name.to_lowercase();
+            words.iter().all(|w| lower.contains(w))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1048,6 +1251,8 @@ struct App {
     pending_rerun: Option<RerunRequest>,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
+    palette_state: Option<PaletteState>,
+    palette_prev_focus: Option<Focus>,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
@@ -1094,6 +1299,8 @@ impl App {
             pending_rerun: None,
             last_cwd: None,
             env_edit: None,
+            palette_state: None,
+            palette_prev_focus: None,
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
@@ -1322,6 +1529,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
                 app.quit = true;
                 return;
             }
+            KeyCode::Char('k') => {
+                open_palette(app);
+                return;
+            }
             _ => {}
         }
     }
@@ -1331,6 +1542,78 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::FilterEdit => handle_filter_edit_key(app, key),
         Focus::BlockExpand => handle_block_expand_key(app, key),
         Focus::EnvEdit => handle_env_edit_key(app, key),
+        Focus::Palette => handle_palette_key(app, key),
+    }
+}
+
+fn open_palette(app: &mut App) {
+    if app.focus == Focus::Palette {
+        return;
+    }
+    app.palette_prev_focus = Some(app.focus);
+    app.palette_state = Some(PaletteState::new());
+    app.focus = Focus::Palette;
+}
+
+fn close_palette_cancelled(app: &mut App) {
+    if let Some(prev) = app.palette_prev_focus.take() {
+        app.focus = prev;
+    }
+    app.palette_state = None;
+}
+
+fn commit_palette(app: &mut App) {
+    let Some(state) = app.palette_state.as_ref() else {
+        return;
+    };
+    let matches = matches_for_input(&state.input, app);
+    let cursor = state.cursor.min(matches.len().saturating_sub(1));
+    let Some(action) = matches.get(cursor).copied() else {
+        // No matches; cancel.
+        close_palette_cancelled(app);
+        return;
+    };
+    let handler = action.handler;
+    // Tear down palette state but DON'T restore prev focus — handler decides.
+    app.palette_state = None;
+    app.palette_prev_focus = None;
+    handler(app);
+}
+
+fn handle_palette_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => close_palette_cancelled(app),
+        KeyCode::Up => {
+            if let Some(state) = app.palette_state.as_mut() {
+                state.cursor = state.cursor.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            let matches_len = app
+                .palette_state
+                .as_ref()
+                .map(|s| matches_for_input(&s.input, app).len())
+                .unwrap_or(0);
+            if let Some(state) = app.palette_state.as_mut() {
+                if matches_len > 0 {
+                    state.cursor = (state.cursor + 1).min(matches_len - 1);
+                }
+            }
+        }
+        KeyCode::Enter => commit_palette(app),
+        KeyCode::Char(c) => {
+            if let Some(state) = app.palette_state.as_mut() {
+                state.input.push(c);
+                state.cursor = 0;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(state) = app.palette_state.as_mut() {
+                state.input.pop();
+                state.cursor = 0;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2797,8 +3080,88 @@ fn draw(f: &mut Frame, app: &App) {
         Focus::FilterEdit => draw_filter_edit(f, app),
         Focus::BlockExpand => draw_block_expand(f, app),
         Focus::EnvEdit => draw_env_edit(f, app),
+        Focus::Palette => draw_palette(f, app),
         _ => draw_repl(f, app),
     }
+}
+
+fn draw_palette(f: &mut Frame, app: &App) {
+    let Some(state) = app.palette_state.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    draw_header(f, chunks[0], "command palette");
+
+    // Input bar with bottom border separator.
+    let input_block = TuiBlock::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let input_widget = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "› ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(state.input.clone()),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]))
+    .block(input_block);
+    f.render_widget(input_widget, chunks[1]);
+
+    // Filtered list.
+    let matches = matches_for_input(&state.input, app);
+    let body_area = chunks[2];
+    let visible = body_area.height as usize;
+    let cursor = state.cursor.min(matches.len().saturating_sub(1));
+    let scroll_offset = if cursor >= visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("  (no matches)", dim)));
+    } else {
+        for (i, action) in matches.iter().enumerate().skip(scroll_offset).take(visible) {
+            let selected = i == cursor;
+            let prefix = if selected { "▸ " } else { "  " };
+            let name_style = if selected {
+                highlight
+            } else {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            };
+            let desc_style = if selected { highlight } else { dim };
+            lines.push(Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(action.name, name_style),
+                Span::raw("  "),
+                Span::styled(action.description, desc_style),
+            ]));
+        }
+    }
+    let list_widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(list_widget, body_area);
+
+    draw_status(f, chunks[3], app);
 }
 
 fn draw_env_edit(f: &mut Frame, app: &App) {
@@ -3587,7 +3950,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
-        Focus::FilterEdit | Focus::BlockExpand | Focus::EnvEdit => Line::from(""),
+        Focus::FilterEdit | Focus::BlockExpand | Focus::EnvEdit | Focus::Palette => {
+            Line::from("")
+        }
     };
     let widget = Paragraph::new(line).block(border);
     f.render_widget(widget, area);
@@ -4212,6 +4577,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("↑↓", "history"),
             ("!cmd", "fullscreen"),
             ("Ctrl-E", "env"),
+            ("Ctrl-K", "palette"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
@@ -4255,6 +4621,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("a", "add"),
             ("d", "delete"),
             ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::Palette => vec![
+            ("↑↓", "navigate"),
+            ("Enter", "run"),
+            ("Esc", "cancel"),
             ("Ctrl-D", "quit"),
         ],
     };
@@ -4519,6 +4891,31 @@ mod tests {
                 .as_nanos()
         ));
         assert!(load_history_from(&path).is_none());
+    }
+
+    #[test]
+    fn palette_matches_filter_by_word_substrings() {
+        let mut app = App::new();
+        app.history.clear();
+        // No cursor, no blocks — only always-enabled actions and "any
+        // blocks" actions show. Newest-block one wouldn't (no blocks).
+        let all = matches_for_input("", &app);
+        assert!(all.iter().any(|a| a.name == "Quit shed"));
+        assert!(all.iter().any(|a| a.name == "Open env editor"));
+        assert!(!all.iter().any(|a| a.name == "Focus newest block"));
+
+        // Multi-word substring match.
+        let env = matches_for_input("env editor", &app);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "Open env editor");
+
+        // Case-insensitive.
+        let q = matches_for_input("QUIT", &app);
+        assert!(q.iter().any(|a| a.name == "Quit shed"));
+
+        // Words can match in any order across the name.
+        let m = matches_for_input("editor env", &app);
+        assert!(m.iter().any(|a| a.name == "Open env editor"));
     }
 
     #[test]

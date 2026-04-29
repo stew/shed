@@ -222,6 +222,7 @@ so you don't lose data without noticing.
 | Esc       | focus newest block |
 | Ctrl-D    | quit |
 | Ctrl-C    | quit (no running selection) |
+| Ctrl-K    | open the command palette |
 
 ### BlockCursor
 
@@ -255,6 +256,23 @@ so you don't lose data without noticing.
 | `x` / Backspace      | (on SortKeys / where-clause) remove the active row (min 1) |
 | Enter                | apply — commits the in-progress filter to the pipeline |
 | Esc                  | cancel — restores the saved filter, returns to BlockCursor |
+
+### Palette (command palette)
+
+Opened from any focus by **Ctrl-K**. A fuzzy-search list of every named
+action shed supports — quit, focus newest block, open env editor, pin /
+unpin / expand / write / rerun the selected block, open the filter
+form, etc. Actions whose preconditions aren't met (e.g. "Pin block"
+when no block is selected) are filtered out, so the list never offers
+something it can't do.
+
+| Key      | Action |
+|----------|--------|
+| (typing) | filter actions by case-insensitive word substring on the action name. Multiple words must all appear (in any order). |
+| `↑` / `↓` | navigate filtered list |
+| Enter    | run the selected action |
+| Esc      | close the palette without running anything |
+| Ctrl-D   | quit shed |
 
 ### EnvEdit (environment-variable editor)
 
@@ -361,7 +379,6 @@ Known gaps and likely next steps, in rough priority order:
   Single-line cursor effects (`\r`, `\x1b[K`, `\t`) now collapse
   cargo-style progress bars; tools that update several lines via
   cursor up still produce stacked output.
-- Command palette (universal `Space` / `Ctrl-K` action menu)
 - Saved/named pipelines as reusable computations
 - Scrollback within long block previews (sub-block scroll without
   entering the pager)
