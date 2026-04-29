@@ -136,6 +136,20 @@ spans. Cursor-positioning sequences are dropped, so non-curses programs
 render cleanly. Programs that try to take over the screen get
 **fullscreen handover** instead.
 
+### Builtins
+
+A few commands aren't external programs and are handled inside shed
+itself:
+
+- **`cd [path]`** — change shed's current working directory. Subsequent
+  commands inherit the new cwd. Without an argument, `cd` goes to
+  `$HOME`. `cd -` swaps with the previous cwd. `~` and `~/path` are
+  expanded. The cwd shows in the header bar (`shed  ·  ~/devel/shed`).
+
+Most other "shell-isms" (`|`, `>`, `&&`, `$(…)`) are deliberately not
+supported — see the design constraints below. Use `bash -c '…'` if you
+need real shell semantics.
+
 ### Fullscreen handover
 
 For interactive programs (`top`, `vim`, `less`, `man`, `tmux`, `ssh`,

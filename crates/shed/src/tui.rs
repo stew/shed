@@ -987,6 +987,7 @@ struct App {
     history_cursor: Option<usize>,
     write_input_mode: bool,
     write_input: String,
+    last_cwd: Option<PathBuf>,
     focus: Focus,
     filter_edit: Option<FilterEditState>,
     pipeline_cursor: usize,
@@ -1025,6 +1026,7 @@ impl App {
             history_cursor: None,
             write_input_mode: false,
             write_input: String::new(),
+            last_cwd: None,
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
@@ -2080,6 +2082,11 @@ async fn spawn_prompt(app: &mut App) {
         return;
     }
 
+    if argv[0] == "cd" {
+        run_cd_builtin(app, &argv);
+        return;
+    }
+
     let id = app.session.add_block(argv.clone());
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer)) => {
@@ -2090,6 +2097,55 @@ async fn spawn_prompt(app: &mut App) {
                 .set_state(id, BlockState::Failed(e.to_string()));
         }
     }
+}
+
+/// Handle `cd` as a shell-style builtin: it can't be spawned as an
+/// executable because it's a state change in shed itself (the process's
+/// current working directory). Subsequent spawns inherit the new cwd
+/// because exec::run_blocking calls std::env::current_dir() at spawn
+/// time. `cd -` swaps to the previous cwd (tracked in App, not via
+/// $OLDPWD env, to avoid the unsafe-set_var dance).
+fn run_cd_builtin(app: &mut App, argv: &[String]) {
+    let id = app.session.add_block(argv.to_vec());
+    let prev_cwd = std::env::current_dir().ok();
+
+    let target: Result<PathBuf, String> = match argv.get(1).map(String::as_str) {
+        Some("-") => app
+            .last_cwd
+            .clone()
+            .ok_or_else(|| "no previous directory".into()),
+        Some(p) => Ok(expand_tilde(p)),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "$HOME not set".into()),
+    };
+
+    let result = target.and_then(|t| std::env::set_current_dir(&t).map(|_| t).map_err(|e| e.to_string()));
+
+    match result {
+        Ok(new_path) => {
+            app.last_cwd = prev_cwd;
+            app.session.set_state(id, BlockState::Done(0));
+            app.flash = Some(format!("cd → {}", new_path.display()));
+        }
+        Err(e) => {
+            app.session
+                .set_state(id, BlockState::Failed(format!("cd: {e}")));
+        }
+    }
+}
+
+fn expand_tilde(s: &str) -> PathBuf {
+    if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(s)
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -2193,10 +2249,25 @@ fn draw_repl(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    draw_header(f, chunks[0], "shed");
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| collapse_home_in_path(&p))
+        .unwrap_or_else(|| "?".into());
+    draw_header(f, chunks[0], &cwd);
     draw_blocks(f, chunks[1], app);
     draw_input(f, chunks[2], app);
     draw_status(f, chunks[3], app);
+}
+
+fn collapse_home_in_path(p: &std::path::Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+        if let Some(s) = p.to_str() {
+            if let Some(rest) = s.strip_prefix(&home) {
+                return format!("~{rest}");
+            }
+        }
+    }
+    p.display().to_string()
 }
 
 fn draw_filter_edit(f: &mut Frame, app: &App) {
@@ -3565,6 +3636,32 @@ mod tests {
     }
 
     #[test]
+    fn expand_tilde_handles_bare_and_prefix_forms() {
+        // Use a known HOME for the test by stashing/restoring.
+        let saved = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", "/tmp/shed-tilde-test");
+        }
+        assert_eq!(
+            expand_tilde("~"),
+            PathBuf::from("/tmp/shed-tilde-test")
+        );
+        assert_eq!(
+            expand_tilde("~/foo"),
+            PathBuf::from("/tmp/shed-tilde-test/foo")
+        );
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel"), PathBuf::from("rel"));
+        // Restore.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
     fn history_load_filters_empty_lines() {
         let dir = std::env::temp_dir().join(format!(
             "shed-history-empty-{}",
@@ -3584,6 +3681,9 @@ mod tests {
     #[test]
     fn history_step_with_empty_history_is_a_noop() {
         let mut app = App::new();
+        // App::new now loads persisted history; clear for this test.
+        app.history.clear();
+        app.history_cursor = None;
         app.prompt = "typed".into();
         history_step(&mut app, -1);
         assert_eq!(app.prompt, "typed");
