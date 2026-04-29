@@ -105,13 +105,25 @@ filter. Captures are bounded (16 MB) so re-running the pipeline is cheap.
 
 ### Focus model
 
-shed has three focus contexts (no vim-style modes — the meaning of each
-key changes with focus, and the bottom status bar lists what's
-available):
+Each block renders as a bordered box; the box title carries the
+identifier (`%5` or `@name` for pinned blocks) plus a state glyph. A
+single "scratch" box at the bottom is the place to type a new command —
+it's always present and takes the next id.
 
-- **Prompt** — type commands. `Enter` runs.
-- **BlockCursor** — navigate blocks (`↑↓`) and filters within a block
-  (`←→`); add/edit/drop filters; cancel running commands.
+- **BlockCursor** — navigate blocks (`↑↓`); the scratch sits one slot
+  past the last real block. Compact view: id/name + glyph + output. To
+  reveal the command and the pipeline, press `e` to enter EditBlock.
+  Press `v` to open the fullscreen pager. Press `/` to jump to the
+  prompt and start typing.
+- **EditBlock** — pipeline-edit mode for the cursor block. The argv is
+  shown on the first line and each filter on its own indented line;
+  `←→` navigates between the command and the filters; `f`/Enter opens
+  the form editor for the active slot; `i` inserts, `d` drops, `<>`
+  reorder. `Esc` returns to BlockCursor.
+- **Prompt** — typing in the scratch box. `Enter` runs (and the new
+  block appears in place of the scratch; a fresh scratch is drawn for
+  the next command). `Esc` returns to BlockCursor on the last block.
+  `↑↓` walk persistent history.
 - **FilterEdit** — schema-aware form for the active filter, with live
   preview at the top.
 
@@ -328,20 +340,21 @@ so you don't lose data without noticing.
 
 ### BlockCursor
 
+The compact, default focus. Each block renders as a bordered box with
+just `id/name + glyph + output`; the command and pipeline stay hidden
+until you press `e` to enter EditBlock. Pressing `↓` past the last real
+block lands on the scratch box (focus shifts to Prompt).
+
 | Key       | Action |
 |-----------|--------|
-| `↑↓`      | navigate between blocks |
-| `←→`      | navigate filters within the selected block (and the `+ add` slot). Pulling left at the first filter steps onto the command itself (highlighted in magenta); right returns to the filter row. |
-| `f` / Enter on the command | open an in-place command editor (input bar pre-fills with the shlex-quoted argv). Commit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
+| `↑↓`      | navigate between blocks; `↓` past the last block jumps to the scratch (Prompt). |
+| `e`       | enter EditBlock — reveals the command and each filter on its own line so you can navigate / edit them. |
+| `v`       | view the selected block in the fullscreen pager. |
+| `/`       | jump to the scratch (Prompt) with `/` typed for slash commands like `/aliases`. |
 | Space     | run the selected block in place (re-spawns its argv, replaces the capture). Use this to execute Idle blocks loaded from a notebook, or to re-run a finished block without typing it again. For `@name` snapshot blocks this re-snapshots from the source. |
-| `f` / Enter | edit selected filter / add new |
-| `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
-| `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
-| `d`       | drop the filter at cursor (or last if on add slot) |
 | `x`       | delete the selected block from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
-| `e`       | expand the selected block to a fullscreen pager |
 | `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
-| `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render with `◉ name` and never evict on capture-budget pressure. Empty name unpins. |
+| `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render their box title as `@name` and never evict on capture-budget pressure. Empty name unpins. |
 | `u`       | unpin the selected block (clear its name) |
 | `r`       | open a rerun input bar pre-filled with the block's argv (shlex-quoted). Edit and Enter to spawn a new block with the edited command and the same pipeline copied over; Esc cancels. The original block is unchanged. |
 | `n` / `N` | edit the block's pre-note / post-note (multi-line text rendered above / below the block, persisted to the notebook) |
@@ -351,6 +364,22 @@ so you don't lose data without noticing.
 | Ctrl-O    | open notebook |
 | Esc       | back to prompt |
 | Ctrl-D    | quit (or prompt if unsaved) |
+
+### EditBlock
+
+Entered by pressing `e` on a block. The block's command appears on the
+first line; each filter on its own indented `│ filter` row below it.
+Block-level actions (run, delete, pin, etc.) live one focus up — `Esc`
+returns to BlockCursor for those.
+
+| Key       | Action |
+|-----------|--------|
+| `←→`      | navigate filters within the selected block (and the `+ add` slot). Pulling left at the first filter steps onto the command itself (highlighted in magenta); right returns to the filter row. |
+| `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
+| `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
+| `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
+| `d`       | drop the filter at cursor (or last if on add slot) |
+| Esc       | back to BlockCursor |
 
 ### FilterEdit
 

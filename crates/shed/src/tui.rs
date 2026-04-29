@@ -120,6 +120,12 @@ const PREVIEW_LINES: usize = 8;
 enum Focus {
     Prompt,
     BlockCursor,
+    /// Pipeline-edit mode for the cursor block. Reveals the command and
+    /// each filter on its own line with ←→ navigation; `f`/Enter opens
+    /// the form editor for the active slot. `Esc` returns to BlockCursor.
+    /// Block-level actions (run, delete, pin, etc.) live in BlockCursor;
+    /// EditBlock is purely for pipeline mutation.
+    EditBlock,
     FilterEdit,
     BlockExpand,
     EnvEdit,
@@ -277,12 +283,20 @@ const ACTIONS: &[Action] = &[
         description: "Remove the filter at the pipeline cursor",
         enabled: block_with_capture,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::EditBlock;
             drop_filter_at_cursor(app);
         },
     },
     Action {
-        name: "Expand block (pager)",
+        name: "Edit block (pipeline)",
+        description: "Reveal the command + filters and navigate them",
+        enabled: block_selected,
+        handler: |app| {
+            enter_edit_block(app);
+        },
+    },
+    Action {
+        name: "View block (pager)",
         description: "Open the selected block in the fullscreen pager",
         enabled: block_selected,
         handler: |app| {
@@ -1529,7 +1543,15 @@ impl App {
             return;
         };
         if let Some(i) = ids.iter().position(|id| *id == cur) {
-            let new_i = (i as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize;
+            let target = i as i32 + delta;
+            if target >= ids.len() as i32 {
+                // ↓ off the end of the list lands on the scratch box.
+                self.session.set_cursor(None);
+                self.command_focused = false;
+                self.focus = Focus::Prompt;
+                return;
+            }
+            let new_i = target.clamp(0, ids.len() as i32 - 1) as usize;
             self.session.set_cursor(Some(ids[new_i]));
             self.reset_pipeline_cursor();
         }
@@ -2173,6 +2195,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
     match app.focus {
         Focus::Prompt => handle_prompt_key(app, key).await,
         Focus::BlockCursor => handle_cursor_key(app, key),
+        Focus::EditBlock => handle_edit_block_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
         Focus::BlockExpand => handle_block_expand_key(app, key),
         Focus::EnvEdit => handle_env_edit_key(app, key),
@@ -2669,25 +2692,21 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Up => app.move_cursor(-1),
         KeyCode::Down => app.move_cursor(1),
-        KeyCode::Left => move_filter_cursor(app, -1),
-        KeyCode::Right => move_filter_cursor(app, 1),
         KeyCode::Char(' ') => run_cursor_block_in_place(app),
         KeyCode::Char('x') => delete_block_at_cursor(app),
         KeyCode::Char('n') => open_note_edit(app, NotePosition::Pre),
         KeyCode::Char('N') => open_note_edit(app, NotePosition::Post),
         KeyCode::Char('A') => open_alias_save(app),
-        KeyCode::Char('f') | KeyCode::Enter => {
-            if app.command_focused {
-                open_cmd_edit(app);
-            } else {
-                open_filter_edit(app);
-            }
+        KeyCode::Char('e') => enter_edit_block(app),
+        KeyCode::Char('/') => {
+            app.focus = Focus::Prompt;
+            app.session.set_cursor(None);
+            app.command_focused = false;
+            app.prompt.clear();
+            app.prompt.push('/');
+            app.history_cursor = None;
         }
-        KeyCode::Char('i') => open_filter_insert(app),
-        KeyCode::Char('d') => drop_filter_at_cursor(app),
-        KeyCode::Char('<') => move_filter_in_pipeline(app, -1),
-        KeyCode::Char('>') => move_filter_in_pipeline(app, 1),
-        KeyCode::Char('e') => {
+        KeyCode::Char('v') => {
             if app.session.cursor().is_some() {
                 app.expand_scroll = 0;
                 app.focus = Focus::BlockExpand;
@@ -2734,6 +2753,56 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        _ => {}
+    }
+}
+
+fn enter_edit_block(app: &mut App) {
+    if app.session.cursor().is_none() {
+        app.flash = Some("no block selected".into());
+        return;
+    }
+    app.focus = Focus::EditBlock;
+    app.reset_pipeline_cursor();
+}
+
+/// EditBlock owns pipeline navigation and mutation; block-level actions
+/// (run, delete, pin, etc.) live one focus up in BlockCursor. Esc returns
+/// to BlockCursor.
+fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
+    if app.cmd_edit_input_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.cmd_edit_input_mode = false;
+                app.cmd_edit_input.clear();
+            }
+            KeyCode::Enter => commit_cmd_edit(app),
+            KeyCode::Char(c) => app.cmd_edit_input.push(c),
+            KeyCode::Backspace => {
+                app.cmd_edit_input.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.focus = Focus::BlockCursor;
+            app.command_focused = false;
+        }
+        KeyCode::Left => move_filter_cursor(app, -1),
+        KeyCode::Right => move_filter_cursor(app, 1),
+        KeyCode::Char('f') | KeyCode::Enter => {
+            if app.command_focused {
+                open_cmd_edit(app);
+            } else {
+                open_filter_edit(app);
+            }
+        }
+        KeyCode::Char('i') => open_filter_insert(app),
+        KeyCode::Char('d') => drop_filter_at_cursor(app),
+        KeyCode::Char('<') => move_filter_in_pipeline(app, -1),
+        KeyCode::Char('>') => move_filter_in_pipeline(app, 1),
         _ => {}
     }
 }
@@ -4804,7 +4873,6 @@ fn draw_repl(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(2),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -4815,8 +4883,7 @@ fn draw_repl(f: &mut Frame, app: &App) {
         .unwrap_or_else(|| "?".into());
     draw_header(f, chunks[0], &cwd);
     draw_blocks(f, chunks[1], app);
-    draw_input(f, chunks[2], app);
-    draw_status(f, chunks[3], app);
+    draw_status(f, chunks[2], app);
 }
 
 fn collapse_home_in_path(p: &std::path::Path) -> String {
@@ -4908,35 +4975,202 @@ fn draw_header(f: &mut Frame, area: Rect, title: &str) {
 
 fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
     let cursor_id = app.session.cursor();
-    let cursor_visible = app.focus != Focus::Prompt;
-    let separator = Line::from(Span::styled(
-        "─".repeat(area.width as usize),
-        Style::default().fg(Color::DarkGray),
-    ));
+    let cursor_visible = matches!(app.focus, Focus::BlockCursor | Focus::EditBlock);
+    let blocks: Vec<&shed_core::Block> = app.session.blocks().collect();
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut first = true;
-    for block in app.session.blocks() {
-        if !first {
-            lines.push(separator.clone());
-        }
-        first = false;
+    // Render each block's interior content + record selection state.
+    let mut renders: Vec<(Vec<Line<'static>>, bool, bool)> = Vec::with_capacity(blocks.len());
+    for block in &blocks {
         let selected = cursor_visible && cursor_id == Some(block.id);
-        let pipeline_cursor = if selected {
+        let editing = selected && app.focus == Focus::EditBlock;
+        let pipeline_cursor = if editing {
             Some(app.pipeline_cursor)
         } else {
             None
         };
-        let command_focused = selected && app.command_focused;
-        lines.extend(render_block(block, selected, pipeline_cursor, command_focused));
+        let command_focused = editing && app.command_focused;
+        let lines = render_block(block, selected, editing, pipeline_cursor, command_focused);
+        renders.push((lines, selected, editing));
     }
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, area);
+
+    // Box height = content lines + 2 (top + bottom border).
+    let heights: Vec<u16> = renders
+        .iter()
+        .map(|(l, _, _)| (l.len() as u16).saturating_add(2))
+        .collect();
+
+    // Scratch box at the end: 3 lines (border + 1 content row + border).
+    // Reserve its height up front so block top-clipping accounts for it.
+    let scratch_height: u16 = 3;
+    let avail = area.height.saturating_sub(scratch_height);
+
+    // Top-clip oldest blocks if total exceeds available height — newest
+    // blocks always stay visible. Walk from end backwards, accumulating.
+    let mut total: u16 = 0;
+    let mut start = renders.len();
+    for i in (0..renders.len()).rev() {
+        if total.saturating_add(heights[i]) > avail {
+            break;
+        }
+        total = total.saturating_add(heights[i]);
+        start = i;
+    }
+
+    let visible = &renders[start..];
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 2);
+    for h in &heights[start..] {
+        constraints.push(Constraint::Length(*h));
+    }
+    // Leftover space pushes the scratch to the bottom.
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(scratch_height));
+
+    let rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for (i, (lines, selected, editing)) in visible.iter().enumerate() {
+        draw_one_block(f, rects[i], blocks[start + i], lines, *selected, *editing);
+    }
+    let scratch_rect = rects[rects.len() - 1];
+    draw_scratch_box(f, scratch_rect, app);
+}
+
+/// Render the always-present "scratch" / prompt box at the end of the
+/// block list. When focus is `Prompt`, the buffer is rendered inside the
+/// box with a cursor; otherwise the box shows a hint inviting the user to
+/// press `/` (or scroll down) to start typing.
+fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
+    let active = app.focus == Focus::Prompt;
+    let title_style = if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    let next_id = app.session.blocks().last().map(|b| b.id.0 + 1).unwrap_or(1);
+    let title = Line::from(vec![
+        Span::styled(format!(" %{next_id} "), title_style),
+        Span::raw("  new "),
+    ]);
+    let border_style = if active {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let widget = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = widget.inner(area);
+    f.render_widget(widget, area);
+
+    let body = if active {
+        Line::from(vec![
+            Span::styled(
+                "› ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.prompt.clone()),
+            Span::styled(
+                "▏",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  press / or ↓ to start typing a command",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let para = Paragraph::new(body).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+/// Render one bordered block. The box title carries the id (`%5`) or
+/// pinned name (`@list`) plus the run-state glyph; the body is the
+/// caller-supplied content (output, notes, edit details, etc.).
+fn draw_one_block(
+    f: &mut Frame,
+    area: Rect,
+    block: &shed_core::Block,
+    lines: &[Line<'static>],
+    selected: bool,
+    editing: bool,
+) {
+    let pinned = block.name.is_some();
+    let id_text = match &block.name {
+        Some(name) => format!(" @{name} "),
+        None => format!(" %{} ", block.id.0),
+    };
+    let id_style = match (selected, pinned) {
+        (true, true) => Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        (false, true) => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (false, false) => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    };
+    let glyph = match &block.state {
+        BlockState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
+        BlockState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
+        BlockState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
+        BlockState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+        BlockState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
+        BlockState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+    };
+    let title = Line::from(vec![
+        Span::styled(id_text, id_style),
+        Span::raw(" "),
+        glyph,
+        Span::raw(" "),
+    ]);
+
+    let border_style = if editing {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let widget = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = widget.inner(area);
+    f.render_widget(widget, area);
+    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
 }
 
 fn render_block(
     block: &Block,
     selected: bool,
+    editing: bool,
     pipeline_cursor: Option<usize>,
     command_focused: bool,
 ) -> Vec<Line<'static>> {
@@ -4957,57 +5191,23 @@ fn render_block(
         .map(|(_, d)| d.clone())
         .unwrap_or_else(|| vec![0; block.pipeline.len()]);
 
-    let glyph = match &block.state {
-        BlockState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
-        BlockState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
-        BlockState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
-        BlockState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
-        BlockState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
-        BlockState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
-    };
-    // Identifier: pinned blocks render as `@name`, unpinned as `%id`.
-    let (id_text, pinned) = match &block.name {
-        Some(name) => (format!(" @{name} "), true),
-        None => (format!(" %{} ", block.id.0), false),
-    };
-    let id_style = match (selected, pinned) {
-        (true, true) => Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-        (true, false) => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        (false, true) => Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-        (false, false) => Style::default().fg(Color::Cyan),
-    };
-    let prefix = if selected { "▸ " } else { "  " };
-    let mut header = vec![
-        Span::raw(prefix),
-        Span::styled(id_text, id_style),
-        Span::raw(" "),
-        glyph,
-    ];
-    // Show the command + each pipeline filter only when the block is
-    // selected. Non-selected blocks render as a compact `id glyph + output`
-    // row — the user reaches details by navigating onto the block.
-    if selected {
-        header.push(Span::raw(" "));
-        header.push(Span::styled(
-            block.argv.join(" "),
-            if command_focused {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().add_modifier(Modifier::BOLD)
-            },
-        ));
-        lines.push(Line::from(header));
+    // Show the command + each pipeline filter only in EditBlock focus.
+    // BlockCursor stays compact — output only — so the list is scannable.
+    if editing {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                block.argv.join(" "),
+                if command_focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                },
+            ),
+        ]));
 
         // Each filter on its own line. When command_focused is true the
         // pipeline cursor is treated as None so no filter wears the
@@ -5020,7 +5220,7 @@ fn render_block(
         let normal = Style::default().fg(Color::LightCyan);
         let dim = Style::default().fg(Color::DarkGray);
         let warn = Style::default().fg(Color::Yellow);
-        let indent = "       ";
+        let indent = "   ";
 
         for (i, f) in block.pipeline.iter().enumerate() {
             let style = if effective_cursor == Some(i) {
@@ -5051,8 +5251,6 @@ fn render_block(
                 Span::styled(" + add ", style),
             ]));
         }
-    } else {
-        lines.push(Line::from(header));
     }
 
     match pipeline_outcome {
@@ -5064,21 +5262,21 @@ fn render_block(
     if let Some(capture) = &block.capture {
         if capture.truncated {
             lines.push(Line::from(Span::styled(
-                "      ✂ output truncated",
+                " ✂ output truncated",
                 Style::default().fg(Color::Magenta),
             )));
         }
         if let Some(code) = capture.exit_code {
             if code != 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("      exit {code}"),
+                    format!(" exit {code}"),
                     Style::default().fg(Color::Red),
                 )));
             }
         }
     } else if let BlockState::Done(code) = &block.state {
         let mut spans = vec![Span::styled(
-            "      (no captured output)",
+            " (no captured output)",
             Style::default().fg(Color::DarkGray),
         )];
         if *code != 0 {
@@ -5091,13 +5289,13 @@ fn render_block(
     }
     if let BlockState::Failed(msg) = &block.state {
         lines.push(Line::from(vec![
-            Span::raw("      "),
+            Span::raw(" "),
             Span::styled(msg.clone(), Style::default().fg(Color::Red)),
         ]));
     }
     if matches!(block.state, BlockState::Idle) && selected {
         lines.push(Line::from(vec![
-            Span::raw("      "),
+            Span::raw(" "),
             Span::styled(
                 "▸ ",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -5436,45 +5634,6 @@ fn describe_compare_value(v: &Value) -> String {
         Value::String(s) => format!("\"{s}\""),
         _ => format_scalar(v),
     }
-}
-
-fn draw_input(f: &mut Frame, area: Rect, app: &App) {
-    let border = TuiBlock::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let line = match app.focus {
-        Focus::Prompt => Line::from(vec![
-            Span::styled(
-                "▶ ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.prompt.clone()),
-            Span::styled("▏", Style::default().fg(Color::Green)),
-        ]),
-        Focus::BlockCursor => Line::from(vec![
-            Span::styled(
-                "  ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                match app.session.cursor() {
-                    Some(id) => format!("(block %{} selected)", id.0),
-                    None => "(no block)".into(),
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Focus::FilterEdit
-        | Focus::BlockExpand
-        | Focus::EnvEdit
-        | Focus::Palette
-        | Focus::NoteEdit
-        | Focus::AliasManage => Line::from(""),
-    };
-    let widget = Paragraph::new(line).block(border);
-    f.render_widget(widget, area);
 }
 
 fn draw_preview_pane(
@@ -6223,34 +6382,35 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::BlockCursor if app.command_focused => vec![
-            ("↑↓", "blocks"),
-            ("←→", "filters"),
-            ("f / Enter", "edit cmd"),
-            ("Space", "run"),
-            ("x", "delete"),
-            ("r", "rerun copy"),
-            ("Esc", "back"),
-        ],
         Focus::BlockCursor => vec![
             ("↑↓", "blocks"),
-            ("←→", "filters / cmd"),
+            ("e", "edit"),
+            ("v", "view"),
             ("Space", "run"),
-            ("<>", "reorder"),
-            ("f", "add/edit"),
-            ("i", "insert"),
-            ("d", "drop"),
             ("x", "delete"),
-            ("e", "expand"),
             ("w", "write"),
             ("p/u", "pin/unpin"),
             ("r", "rerun"),
             ("A", "save alias"),
             ("n/N", "pre/post note"),
+            ("/", "prompt"),
             ("Ctrl-S/O", "save/open"),
             ("Ctrl-C", "cancel"),
-            ("Esc", "back"),
+            ("Esc", "prompt"),
             ("Ctrl-D", "quit"),
+        ],
+        Focus::EditBlock if app.command_focused => vec![
+            ("←→", "filters"),
+            ("f / Enter", "edit cmd"),
+            ("Esc", "back"),
+        ],
+        Focus::EditBlock => vec![
+            ("←→", "cmd / filters"),
+            ("f / Enter", "edit"),
+            ("i", "insert"),
+            ("d", "drop"),
+            ("<>", "reorder"),
+            ("Esc", "back"),
         ],
         Focus::FilterEdit => {
             let field = app
