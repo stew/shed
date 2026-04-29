@@ -1312,12 +1312,33 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
+    let outcome = hypothetical_outcome(block, state);
+    let drops: Vec<usize> = outcome
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, d)| d.clone())
+        .unwrap_or_default();
+
     let title = format!("editing  %{}  {}", block.id.0, block.argv.join(" "));
     draw_header(f, chunks[0], &title);
-    draw_preview_pane(f, chunks[1], block, state);
-    draw_stack_pane(f, chunks[2], block, state);
+    draw_preview_pane(f, chunks[1], &outcome);
+    draw_stack_pane(f, chunks[2], block, state, &drops);
     draw_form_pane(f, chunks[3], state);
     draw_status(f, chunks[4], app);
+}
+
+fn hypothetical_outcome(
+    block: &Block,
+    state: &FilterEditState,
+) -> Option<Result<(PipelineValue, Vec<usize>), String>> {
+    let capture = block.capture.as_ref()?;
+    let mut hypothetical: Vec<FilterSpec> = block.pipeline.clone();
+    match (state.editing_index, state.build_filter()) {
+        (None, Some(spec)) => hypothetical.push(spec),
+        (Some(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
+        _ => {}
+    }
+    Some(apply_pipeline(&capture.stdout, &hypothetical))
 }
 
 fn draw_header(f: &mut Frame, area: Rect, title: &str) {
@@ -1401,11 +1422,25 @@ fn render_block(
     }
     lines.push(Line::from(header));
 
+    let pipeline_outcome = block
+        .capture
+        .as_ref()
+        .map(|c| apply_pipeline(&c.stdout, &block.pipeline));
+    let drops: Vec<usize> = pipeline_outcome
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| vec![0; block.pipeline.len()]);
+
     if !block.pipeline.is_empty() || pipeline_cursor.is_some() {
-        lines.push(pipeline_line(&block.pipeline, pipeline_cursor));
+        lines.push(pipeline_line(&block.pipeline, pipeline_cursor, &drops));
     }
 
-    lines.extend(render_block_preview(block));
+    match pipeline_outcome {
+        Some(Ok((value, _))) => lines.extend(render_pipeline_value(value)),
+        Some(Err(e)) => lines.extend(filter_error_lines(&e)),
+        None => {}
+    }
 
     if let Some(capture) = &block.capture {
         if capture.truncated {
@@ -1446,13 +1481,18 @@ fn render_block(
     lines
 }
 
-fn pipeline_line(pipeline: &[FilterSpec], selected: Option<usize>) -> Line<'static> {
+fn pipeline_line(
+    pipeline: &[FilterSpec],
+    selected: Option<usize>,
+    drops: &[usize],
+) -> Line<'static> {
     let highlight = Style::default()
         .fg(Color::Black)
         .bg(Color::Magenta)
         .add_modifier(Modifier::BOLD);
     let normal = Style::default().fg(Color::LightCyan);
     let dim = Style::default().fg(Color::DarkGray);
+    let warn = Style::default().fg(Color::Yellow);
 
     let mut spans = vec![Span::raw("      ")];
     for (i, f) in pipeline.iter().enumerate() {
@@ -1461,6 +1501,10 @@ fn pipeline_line(pipeline: &[FilterSpec], selected: Option<usize>) -> Line<'stat
         }
         let style = if selected == Some(i) { highlight } else { normal };
         spans.push(Span::styled(format!(" {} ", describe_filter(f)), style));
+        let n = drops.get(i).copied().unwrap_or(0);
+        if n > 0 {
+            spans.push(Span::styled(format!(" ⓘ-{n}"), warn));
+        }
     }
     if selected.is_some() {
         if !pipeline.is_empty() {
@@ -1476,55 +1520,25 @@ fn pipeline_line(pipeline: &[FilterSpec], selected: Option<usize>) -> Line<'stat
     Line::from(spans)
 }
 
-fn render_block_preview(block: &Block) -> Vec<Line<'static>> {
-    let Some(capture) = &block.capture else {
-        return Vec::new();
-    };
-    match apply_pipeline(&capture.stdout, &block.pipeline) {
-        Ok((value, notes)) => {
-            let mut lines = render_pipeline_value(value);
-            for note in &notes {
-                lines.push(note_line(note));
-            }
-            lines
-        }
-        Err(e) => filter_error_lines(&e),
-    }
-}
-
-/// Apply a pipeline of filters and accumulate per-filter diagnostic notes
-/// (currently: where filters that silently dropped rows due to type mismatch).
+/// Apply a pipeline of filters. Returns the final value plus per-filter
+/// drop counts (rows silently filtered by a `where` due to type mismatch),
+/// indexed by filter position in the pipeline.
 fn apply_pipeline(
     bytes: &bytes::Bytes,
     pipeline: &[FilterSpec],
-) -> Result<(PipelineValue, Vec<String>), String> {
+) -> Result<(PipelineValue, Vec<usize>), String> {
     let mut value = PipelineValue::Bytes(bytes.clone());
-    let mut notes: Vec<String> = Vec::new();
+    let mut drops: Vec<usize> = vec![0; pipeline.len()];
     for (i, filter) in pipeline.iter().enumerate() {
         match apply_with_notes(filter, value) {
             Ok((v, n)) => {
-                if n.error_drops > 0 {
-                    notes.push(format!(
-                        "filter {} dropped {} row{} (type mismatch)",
-                        circled(i + 1),
-                        n.error_drops,
-                        if n.error_drops == 1 { "" } else { "s" },
-                    ));
-                }
+                drops[i] = n.error_drops;
                 value = v;
             }
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok((value, notes))
-}
-
-fn note_line(message: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("      "),
-        Span::styled("ⓘ ", Style::default().fg(Color::Yellow)),
-        Span::styled(message.to_string(), Style::default().fg(Color::Yellow)),
-    ])
+    Ok((value, drops))
 }
 
 fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
@@ -1745,7 +1759,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(widget, area);
 }
 
-fn draw_preview_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEditState) {
+fn draw_preview_pane(
+    f: &mut Frame,
+    area: Rect,
+    outcome: &Option<Result<(PipelineValue, Vec<usize>), String>>,
+) {
     let block_widget = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -1758,41 +1776,26 @@ fn draw_preview_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEdi
     f.render_widget(block_widget, area);
 
     let max_rows = inner.height.saturating_sub(2) as usize;
-    let lines = compute_preview_lines(block, state, max_rows.max(3));
+    let max = max_rows.max(3);
+    let lines = match outcome {
+        None => vec![Line::from(Span::styled(
+            "      (no capture)",
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(Ok((value, _))) => render_pipeline_value_with_max(value.clone(), max),
+        Some(Err(e)) => filter_error_lines(e),
+    };
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 }
 
-fn compute_preview_lines(
+fn draw_stack_pane(
+    f: &mut Frame,
+    area: Rect,
     block: &Block,
     state: &FilterEditState,
-    max: usize,
-) -> Vec<Line<'static>> {
-    let Some(capture) = &block.capture else {
-        return vec![Line::from(Span::styled(
-            "      (no capture)",
-            Style::default().fg(Color::DarkGray),
-        ))];
-    };
-    let mut hypothetical: Vec<FilterSpec> = block.pipeline.clone();
-    match (state.editing_index, state.build_filter()) {
-        (None, Some(spec)) => hypothetical.push(spec),
-        (Some(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
-        _ => {}
-    }
-    match apply_pipeline(&capture.stdout, &hypothetical) {
-        Ok((value, notes)) => {
-            let mut lines = render_pipeline_value_with_max(value, max);
-            for note in &notes {
-                lines.push(note_line(note));
-            }
-            lines
-        }
-        Err(e) => filter_error_lines(&e),
-    }
-}
-
-fn draw_stack_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEditState) {
+    drops: &[usize],
+) {
     let block_widget = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -1814,6 +1817,7 @@ fn draw_stack_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEditS
     let dim = Style::default().fg(Color::DarkGray);
     let normal = Style::default().fg(Color::LightCyan);
 
+    let warn = Style::default().fg(Color::Yellow);
     let mut lines: Vec<Line> = Vec::new();
     for (i, spec) in block.pipeline.iter().enumerate() {
         let is_editing_here = state.editing_index == Some(i);
@@ -1829,17 +1833,32 @@ fn draw_stack_pane(f: &mut Frame, area: Rect, block: &Block, state: &FilterEditS
         if let Some(s) = suffix {
             spans.push(Span::styled(s, dim));
         }
+        let n = drops.get(i).copied().unwrap_or(0);
+        if n > 0 {
+            spans.push(Span::styled(
+                format!("  ⓘ -{n} (type mismatch)"),
+                warn,
+            ));
+        }
         lines.push(Line::from(spans));
     }
     if state.editing_index.is_none() {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!("  {} ", circled(block.pipeline.len() + 1)),
                 edit_style,
             ),
             Span::styled(active_label, edit_style),
             Span::styled("  ← editing", dim),
-        ]));
+        ];
+        let n = drops.get(block.pipeline.len()).copied().unwrap_or(0);
+        if n > 0 {
+            spans.push(Span::styled(
+                format!("  ⓘ -{n} (type mismatch)"),
+                warn,
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     let para = Paragraph::new(lines);
