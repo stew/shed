@@ -5,18 +5,30 @@
 //! walks the byte stream via `vte` and produces `ratatui::text::Line`s with
 //! `Span`s carrying the corresponding `Style`.
 //!
-//! What we honor:
-//! - SGR (CSI `m`): foreground/background colors (8-color, bright, 8-bit
-//!   indexed, 24-bit RGB), bold, dim, italic, underlined, reversed,
+//! Internally each line is a `Vec<(char, Style)>` with a cursor column,
+//! so that single-line cursor effects work:
+//!
+//! - **SGR** (CSI `m`): foreground/background colors (8-color, bright,
+//!   8-bit indexed, 24-bit RGB), bold, dim, italic, underlined, reversed,
 //!   crossed-out.
-//! - `\n` starts a new line; `\r` is silently consumed (so PTY-emitted
-//!   `\r\n` collapses to `\n`); `\t` becomes a literal tab.
+//! - **`\r`** (carriage return): resets the column to 0, so subsequent
+//!   prints overwrite earlier characters on the same line. This is what
+//!   makes cargo's `Building (10%) … (100%)` progress bar collapse to
+//!   only the final state in the captured block.
+//! - **`\x1b[K`** (Erase in Line): truncates from cursor to end (param 0
+//!   or default), erases from start to cursor (param 1), or clears the
+//!   whole line (param 2). Combined with `\r` this is the standard
+//!   "rewrite this line" idiom.
+//! - **`\n`**: emits the current line into scrollback and resets.
+//! - **`\t`**: pads to the next tab stop (every 8 columns).
 //!
 //! What we drop:
-//! - Cursor positioning, line clears, scroll regions, alt-screen requests,
-//!   OSC sequences (window titles, hyperlinks, …) — anything that would
-//!   require a full terminal screen state. Programs that need that
-//!   (`top`, `vim`, `less`, …) trigger fullscreen handover instead.
+//! - Cursor up/down/left/right and absolute positioning. Multi-line cursor
+//!   manipulation needs full screen state, which is the next step beyond
+//!   v0. Programs that need it (`top`, `vim`, …) trigger fullscreen
+//!   handover instead.
+//! - Scroll regions, alt-screen requests (those auto-trigger handover),
+//!   OSC sequences (window titles, hyperlinks, …).
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -25,9 +37,7 @@ use ratatui::{
 use vte::{Params, Parser, Perform};
 
 /// Parse `bytes` as a stream of text + ANSI escape sequences and produce
-/// styled `Line`s suitable for ratatui rendering. SGR (color/style) is honored;
-/// cursor positioning, line clears, and other terminal control sequences are
-/// dropped. CR is silently consumed so PTY-output `\r\n` collapses to `\n`.
+/// styled `Line`s suitable for ratatui rendering.
 pub fn parse_to_lines(bytes: &[u8], indent: &str, max_lines: usize) -> ParsedPreview {
     let mut performer = AnsiToLines::new(indent.to_string());
     let mut parser = Parser::new();
@@ -59,8 +69,8 @@ pub struct ParsedPreview {
 struct AnsiToLines {
     indent: String,
     lines: Vec<Line<'static>>,
-    current_spans: Vec<Span<'static>>,
-    pending_text: String,
+    current_line: Vec<(char, Style)>,
+    cursor_col: usize,
     current_style: Style,
 }
 
@@ -69,32 +79,75 @@ impl AnsiToLines {
         Self {
             indent,
             lines: Vec::new(),
-            current_spans: Vec::new(),
-            pending_text: String::new(),
+            current_line: Vec::new(),
+            cursor_col: 0,
             current_style: Style::default(),
         }
     }
 
-    fn flush_text(&mut self) {
-        if !self.pending_text.is_empty() {
-            let text = std::mem::take(&mut self.pending_text);
-            self.current_spans.push(Span::styled(text, self.current_style));
-        }
+    fn finish_line(&mut self) {
+        let line = self.build_line();
+        self.lines.push(line);
+        self.current_line.clear();
+        self.cursor_col = 0;
     }
 
-    fn finish_line(&mut self) {
-        self.flush_text();
-        let mut spans = vec![Span::raw(self.indent.clone())];
-        spans.append(&mut self.current_spans);
-        self.lines.push(Line::from(spans));
+    /// Collapse the current cell array into a `Line` by merging
+    /// consecutive cells with the same `Style` into a single styled span.
+    fn build_line(&self) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if !self.indent.is_empty() {
+            spans.push(Span::raw(self.indent.clone()));
+        }
+        let mut run = String::new();
+        let mut run_style: Option<Style> = None;
+        for (ch, style) in &self.current_line {
+            if Some(*style) == run_style {
+                run.push(*ch);
+            } else {
+                if let Some(prev) = run_style {
+                    spans.push(Span::styled(std::mem::take(&mut run), prev));
+                }
+                run.push(*ch);
+                run_style = Some(*style);
+            }
+        }
+        if let Some(style) = run_style {
+            spans.push(Span::styled(run, style));
+        }
+        Line::from(spans)
     }
 
     fn finalize(&mut self) {
-        self.flush_text();
-        if !self.current_spans.is_empty() {
-            let mut spans = vec![Span::raw(self.indent.clone())];
-            spans.append(&mut self.current_spans);
-            self.lines.push(Line::from(spans));
+        if !self.current_line.is_empty() {
+            self.finish_line();
+        }
+    }
+
+    fn write_at_cursor(&mut self, c: char) {
+        if self.cursor_col < self.current_line.len() {
+            self.current_line[self.cursor_col] = (c, self.current_style);
+        } else {
+            while self.current_line.len() < self.cursor_col {
+                self.current_line.push((' ', Style::default()));
+            }
+            self.current_line.push((c, self.current_style));
+        }
+        self.cursor_col += 1;
+    }
+
+    fn erase_in_line(&mut self, params: &Params) {
+        let n = params.iter().flatten().copied().next().unwrap_or(0);
+        match n {
+            0 => self.current_line.truncate(self.cursor_col),
+            1 => {
+                let upper = self.cursor_col.min(self.current_line.len());
+                for cell in &mut self.current_line[..upper] {
+                    *cell = (' ', Style::default());
+                }
+            }
+            2 => self.current_line.clear(),
+            _ => {}
         }
     }
 
@@ -176,13 +229,19 @@ impl AnsiToLines {
 
 impl Perform for AnsiToLines {
     fn print(&mut self, c: char) {
-        self.pending_text.push(c);
+        self.write_at_cursor(c);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' => self.finish_line(),
-            b'\t' => self.pending_text.push('\t'),
+            b'\r' => self.cursor_col = 0,
+            b'\t' => {
+                let target = (self.cursor_col / 8 + 1) * 8;
+                while self.cursor_col < target {
+                    self.write_at_cursor(' ');
+                }
+            }
             _ => {}
         }
     }
@@ -194,9 +253,10 @@ impl Perform for AnsiToLines {
         _ignore: bool,
         action: char,
     ) {
-        if action == 'm' {
-            self.flush_text();
-            self.apply_sgr(params);
+        match action {
+            'm' => self.apply_sgr(params),
+            'K' => self.erase_in_line(params),
+            _ => {}
         }
     }
 }
@@ -241,6 +301,10 @@ fn extended_color_8bit(n: u8) -> Color {
 mod tests {
     use super::*;
 
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
     fn plain_text_makes_one_line_per_newline() {
         let p = parse_to_lines(b"alpha\nbeta\n", "  ", 10);
@@ -249,9 +313,11 @@ mod tests {
     }
 
     #[test]
-    fn cr_is_silently_consumed() {
+    fn cr_lf_collapses_to_a_single_line_break() {
         let p = parse_to_lines(b"alpha\r\nbeta\r\n", "  ", 10);
         assert_eq!(p.total, 2);
+        assert_eq!(line_text(&p.lines[0]), "  alpha");
+        assert_eq!(line_text(&p.lines[1]), "  beta");
     }
 
     #[test]
@@ -266,7 +332,6 @@ mod tests {
     fn sgr_red_emits_styled_span() {
         let p = parse_to_lines(b"\x1b[31mred\x1b[0m\n", "", 10);
         assert_eq!(p.total, 1);
-        // First line should contain a span styled red somewhere.
         let any_red = p.lines.iter().any(|l| {
             l.spans.iter().any(|s| s.style.fg == Some(Color::Red))
         });
@@ -275,9 +340,53 @@ mod tests {
 
     #[test]
     fn cursor_moves_are_dropped() {
-        // \x1b[2J = clear screen; \x1b[H = home; \x1b[K = clear line.
-        // None of these should produce extra lines or visible text.
         let p = parse_to_lines(b"\x1b[2J\x1b[Hhello\x1b[K\nworld\n", "", 10);
         assert_eq!(p.total, 2);
+    }
+
+    #[test]
+    fn cr_overwrites_existing_chars_on_same_line() {
+        // "hello" → \r → "XY" overwrites first two chars → final "XYllo".
+        let p = parse_to_lines(b"hello\rXY\n", "", 10);
+        assert_eq!(p.total, 1);
+        assert_eq!(line_text(&p.lines[0]), "XYllo");
+    }
+
+    #[test]
+    fn cr_plus_erase_line_then_write_replaces_line() {
+        let p = parse_to_lines(b"hello\r\x1b[Kworld\n", "", 10);
+        assert_eq!(line_text(&p.lines[0]), "world");
+    }
+
+    #[test]
+    fn cargo_style_progress_bar_collapses_to_final_state() {
+        let input =
+            b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
+        let p = parse_to_lines(input, "", 10);
+        assert_eq!(p.total, 2);
+        assert_eq!(line_text(&p.lines[0]), "Building (100%)");
+        assert_eq!(line_text(&p.lines[1]), "Done");
+    }
+
+    #[test]
+    fn tab_expands_to_next_multiple_of_eight() {
+        let p = parse_to_lines(b"a\tb\n", "", 10);
+        assert_eq!(line_text(&p.lines[0]), "a       b");
+    }
+
+    #[test]
+    fn sgr_color_persists_after_overwrite() {
+        // First write "hello" in red, \r, write "X" in default style. Cell 0
+        // should be 'X' with default style; cells 1-4 stay red.
+        let p = parse_to_lines(b"\x1b[31mhello\x1b[0m\rX\n", "", 10);
+        assert_eq!(line_text(&p.lines[0]), "Xello");
+        // The 'X' span should NOT be red.
+        let first_char_red = p.lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "X")
+            .map(|s| s.style.fg == Some(Color::Red))
+            .unwrap_or(false);
+        assert!(!first_char_red, "X should be in default style, not red");
     }
 }

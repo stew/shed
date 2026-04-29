@@ -231,39 +231,61 @@ fn require_bytes(input: PipelineValue) -> Result<Bytes, FilterError> {
     }
 }
 
-// Strip ANSI escape sequences (CSI and OSC) and stray CR bytes. Parsers see
-// clean text regardless of whether the upstream capture came from a pipe (no
-// escapes) or a PTY (terminal-aware programs emit colors).
+// Strip ANSI escape sequences (CSI and OSC) and apply per-line cursor
+// effects (\r and \x1b[K), so parsers see the *final* state of each line —
+// not the intermediate steps from carriage-return-driven progress bars
+// like cargo's "Building (10%) … (50%) … (100%)". Cursor-up and other
+// multi-line cursor sequences are still dropped (full vt100 emulation
+// is the next step beyond v0).
 fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
+    let input = String::from_utf8_lossy(bytes);
+    let chars: Vec<char> = input.chars().collect();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut line: Vec<char> = Vec::new();
+    let mut pos: usize = 0;
     let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0x1b {
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\x1b' {
             i += 1;
-            if i >= bytes.len() {
+            if i >= chars.len() {
                 break;
             }
-            match bytes[i] {
-                b'[' => {
+            match chars[i] {
+                '[' => {
                     i += 1;
-                    while i < bytes.len() && !matches!(bytes[i], 0x40..=0x7E) {
+                    let csi_start = i;
+                    while i < chars.len() {
+                        let ch = chars[i] as u32;
+                        if (0x40..=0x7E).contains(&ch) {
+                            break;
+                        }
                         i += 1;
                     }
-                    if i < bytes.len() {
+                    if i < chars.len() {
+                        let action = chars[i];
+                        if action == 'K' {
+                            let params: String = chars[csi_start..i].iter().collect();
+                            let n: u32 = params
+                                .split(';')
+                                .next()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            erase_in_line(&mut line, pos, n);
+                        }
                         i += 1;
                     }
                 }
-                b']' => {
+                ']' => {
                     i += 1;
-                    while i < bytes.len() {
-                        if bytes[i] == 0x07 {
+                    while i < chars.len() {
+                        if chars[i] == '\x07' {
                             i += 1;
                             break;
                         }
-                        if bytes[i] == 0x1b
-                            && i + 1 < bytes.len()
-                            && bytes[i + 1] == b'\\'
+                        if chars[i] == '\x1b'
+                            && i + 1 < chars.len()
+                            && chars[i + 1] == '\\'
                         {
                             i += 2;
                             break;
@@ -273,14 +295,49 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
                 }
                 _ => i += 1,
             }
-        } else if b == b'\r' {
+        } else if c == '\r' {
+            pos = 0;
+            i += 1;
+        } else if c == '\n' {
+            for ch in &line {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            out.push(b'\n');
+            line.clear();
+            pos = 0;
             i += 1;
         } else {
-            out.push(b);
+            if pos < line.len() {
+                line[pos] = c;
+            } else {
+                while line.len() < pos {
+                    line.push(' ');
+                }
+                line.push(c);
+            }
+            pos += 1;
             i += 1;
         }
     }
+    for ch in &line {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
     out
+}
+
+fn erase_in_line(line: &mut Vec<char>, pos: usize, n: u32) {
+    match n {
+        0 => line.truncate(pos),
+        1 => {
+            for j in 0..pos.min(line.len()) {
+                line[j] = ' ';
+            }
+        }
+        2 => line.clear(),
+        _ => {}
+    }
 }
 
 fn require_list(input: PipelineValue) -> Result<Vec<Value>, FilterError> {
@@ -1011,6 +1068,36 @@ mod tests {
     fn strip_ansi_drops_osc_and_cr() {
         let input = b"\x1b]0;title\x07hello\r\nworld\r\n";
         assert_eq!(strip_ansi(input), b"hello\nworld\n");
+    }
+
+    #[test]
+    fn strip_ansi_carriage_return_overwrites_partial() {
+        // hello → \r → XY overwrites first two chars → "XYllo"
+        assert_eq!(strip_ansi(b"hello\rXY\n"), b"XYllo\n");
+    }
+
+    #[test]
+    fn strip_ansi_clear_to_end_after_cr_starts_fresh_line() {
+        assert_eq!(strip_ansi(b"hello\r\x1b[Kworld\n"), b"world\n");
+    }
+
+    #[test]
+    fn strip_ansi_progress_bar_keeps_only_last_state() {
+        // Cargo-style progress: each \r\x1b[K rewrites the same line;
+        // the parsed "logical" line is just the final 100% version.
+        let input =
+            b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
+        assert_eq!(strip_ansi(input), b"Building (100%)\nDone\n");
+    }
+
+    #[test]
+    fn from_lines_collapses_progress_bar() {
+        let pipeline = vec![FilterSpec::FromLines];
+        let result = run(
+            &pipeline,
+            b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n",
+        );
+        assert_eq!(lines_of(result), vec!["Building (100%)", "Done"]);
     }
 
     #[test]

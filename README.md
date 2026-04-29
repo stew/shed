@@ -313,9 +313,10 @@ Known gaps and likely next steps, in rough priority order:
 - Predicate negation in the `where` form (the data model has
   `Predicate::Not`; the form has `≠` for compares but no negation
   for `matches`/`contains`)
-- vt100 emulation for cursor-positioning programs (cargo progress
-  bars, etc.) — captured output currently shows the
-  flattened-and-stacked version
+- Multi-line cursor manipulation (cursor up / absolute position).
+  Single-line cursor effects (`\r`, `\x1b[K`, `\t`) now collapse
+  cargo-style progress bars; tools that update several lines via
+  cursor up still produce stacked output.
 - Persistent prompt history (currently in-memory only; lost on quit)
 - Command palette (universal `Space` / `Ctrl-K` action menu)
 - Saved/named pipelines as reusable computations
