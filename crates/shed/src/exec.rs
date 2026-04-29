@@ -45,7 +45,34 @@ pub enum ExecError {
 }
 
 pub type Killer = Box<dyn ChildKiller + Send + Sync>;
-pub type ExecHandle = JoinHandle<Result<Capture, ExecError>>;
+pub type ExecHandle = JoinHandle<Result<CaptureOutcome, ExecError>>;
+
+/// What a finished PTY reader task hands back.
+///
+/// `Captured` is the normal case — the child ran, output was captured, the
+/// child exited. `NeededFullscreen` means the reader spotted an alt-screen
+/// enter sequence (`\x1b[?1049h` and friends) in the byte stream, killed
+/// the PTY child, and is signaling the TUI to retry as a fullscreen
+/// handover. The TUI keeps the original block's id, swaps in inherited
+/// stdio, and runs the program with full terminal control.
+#[derive(Debug)]
+pub enum CaptureOutcome {
+    Captured(Capture),
+    NeededFullscreen,
+}
+
+const ALT_SCREEN_PATTERNS: &[&[u8]] = &[
+    b"\x1b[?1049h",
+    b"\x1b[?1047h",
+    b"\x1b[?47h",
+];
+
+/// Search a byte slice for any alt-screen-enter sequence.
+pub fn contains_alt_screen(haystack: &[u8]) -> bool {
+    ALT_SCREEN_PATTERNS
+        .iter()
+        .any(|p| haystack.windows(p.len()).any(|w| w == *p))
+}
 
 /// Spawn a command attached to a pseudo-terminal. Returns a JoinHandle for the
 /// blocking task that captures output AND a separate killer that lets the
@@ -70,7 +97,7 @@ fn run_blocking(
     argv: Vec<String>,
     cap_bytes: usize,
     killer_tx: oneshot::Sender<Result<Killer, ExecError>>,
-) -> Result<Capture, ExecError> {
+) -> Result<CaptureOutcome, ExecError> {
     let started_at = Instant::now();
 
     let pty_system = native_pty_system();
@@ -122,46 +149,44 @@ fn run_blocking(
         .master
         .try_clone_reader()
         .map_err(|e| ExecError::Io(e.to_string()))?;
-    let (buf, truncated) =
-        read_capped_blocking(&mut reader, cap_bytes).map_err(|e| ExecError::Io(e.to_string()))?;
 
-    let exit_status = child.wait().map_err(|e| ExecError::Wait(e.to_string()))?;
-    let finished_at = Instant::now();
-
-    let exit_code = if exit_status.success() {
-        0
-    } else {
-        exit_status.exit_code() as i32
-    };
-
-    Ok(Capture {
-        stdout: Bytes::from(buf),
-        stderr: Bytes::new(),
-        exit_code: Some(exit_code),
-        started_at,
-        finished_at: Some(finished_at),
-        truncated,
-        snapshotted: false,
-    })
-}
-
-fn read_capped_blocking<R: Read>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut truncated = false;
+    let mut tail: Vec<u8> = Vec::new();
+    let mut needs_fullscreen = false;
+    // Longest pattern we look for, used for the chunk-boundary overlap window.
+    let overlap = ALT_SCREEN_PATTERNS
+        .iter()
+        .map(|p| p.len())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+
     loop {
         let n = match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
-            // PTY master sees the slave close as EIO on Linux.
             Err(e) if e.raw_os_error() == Some(5) => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(ExecError::Io(e.to_string())),
         };
+
+        let mut combined = Vec::with_capacity(tail.len() + n);
+        combined.extend_from_slice(&tail);
+        combined.extend_from_slice(&chunk[..n]);
+        if contains_alt_screen(&combined) {
+            let _ = child.kill();
+            needs_fullscreen = true;
+            break;
+        }
+        let keep_from = combined.len().saturating_sub(overlap);
+        tail = combined[keep_from..].to_vec();
+
         if truncated {
             continue;
         }
-        let remaining = cap.saturating_sub(buf.len());
+        let remaining = cap_bytes.saturating_sub(buf.len());
         if n <= remaining {
             buf.extend_from_slice(&chunk[..n]);
         } else {
@@ -169,12 +194,41 @@ fn read_capped_blocking<R: Read>(reader: &mut R, cap: usize) -> std::io::Result<
             truncated = true;
         }
     }
-    Ok((buf, truncated))
+
+    let exit_status = child.wait().map_err(|e| ExecError::Wait(e.to_string()))?;
+    let finished_at = Instant::now();
+
+    if needs_fullscreen {
+        return Ok(CaptureOutcome::NeededFullscreen);
+    }
+
+    let exit_code = if exit_status.success() {
+        0
+    } else {
+        exit_status.exit_code() as i32
+    };
+
+    Ok(CaptureOutcome::Captured(Capture {
+        stdout: Bytes::from(buf),
+        stderr: Bytes::new(),
+        exit_code: Some(exit_code),
+        started_at,
+        finished_at: Some(finished_at),
+        truncated,
+        snapshotted: false,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unwrap_captured(o: CaptureOutcome) -> Capture {
+        match o {
+            CaptureOutcome::Captured(c) => c,
+            CaptureOutcome::NeededFullscreen => panic!("expected Captured"),
+        }
+    }
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code() {
@@ -184,8 +238,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let capture = handle.await.unwrap().unwrap();
-        // PTY adds CRLF, so we see \r\n instead of \n.
+        let capture = unwrap_captured(handle.await.unwrap().unwrap());
         let s = String::from_utf8_lossy(&capture.stdout);
         assert!(s.contains("a") && s.contains("b") && s.contains("c"));
         assert_eq!(capture.exit_code, Some(0));
@@ -196,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn captures_nonzero_exit() {
         let (handle, _killer) = spawn_command(vec!["false".into()], 1024).await.unwrap();
-        let capture = handle.await.unwrap().unwrap();
+        let capture = unwrap_captured(handle.await.unwrap().unwrap());
         assert_eq!(capture.exit_code, Some(1));
     }
 
@@ -208,10 +261,34 @@ mod tests {
         )
         .await
         .unwrap();
-        let capture = handle.await.unwrap().unwrap();
+        let capture = unwrap_captured(handle.await.unwrap().unwrap());
         assert!(capture.truncated);
         assert_eq!(capture.stdout.len(), 64);
         assert_eq!(capture.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn alt_screen_detected_in_output_triggers_handover_signal() {
+        // printf emits a literal alt-screen-enter sequence; the reader
+        // should detect it and return NeededFullscreen.
+        let (handle, _killer) = spawn_command(
+            vec!["printf".into(), "\\x1b[?1049hhello".into()],
+            1024,
+        )
+        .await
+        .unwrap();
+        let outcome = handle.await.unwrap().unwrap();
+        assert!(matches!(outcome, CaptureOutcome::NeededFullscreen));
+    }
+
+    #[test]
+    fn contains_alt_screen_finds_known_patterns() {
+        assert!(contains_alt_screen(b"prefix\x1b[?1049hpostfix"));
+        assert!(contains_alt_screen(b"\x1b[?1047h"));
+        assert!(contains_alt_screen(b"\x1b[?47h"));
+        assert!(!contains_alt_screen(b"plain text"));
+        assert!(!contains_alt_screen(b"\x1b[?1049l")); // leave, not enter
+        assert!(!contains_alt_screen(b"\x1b[31mred\x1b[0m"));
     }
 
     #[tokio::test]

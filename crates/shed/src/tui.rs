@@ -53,19 +53,28 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Block, BlockId, BlockState, Capture, CompareOp, Filter, FilterSpec, PipelineValue, Predicate,
+    Block, BlockId, BlockState, CompareOp, Filter, FilterSpec, PipelineValue, Predicate,
     Session, SortDirection, SortKey, Value, apply_with_notes,
 };
 use tokio::task::JoinHandle;
 
 use crate::ansi;
-use crate::exec::{self, ExecError, Killer};
+use crate::exec::{self, CaptureOutcome, ExecError, Killer};
 
-type CommandTask = JoinHandle<Result<Capture, ExecError>>;
+type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
 
 struct RunningCommand {
     handle: CommandTask,
     killer: Killer,
+}
+
+#[derive(Debug, Clone)]
+struct HandoverRequest {
+    argv: Vec<String>,
+    /// If `Some`, reuse this block's id (for auto-handover after
+    /// alt-screen detection); if `None`, allocate a new one (for
+    /// user-initiated handover via blacklist or `!` prefix).
+    reuse_block: Option<BlockId>,
 }
 
 const MAX_SORT_KEYS: usize = 5;
@@ -907,7 +916,7 @@ struct App {
     flash: Option<String>,
     quit: bool,
     running: HashMap<BlockId, RunningCommand>,
-    pending_handover: Option<Vec<String>>,
+    pending_handover: Option<HandoverRequest>,
 }
 
 impl Drop for App {
@@ -990,8 +999,8 @@ pub async fn run() -> io::Result<()> {
 async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut app = App::new();
     loop {
-        if let Some(argv) = app.pending_handover.take() {
-            perform_handover(terminal, &mut app, argv).await?;
+        if let Some(req) = app.pending_handover.take() {
+            perform_handover(terminal, &mut app, req).await?;
         }
         reap_completed(&mut app).await;
         terminal.draw(|f| draw(f, &app))?;
@@ -1012,13 +1021,16 @@ async fn app_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 async fn perform_handover(
     terminal: &mut DefaultTerminal,
     app: &mut App,
-    argv: Vec<String>,
+    req: HandoverRequest,
 ) -> io::Result<()> {
     ratatui::restore();
 
-    let id = app.session.add_block(argv.clone());
-    let status_result = tokio::process::Command::new(&argv[0])
-        .args(&argv[1..])
+    let id = match req.reuse_block {
+        Some(existing) => existing,
+        None => app.session.add_block(req.argv.clone()),
+    };
+    let status_result = tokio::process::Command::new(&req.argv[0])
+        .args(&req.argv[1..])
         .status()
         .await;
 
@@ -1033,6 +1045,9 @@ async fn perform_handover(
             app.session
                 .set_state(id, BlockState::Failed(format!("spawn: {e}")));
         }
+    }
+    if req.reuse_block.is_some() {
+        app.flash = Some(format!("%{} switched to fullscreen mode", id.0));
     }
     Ok(())
 }
@@ -1049,10 +1064,28 @@ async fn reap_completed(app: &mut App) {
             continue;
         };
         match cmd.handle.await {
-            Ok(Ok(capture)) => {
+            Ok(Ok(CaptureOutcome::Captured(capture))) => {
                 let exit = capture.exit_code.unwrap_or(-1);
                 app.session.set_capture(id, capture);
                 app.session.set_state(id, BlockState::Done(exit));
+            }
+            Ok(Ok(CaptureOutcome::NeededFullscreen)) => {
+                let argv = app
+                    .session
+                    .block(id)
+                    .map(|b| b.argv.clone())
+                    .unwrap_or_default();
+                if argv.is_empty() {
+                    app.session.set_state(
+                        id,
+                        BlockState::Failed("alt-screen detected, argv missing".into()),
+                    );
+                } else {
+                    app.pending_handover = Some(HandoverRequest {
+                        argv,
+                        reuse_block: Some(id),
+                    });
+                }
             }
             Ok(Err(e)) => {
                 app.session.set_state(id, BlockState::Failed(e.to_string()));
@@ -1667,7 +1700,10 @@ async fn spawn_prompt(app: &mut App) {
     app.prompt.clear();
 
     if force_fullscreen || needs_fullscreen(&argv) {
-        app.pending_handover = Some(argv);
+        app.pending_handover = Some(HandoverRequest {
+            argv,
+            reuse_block: None,
+        });
         return;
     }
 

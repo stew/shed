@@ -144,9 +144,18 @@ tears down its TUI, runs the child with inherited stdio, restores. The
 block records the exit code with no captured output (`(no captured
 output)`).
 
-Detection is by built-in blacklist of common interactive programs. To
-force handover for anything not on the list, prefix the command with
-`!` — e.g., `!cargo run` if cargo's child wants the TTY.
+Detection has three paths, in order:
+- **Built-in blacklist** of common interactive programs — handover
+  before spawn.
+- **Explicit `!` prefix** — type `!cmd` to force handover for anything
+  not on the blacklist.
+- **Auto-detect at runtime** — the PTY reader watches each chunk for
+  alt-screen-enter sequences (`\x1b[?1049h` and the older
+  `\x1b[?47h` / `\x1b[?1047h`). If it sees one mid-capture, it kills
+  the child, signals the TUI, and the same block is retried with
+  inherited stdio. A flash message confirms: `%N switched to
+  fullscreen mode`. Means programs not on the blacklist (`htop` aliases,
+  custom TUIs, …) Just Work after the first attempt.
 
 ## Filter reference
 
@@ -300,8 +309,6 @@ Known gaps and likely next steps, in rough priority order:
 - Predicate negation in the `where` form (the data model has
   `Predicate::Not`; the form has `≠` for compares but no negation
   for `matches`/`contains`)
-- Alt-screen auto-handover — detect `\x1b[?1049h` mid-capture and
-  switch to handover mode
 - vt100 emulation for cursor-positioning programs (cargo progress
   bars, etc.) — captured output currently shows the
   flattened-and-stacked version
