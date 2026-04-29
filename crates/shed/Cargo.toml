@@ -1,0 +1,14 @@
+[package]
+name = "shed"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "An interactive shell with retroactive pipelines"
+
+[[bin]]
+name = "shed"
+path = "src/main.rs"
+
+[dependencies]
+shed-core.workspace = true

@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/shed-core", "crates/shed"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+shed-core = { path = "crates/shed-core" }
