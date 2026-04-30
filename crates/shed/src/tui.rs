@@ -115,6 +115,7 @@ fn needs_fullscreen(argv: &[String]) -> bool {
 const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const PREVIEW_LINES: usize = 8;
+const MAX_UNDO_DEPTH: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -442,6 +443,22 @@ const ACTIONS: &[Action] = &[
         enabled: always_enabled,
         handler: |app| {
             open_alias_manage(app);
+        },
+    },
+    Action {
+        name: "Undo",
+        description: "Reverse the most recent structural change to the notebook",
+        enabled: |app| !app.undo_stack.is_empty(),
+        handler: |app| {
+            undo(app);
+        },
+    },
+    Action {
+        name: "Redo",
+        description: "Re-apply the most recently undone change",
+        enabled: |app| !app.redo_stack.is_empty(),
+        handler: |app| {
+            redo(app);
         },
     },
 ];
@@ -1437,6 +1454,15 @@ struct App {
     /// While `Some`, the next chain item won't start. Cleared once the
     /// block reaches a terminal state.
     chain_in_flight: Option<BlockId>,
+    /// Snapshots taken before each structural mutation. Bounded; oldest
+    /// drops first when full. Captures are shared via `bytes::Bytes`
+    /// refcounting so the memory cost is roughly one BTreeMap clone per
+    /// entry.
+    undo_stack: Vec<Session>,
+    /// Snapshots that were undone past. Cleared on every fresh
+    /// structural mutation so redo only chains forward through actual
+    /// undos.
+    redo_stack: Vec<Session>,
     /// Save-as input bar (Ctrl-S without a bound path).
     save_input_mode: bool,
     save_input: String,
@@ -1517,6 +1543,8 @@ impl App {
             dirty: false,
             pending_run_chain: VecDeque::new(),
             chain_in_flight: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             save_input_mode: false,
             save_input: String::new(),
             open_input_mode: false,
@@ -1525,7 +1553,16 @@ impl App {
         }
     }
 
-    fn mark_dirty(&mut self) {
+    /// Snapshot the current session and push it onto the undo stack
+    /// before applying a structural mutation. Clears redo (any fresh
+    /// edit invalidates the redo path) and marks the notebook dirty.
+    /// Capped at `MAX_UNDO_DEPTH`; oldest entries drop first.
+    fn savepoint(&mut self) {
+        self.undo_stack.push(self.session.clone());
+        if self.undo_stack.len() > MAX_UNDO_DEPTH {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
         self.dirty = true;
     }
 
@@ -1655,8 +1692,8 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
         _ => {}
     }
 
+    app.savepoint();
     let id = app.session.add_block(req.argv.clone());
-    app.mark_dirty();
     if !req.pipeline.is_empty() {
         if let Some(block) = app.session.block_mut(id) {
             block.pipeline = req.pipeline;
@@ -1814,13 +1851,14 @@ fn commit_cmd_edit(app: &mut App) {
         return;
     }
     let Some(id) = app.session.cursor() else { return };
-    if let Some(block) = app.session.block_mut(id) {
-        block.argv = argv;
-    } else {
+    if app.session.block(id).is_none() {
         return;
     }
+    app.savepoint();
+    if let Some(block) = app.session.block_mut(id) {
+        block.argv = argv;
+    }
     app.command_focused = false;
-    app.mark_dirty();
     queue_edit_chain(app, id);
 }
 
@@ -1929,10 +1967,10 @@ fn populate_snapshot(app: &mut App, id: BlockId, name: &str) {
 /// (along with any deps) on the run chain. The actual snapshot runs from
 /// `perform_run_in_place` so the source's pipeline output is fresh.
 fn spawn_pinned_snapshot(app: &mut App, name: &str) {
+    app.savepoint();
     let argv = vec![format!("@{name}")];
     let id = app.session.add_block(argv);
     app.session.set_state(id, BlockState::Idle);
-    app.mark_dirty();
     queue_run_chain(app, id);
 }
 
@@ -1945,6 +1983,10 @@ fn delete_block_at_cursor(app: &mut App) {
         app.flash = Some("no block selected".into());
         return;
     };
+    if app.session.block(id).is_none() {
+        return;
+    }
+    app.savepoint();
     if let Some(mut cmd) = app.running.remove(&id) {
         let _ = cmd.killer.kill();
         cmd.handle.abort();
@@ -1964,7 +2006,6 @@ fn delete_block_at_cursor(app: &mut App) {
     if removed.is_none() {
         return;
     }
-    app.mark_dirty();
     app.session.set_cursor(next_cursor);
     if next_cursor.is_some() {
         app.reset_pipeline_cursor();
@@ -2008,7 +2049,6 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
 
     if is_pinned_ref(&argv) {
         let name = argv[0][1..].to_string();
-        app.mark_dirty();
         populate_snapshot(app, id, &name);
         return;
     }
@@ -2048,7 +2088,6 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
         b.capture = None;
         b.state = BlockState::Running;
     }
-    app.mark_dirty();
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer)) => {
             app.running.insert(id, RunningCommand { handle, killer });
@@ -2069,7 +2108,7 @@ async fn perform_handover(
     let id = match req.reuse_block {
         Some(existing) => existing,
         None => {
-            app.mark_dirty();
+            app.savepoint();
             app.session.add_block(req.argv.clone())
         }
     };
@@ -2189,6 +2228,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
                 begin_open(app);
                 return;
             }
+            KeyCode::Char('z') => {
+                undo(app);
+                return;
+            }
+            KeyCode::Char('y') => {
+                redo(app);
+                return;
+            }
             _ => {}
         }
     }
@@ -2202,6 +2249,88 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         Focus::Palette => handle_palette_key(app, key),
         Focus::NoteEdit => handle_note_edit_key(app, key),
         Focus::AliasManage => handle_alias_manage_key(app, key),
+    }
+}
+
+/// Pop the latest savepoint and restore it as the active session. The
+/// previous current session is pushed onto the redo stack so the user
+/// can roll forward again. Captures and run-state of any blocks that
+/// exist in both versions are *preserved* — undo only reverts the
+/// structural fields (argv, name, pipeline, pre/post-text, cursor) so
+/// you don't lose freshly produced output. Blocks that the snapshot
+/// resurrects come back with whatever capture they had at snapshot time.
+fn undo(app: &mut App) {
+    let Some(prev) = app.undo_stack.pop() else {
+        app.flash = Some("nothing to undo".into());
+        return;
+    };
+    let current = app.session.clone();
+    app.redo_stack.push(current);
+    apply_snapshot(app, prev);
+    app.dirty = true;
+    app.flash = Some("undid last change".into());
+}
+
+fn redo(app: &mut App) {
+    let Some(next) = app.redo_stack.pop() else {
+        app.flash = Some("nothing to redo".into());
+        return;
+    };
+    let current = app.session.clone();
+    app.undo_stack.push(current);
+    apply_snapshot(app, next);
+    app.dirty = true;
+    app.flash = Some("redid".into());
+}
+
+/// Replace `app.session` with `snap`, then patch live runtime state
+/// (capture, run-state, last_touched) from the previous current onto
+/// any block whose id survives in the restored session. Finishes by
+/// sanitizing app-level state that may now reference vanished blocks.
+fn apply_snapshot(app: &mut App, snap: Session) {
+    let prev = std::mem::replace(&mut app.session, snap);
+    let ids: Vec<BlockId> = app.session.blocks().map(|b| b.id).collect();
+    for id in ids {
+        if let Some(prev_block) = prev.block(id) {
+            let cap = prev_block.capture.clone();
+            let st = prev_block.state.clone();
+            let lt = prev_block.last_touched;
+            if let Some(restored) = app.session.block_mut(id) {
+                restored.capture = cap;
+                restored.state = st;
+                restored.last_touched = lt;
+            }
+        }
+    }
+    sanitize_after_restore(app);
+}
+
+/// Drop app-level references to blocks that may not exist after a
+/// snapshot restore: pending run-chain entries, the in-flight chain
+/// slot, the cursor, child processes whose blocks vanished. Also
+/// rebases `pipeline_cursor` on the (possibly new) cursor block.
+fn sanitize_after_restore(app: &mut App) {
+    if let Some(id) = app.session.cursor() {
+        if app.session.block(id).is_none() {
+            app.session.set_cursor(app.newest_block_id());
+        }
+    }
+    app.command_focused = false;
+    app.reset_pipeline_cursor();
+    app.pending_run_chain.clear();
+    app.chain_in_flight = None;
+    let session_ids: HashSet<BlockId> = app.session.blocks().map(|b| b.id).collect();
+    let orphans: Vec<BlockId> = app
+        .running
+        .keys()
+        .copied()
+        .filter(|id| !session_ids.contains(id))
+        .collect();
+    for id in orphans {
+        if let Some(mut cmd) = app.running.remove(&id) {
+            let _ = cmd.killer.kill();
+            cmd.handle.abort();
+        }
     }
 }
 
@@ -2732,10 +2861,10 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('u') => {
             if let Some(id) = app.session.cursor() {
                 let was_named = app.session.block(id).and_then(|b| b.name.clone());
-                app.session.unpin(id);
                 if was_named.is_some() {
-                    app.mark_dirty();
+                    app.savepoint();
                 }
+                app.session.unpin(id);
                 app.flash = Some(match was_named {
                     Some(name) => format!("unpinned %{} (was @{})", id.0, name),
                     None => format!("%{} was not pinned", id.0),
@@ -2790,8 +2919,10 @@ fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
             app.focus = Focus::BlockCursor;
             app.command_focused = false;
         }
-        KeyCode::Left => move_filter_cursor(app, -1),
-        KeyCode::Right => move_filter_cursor(app, 1),
+        // Filters render vertically, so ↑↓ does the navigation that
+        // ←→ used to. ←→ are kept as aliases for muscle memory.
+        KeyCode::Up | KeyCode::Left => move_filter_cursor(app, -1),
+        KeyCode::Down | KeyCode::Right => move_filter_cursor(app, 1),
         KeyCode::Char('f') | KeyCode::Enter => {
             if app.command_focused {
                 open_cmd_edit(app);
@@ -2844,18 +2975,20 @@ fn commit_pin(app: &mut App) {
     let Some(id) = app.session.cursor() else { return };
 
     if name.is_empty() {
+        app.savepoint();
         app.session.unpin(id);
-        app.mark_dirty();
         app.flash = Some(format!("unpinned %{}", id.0));
         return;
     }
 
     let previous_owner = app.session.lookup_by_name(&name);
+    app.savepoint();
     if !app.session.pin(id, name.clone()) {
+        // Restore: pop the savepoint we just pushed since nothing changed.
+        app.undo_stack.pop();
         app.flash = Some(format!("pin failed: unknown block %{}", id.0));
         return;
     }
-    app.mark_dirty();
 
     app.flash = Some(match previous_owner {
         Some(prev) if prev != id => format!("pinned %{} as @{} (was on %{})", id.0, name, prev.0),
@@ -3686,6 +3819,12 @@ fn apply_filter_edit(app: &mut App) {
     };
     let id = state.block_id;
     let mode = state.mode;
+    if app.session.block(id).is_none() {
+        app.filter_edit = None;
+        app.focus = Focus::BlockCursor;
+        return;
+    }
+    app.savepoint();
     if let Some(block) = app.session.block_mut(id) {
         match mode {
             EditMode::Add => block.pipeline.push(spec),
@@ -3697,36 +3836,48 @@ fn apply_filter_edit(app: &mut App) {
             }
         }
     }
-    app.mark_dirty();
     app.filter_edit = None;
-    app.focus = Focus::BlockCursor;
+    app.focus = Focus::EditBlock;
     app.reset_pipeline_cursor();
 }
 
 fn move_filter_in_pipeline(app: &mut App, delta: i32) {
     let Some(id) = app.session.cursor() else { return };
     let pos = app.pipeline_cursor;
-    let Some(block) = app.session.block_mut(id) else { return };
-    if pos >= block.pipeline.len() {
+    let len = match app.session.block(id) {
+        Some(b) => b.pipeline.len(),
+        None => return,
+    };
+    if pos >= len {
         return; // Cursor is on the `+ add` slot, nothing to move.
     }
     let new_pos_signed = pos as i32 + delta;
-    if new_pos_signed < 0 || new_pos_signed as usize >= block.pipeline.len() {
+    if new_pos_signed < 0 || new_pos_signed as usize >= len {
         return;
     }
     let new_pos = new_pos_signed as usize;
-    block.pipeline.swap(pos, new_pos);
+    app.savepoint();
+    if let Some(block) = app.session.block_mut(id) {
+        block.pipeline.swap(pos, new_pos);
+    }
     app.pipeline_cursor = new_pos;
-    app.mark_dirty();
 }
 
 fn drop_filter_at_cursor(app: &mut App) {
     let Some(id) = app.session.cursor() else { return };
     let cursor = app.pipeline_cursor;
+    let pipeline_empty = app
+        .session
+        .block(id)
+        .map(|b| b.pipeline.is_empty())
+        .unwrap_or(true);
+    if pipeline_empty {
+        app.flash = Some("no filters to drop".into());
+        return;
+    }
+    app.savepoint();
     let dropped = if let Some(block) = app.session.block_mut(id) {
-        if block.pipeline.is_empty() {
-            false
-        } else if cursor < block.pipeline.len() {
+        if cursor < block.pipeline.len() {
             block.pipeline.remove(cursor);
             true
         } else {
@@ -3737,9 +3888,9 @@ fn drop_filter_at_cursor(app: &mut App) {
         false
     };
     if !dropped {
+        // Nothing changed — pop the just-pushed savepoint.
+        app.undo_stack.pop();
         app.flash = Some("no filters to drop".into());
-    } else {
-        app.mark_dirty();
     }
     let new_len = app
         .session
@@ -3842,8 +3993,8 @@ async fn spawn_prompt(app: &mut App) {
         _ => {}
     }
 
+    app.savepoint();
     let id = app.session.add_block(argv.clone());
-    app.mark_dirty();
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer)) => {
             app.running.insert(id, RunningCommand { handle, killer });
@@ -3862,8 +4013,8 @@ async fn spawn_prompt(app: &mut App) {
 /// time. `cd -` swaps to the previous cwd (tracked in App, not via
 /// $OLDPWD env, to avoid the unsafe-set_var dance).
 fn run_cd_builtin(app: &mut App, argv: &[String]) {
+    app.savepoint();
     let id = app.session.add_block(argv.to_vec());
-    app.mark_dirty();
     let prev_cwd = std::env::current_dir().ok();
 
     let target: Result<PathBuf, String> = match argv.get(1).map(String::as_str) {
@@ -3920,21 +4071,17 @@ fn commit_note_edit(app: &mut App) {
     };
     let text = state.buffer_string();
     let new_value = if text.is_empty() { None } else { Some(text) };
-    if let Some(block) = app.session.block_mut(state.block_id) {
-        let changed = match state.position {
-            NotePosition::Pre => {
-                let prev = block.pre_text.clone();
-                block.pre_text = new_value.clone();
-                prev != new_value
+    let prev_value = app.session.block(state.block_id).and_then(|b| match state.position {
+        NotePosition::Pre => b.pre_text.clone(),
+        NotePosition::Post => b.post_text.clone(),
+    });
+    if prev_value != new_value {
+        app.savepoint();
+        if let Some(block) = app.session.block_mut(state.block_id) {
+            match state.position {
+                NotePosition::Pre => block.pre_text = new_value,
+                NotePosition::Post => block.post_text = new_value,
             }
-            NotePosition::Post => {
-                let prev = block.post_text.clone();
-                block.post_text = new_value.clone();
-                prev != new_value
-            }
-        };
-        if changed {
-            app.mark_dirty();
         }
     }
     app.focus = Focus::BlockCursor;
@@ -4194,8 +4341,8 @@ fn commit_env_input(app: &mut App) {
 /// KEY` (without `=`) is rejected — shed doesn't have POSIX's marked-for-
 /// export distinction since every var we hold is automatically inherited.
 fn run_export_builtin(app: &mut App, argv: &[String]) {
+    app.savepoint();
     let id = app.session.add_block(argv.to_vec());
-    app.mark_dirty();
     if argv.len() < 2 {
         app.session.set_state(
             id,
@@ -4232,8 +4379,8 @@ fn run_export_builtin(app: &mut App, argv: &[String]) {
 }
 
 fn run_unset_builtin(app: &mut App, argv: &[String]) {
+    app.savepoint();
     let id = app.session.add_block(argv.to_vec());
-    app.mark_dirty();
     if argv.len() < 2 {
         app.session.set_state(
             id,
@@ -4494,6 +4641,7 @@ fn confirm_alias_overwrite(app: &mut App, accept: bool) {
 /// Materialise an alias as a fresh Idle block and drop the user into
 /// in-place command edit so they can append args before running.
 fn spawn_alias(app: &mut App, alias: &Alias) {
+    app.savepoint();
     let id = app.session.add_block(alias.argv.clone());
     if let Some(block) = app.session.block_mut(id) {
         block.pipeline = alias.pipeline.clone();
@@ -4503,7 +4651,6 @@ fn spawn_alias(app: &mut App, alias: &Alias) {
     app.reset_pipeline_cursor();
     app.command_focused = true;
     app.focus = Focus::BlockCursor;
-    app.mark_dirty();
 
     let joined = shlex::try_join(alias.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| alias.argv.join(" "));
@@ -6379,6 +6526,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Ctrl-E", "env"),
             ("Ctrl-K", "palette"),
             ("Ctrl-S/O", "save/open"),
+            ("Ctrl-Z/Y", "undo/redo"),
             ("Esc", "focus block"),
             ("Ctrl-D", "quit"),
         ],
@@ -6395,17 +6543,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("n/N", "pre/post note"),
             ("/", "prompt"),
             ("Ctrl-S/O", "save/open"),
+            ("Ctrl-Z/Y", "undo/redo"),
             ("Ctrl-C", "cancel"),
             ("Esc", "prompt"),
             ("Ctrl-D", "quit"),
         ],
         Focus::EditBlock if app.command_focused => vec![
-            ("←→", "filters"),
+            ("↓", "filters"),
             ("f / Enter", "edit cmd"),
             ("Esc", "back"),
         ],
         Focus::EditBlock => vec![
-            ("←→", "cmd / filters"),
+            ("↑↓", "cmd / filters"),
             ("f / Enter", "edit"),
             ("i", "insert"),
             ("d", "drop"),
@@ -7336,7 +7485,7 @@ mod tests {
         app.history.clear();
         let id = app.session.add_block(vec!["echo".into(), "hi".into()]);
         app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
-        app.mark_dirty();
+        app.dirty = true;
         assert!(app.dirty);
 
         save_to_path(&mut app, &path);
@@ -7608,6 +7757,90 @@ mod tests {
         }
         commit_note_edit(&mut app);
         assert!(app.session.block(id).unwrap().pre_text.is_none());
+    }
+
+    #[test]
+    fn savepoint_pushes_clone_and_clears_redo() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        let _ = app.session.add_block(vec!["a".into()]);
+        // Pretend a previous redo path exists.
+        app.redo_stack.push(app.session.clone());
+        app.savepoint();
+        assert_eq!(app.undo_stack.len(), 1);
+        assert!(app.redo_stack.is_empty(), "savepoint clears redo");
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn undo_redo_round_trip_on_filter_add() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        let id = app.session.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        app.session.set_capture(id, Capture {
+            stdout: Bytes::from_static(b"1\n2\n3\n"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+        });
+        app.session.set_cursor(Some(id));
+
+        // Simulate adding a filter via savepoint + mutation.
+        app.savepoint();
+        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+
+        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 1);
+
+        undo(&mut app);
+        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 0);
+        // Capture preserved on undo (not lost when reverting structure).
+        assert!(app.session.block(id).unwrap().capture.is_some());
+
+        redo(&mut app);
+        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 1);
+        assert!(app.session.block(id).unwrap().capture.is_some());
+    }
+
+    #[test]
+    fn undo_resurrects_a_deleted_block() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        let id = app.session.add_block(vec!["echo".into(), "hi".into()]);
+        app.session.set_cursor(Some(id));
+
+        app.savepoint();
+        app.session.remove_block(id);
+        assert!(app.session.block(id).is_none());
+
+        undo(&mut app);
+        let resurrected = app.session.block(id).expect("block restored");
+        assert_eq!(resurrected.argv, vec!["echo", "hi"]);
+    }
+
+    #[test]
+    fn undo_with_empty_stack_flashes_and_no_panic() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        undo(&mut app);
+        assert!(app.flash.as_deref().unwrap_or("").contains("nothing"));
+    }
+
+    #[test]
+    fn savepoint_caps_at_max_depth() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        for _ in 0..(MAX_UNDO_DEPTH + 5) {
+            app.savepoint();
+        }
+        assert_eq!(app.undo_stack.len(), MAX_UNDO_DEPTH);
     }
 
     #[test]

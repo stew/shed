@@ -16,6 +16,12 @@ pub const DEFAULT_CAPTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// `Session` is pure data — it does not own running tasks, the TUI, or
 /// the terminal. The binary crate maintains its own `App` struct that
 /// wraps a `Session` plus I/O state.
+///
+/// `Clone` is derived so the binary crate can take cheap structural
+/// snapshots for undo / redo. `Capture` clones share underlying bytes
+/// via `bytes::Bytes` refcounting, so a snapshot of a session with
+/// large captures is small in additional memory.
+#[derive(Clone)]
 pub struct Session {
     blocks: BTreeMap<BlockId, Block>,
     next_id: u64,

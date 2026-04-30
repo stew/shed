@@ -246,6 +246,28 @@ Aliases are cross-session and not tied to any single notebook.
 Edit by re-invoking: type the alias, modify the argv / pipeline as
 needed, then `A` again with the same name and confirm overwrite.
 
+### Undo / redo
+
+`Ctrl-Z` and `Ctrl-Y` step backwards and forwards through every
+*structural* change you've made: adding a block, deleting a block,
+pinning / unpinning, editing the command, adding / dropping / reordering
+filters, editing pre / post notes, saving a block as an alias. The
+history is in-memory only (not persisted across sessions) and capped at
+50 entries.
+
+Captures and run-state are preserved across an undo/redo round-trip:
+adding a filter, undoing, and redoing won't reset your block to Idle —
+the output you've already produced stays put. The one exception is
+undoing the *creation* of a block: the block disappears (and so does
+its capture) until you redo. Resurrecting a deleted block via undo
+brings back its argv / pipeline / notes, but its capture comes back as
+whatever the snapshot held (no fresh run is triggered).
+
+Running a command (Space, Enter, re-snapshot of `@name`) is *not*
+undoable — re-runs are runtime, not structural, and don't dirty the
+notebook. Undo restores notebook structure; if you want to revert a
+re-run's output, save before re-running and reload.
+
 ### Notebooks
 
 A *notebook* is the saveable form of a session: an ordered list of
@@ -337,6 +359,7 @@ so you don't lose data without noticing.
 | Ctrl-K    | open the command palette |
 | Ctrl-S    | save notebook (input bar if no path bound) |
 | Ctrl-O    | open notebook (replaces the current session) |
+| Ctrl-Z / Ctrl-Y | undo / redo the most recent structural change (see Undo / redo) |
 
 ### BlockCursor
 
@@ -374,7 +397,7 @@ returns to BlockCursor for those.
 
 | Key       | Action |
 |-----------|--------|
-| `←→`      | navigate filters within the selected block (and the `+ add` slot). Pulling left at the first filter steps onto the command itself (highlighted in magenta); right returns to the filter row. |
+| `↑↓`      | navigate vertically through the command, each filter, and the `+ add` slot. `↑` at the first filter steps onto the command (highlighted in magenta); `↓` from the command returns to the filter list. `←→` are aliases for muscle memory. |
 | `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
 | `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
