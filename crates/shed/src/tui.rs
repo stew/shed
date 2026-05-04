@@ -1393,6 +1393,10 @@ struct App {
     prompt: String,
     history: Vec<String>,
     history_cursor: Option<usize>,
+    /// Active tab-completion cycle, or `None` if Tab hasn't been pressed
+    /// since the last edit. Cleared on any non-Tab key in a completion
+    /// context. See [`cycle_completion`].
+    completion: Option<CompletionState>,
     write_input_mode: bool,
     write_input: String,
     pin_input_mode: bool,
@@ -1503,6 +1507,7 @@ impl App {
             prompt: String::new(),
             history: load_history_from_default_path().unwrap_or_default(),
             history_cursor: None,
+            completion: None,
             write_input_mode: false,
             write_input: String::new(),
             pin_input_mode: false,
@@ -2597,13 +2602,296 @@ fn cancel_at_cursor(app: &mut App) -> bool {
     true
 }
 
+// === Tab completion =========================================================
+//
+// Two surfaces: the main Prompt and the in-place cmd-edit input bar.
+// Both append-only Strings (no mid-string cursor), so completion always
+// operates on the final whitespace-separated token. Tab cycles forward,
+// Shift-Tab cycles backward; any non-Tab key clears the cycle.
+//
+// Completion source by token shape (in order):
+//   $...   env var names
+//   @...   pinned block names  (only when the token starts with @)
+//   /...   slash commands       (Prompt focus, argv0 only)
+//   .../...    path completion  (anywhere with a path-shape)
+//   <argv0>    commands ∪ aliases ∪ builtins
+//   <argv1+>   path completion
+
+const COMPLETION_BUILTINS: &[&str] = &["cd", "exit", "quit", "export", "unset"];
+const COMPLETION_SLASH: &[&str] = &["/aliases"];
+
+#[derive(Debug, Clone)]
+struct CompletionState {
+    /// The unchanged prefix of the input. Each cycle re-renders the
+    /// input as `base_text + matches[idx]`.
+    base_text: String,
+    matches: Vec<String>,
+    idx: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionContext {
+    EnvVar,
+    Pinned,
+    Slash,
+    Argv0,
+    Path,
+}
+
+/// Split `text` into (everything before the final token, the final
+/// token). The final token starts after the last whitespace char.
+fn split_last_token(text: &str) -> (&str, &str) {
+    match text.rfind(char::is_whitespace) {
+        Some(idx) => {
+            let after = idx + text[idx..].chars().next().unwrap().len_utf8();
+            (&text[..after], &text[after..])
+        }
+        None => ("", text),
+    }
+}
+
+fn classify_completion(focus: Focus, base: &str, token: &str) -> CompletionContext {
+    if token.starts_with('$') {
+        return CompletionContext::EnvVar;
+    }
+    if token.starts_with('@') {
+        return CompletionContext::Pinned;
+    }
+    let argv0 = base.trim().is_empty();
+    if argv0 {
+        if focus == Focus::Prompt && token.starts_with('/') {
+            return CompletionContext::Slash;
+        }
+        if token.starts_with('/') || token.starts_with("./") || token.starts_with("../")
+            || token.starts_with("~/")
+        {
+            return CompletionContext::Path;
+        }
+        return CompletionContext::Argv0;
+    }
+    CompletionContext::Path
+}
+
+fn env_completions(token: &str) -> Vec<String> {
+    let prefix = &token[1..]; // strip $
+    let mut names: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with(prefix))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().map(|n| format!("${n}")).collect()
+}
+
+fn pinned_completions(session: &Session, token: &str) -> Vec<String> {
+    let prefix = &token[1..]; // strip @
+    let mut names: Vec<String> = session
+        .blocks()
+        .filter_map(|b| b.name.clone())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().map(|n| format!("@{n}")).collect()
+}
+
+fn slash_completions(token: &str) -> Vec<String> {
+    COMPLETION_SLASH
+        .iter()
+        .filter(|cmd| cmd.starts_with(token))
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn argv0_completions(aliases: &AliasFile, token: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    for b in COMPLETION_BUILTINS {
+        if b.starts_with(token) {
+            all.insert((*b).to_string());
+        }
+    }
+    for alias in &aliases.aliases {
+        if alias.name.starts_with(token) {
+            all.insert(alias.name.clone());
+        }
+    }
+    for cmd in path_executables(token) {
+        all.insert(cmd);
+    }
+    all.into_iter().collect()
+}
+
+fn path_executables(prefix: &str) -> Vec<String> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for dir in std::env::split_paths(&path) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            if !is_executable_entry(&entry) {
+                continue;
+            }
+            if seen.insert(name.clone()) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn is_executable_entry(entry: &std::fs::DirEntry) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    entry
+        .metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_entry(_entry: &std::fs::DirEntry) -> bool {
+    true
+}
+
+fn path_completions(token: &str) -> Vec<String> {
+    // dir_str is what we keep in the displayed match (so `~/` stays
+    // `~/`), dir_lookup is the actual filesystem path.
+    let (dir_str, prefix) = match token.rfind('/') {
+        Some(idx) => (&token[..=idx], &token[idx + 1..]),
+        None => ("", token),
+    };
+    let dir_lookup: PathBuf = if dir_str.is_empty() {
+        PathBuf::from(".")
+    } else if let Some(rest) = dir_str.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => {
+                let mut p = PathBuf::from(home);
+                p.push(rest);
+                p
+            }
+            None => PathBuf::from(dir_str),
+        }
+    } else {
+        PathBuf::from(dir_str)
+    };
+
+    let Ok(entries) = std::fs::read_dir(&dir_lookup) else {
+        return Vec::new();
+    };
+    let show_hidden = prefix.starts_with('.');
+    let mut rows: Vec<(String, bool)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(prefix) {
+                return None;
+            }
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            Some((name, is_dir))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.into_iter()
+        .map(|(name, is_dir)| {
+            let suffix = if is_dir { "/" } else { "" };
+            format!("{dir_str}{name}{suffix}")
+        })
+        .collect()
+}
+
+/// Compute the (base_text, matches) pair for completing `text` at the
+/// final token.
+fn compute_completions(
+    session: &Session,
+    aliases: &AliasFile,
+    focus: Focus,
+    text: &str,
+) -> (String, Vec<String>) {
+    let (base, token) = split_last_token(text);
+    let ctx = classify_completion(focus, base, token);
+    let matches = match ctx {
+        CompletionContext::EnvVar => env_completions(token),
+        CompletionContext::Pinned => pinned_completions(session, token),
+        CompletionContext::Slash => slash_completions(token),
+        CompletionContext::Argv0 => argv0_completions(aliases, token),
+        CompletionContext::Path => path_completions(token),
+    };
+    (base.to_string(), matches)
+}
+
+fn current_input_text(app: &App) -> Option<String> {
+    match app.focus {
+        Focus::Prompt => Some(app.prompt.clone()),
+        Focus::EditBlock if app.cmd_edit_input_mode => Some(app.cmd_edit_input.clone()),
+        _ => None,
+    }
+}
+
+fn set_current_input(app: &mut App, text: String) {
+    match app.focus {
+        Focus::Prompt => app.prompt = text,
+        Focus::EditBlock if app.cmd_edit_input_mode => app.cmd_edit_input = text,
+        _ => {}
+    }
+}
+
+/// Handle a Tab (dir = +1) or Shift-Tab (dir = -1) press in a
+/// completion context. On the first press, builds a fresh match list
+/// and applies the first match. Subsequent presses cycle through
+/// `app.completion.matches`.
+fn cycle_completion(app: &mut App, dir: i32) {
+    if app.completion.is_none() {
+        let Some(text) = current_input_text(app) else {
+            return;
+        };
+        let focus = app.focus;
+        let (base, matches) = compute_completions(&app.session, &app.aliases, focus, &text);
+        if matches.is_empty() {
+            app.flash = Some("no completions".into());
+            return;
+        }
+        set_current_input(app, format!("{base}{}", matches[0]));
+        app.completion = Some(CompletionState {
+            base_text: base,
+            matches,
+            idx: 0,
+        });
+        return;
+    }
+    let state = app.completion.as_mut().unwrap();
+    let n = state.matches.len() as isize;
+    state.idx = ((state.idx as isize + dir as isize).rem_euclid(n)) as usize;
+    let new_text = format!("{}{}", state.base_text, state.matches[state.idx]);
+    set_current_input(app, new_text);
+}
+
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
+    let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+    if !is_tab {
+        app.completion = None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         app.env_edit = Some(EnvEditState::new());
         app.focus = Focus::EnvEdit;
         return;
     }
     match key.code {
+        KeyCode::Tab => cycle_completion(app, 1),
+        KeyCode::BackTab => cycle_completion(app, -1),
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
                 app.session.set_cursor(Some(id));
@@ -2900,7 +3188,13 @@ fn enter_edit_block(app: &mut App) {
 /// to BlockCursor.
 fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
     if app.cmd_edit_input_mode {
+        let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+        if !is_tab {
+            app.completion = None;
+        }
         match key.code {
+            KeyCode::Tab => cycle_completion(app, 1),
+            KeyCode::BackTab => cycle_completion(app, -1),
             KeyCode::Esc => {
                 app.cmd_edit_input_mode = false;
                 app.cmd_edit_input.clear();
@@ -8043,5 +8337,179 @@ mod tests {
         // No RunningCommand entry → queues normally.
         run_cursor_block_in_place(&mut app);
         assert_eq!(app.pending_run_chain.front().copied(), Some(id));
+    }
+
+    // === tab completion ===
+
+    #[test]
+    fn split_last_token_handles_empty_and_whitespace() {
+        assert_eq!(split_last_token(""), ("", ""));
+        assert_eq!(split_last_token("git"), ("", "git"));
+        assert_eq!(split_last_token("git "), ("git ", ""));
+        assert_eq!(split_last_token("git ch"), ("git ", "ch"));
+        assert_eq!(split_last_token("a b c"), ("a b ", "c"));
+        assert_eq!(split_last_token("  ls"), ("  ", "ls"));
+    }
+
+    #[test]
+    fn classify_completion_picks_each_context() {
+        // env var anywhere
+        assert_eq!(
+            classify_completion(Focus::Prompt, "echo ", "$HO"),
+            CompletionContext::EnvVar
+        );
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "$HO"),
+            CompletionContext::EnvVar
+        );
+        // pinned anywhere a token starts with @
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "@lo"),
+            CompletionContext::Pinned
+        );
+        assert_eq!(
+            classify_completion(Focus::Prompt, "cat ", "@log"),
+            CompletionContext::Pinned
+        );
+        // slash only at argv0 in Prompt
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "/al"),
+            CompletionContext::Slash
+        );
+        // / outside Prompt at argv0 → path (cmd-edit can be /usr/bin/foo)
+        assert_eq!(
+            classify_completion(Focus::EditBlock, "", "/usr"),
+            CompletionContext::Path
+        );
+        // ./ at argv0 → path
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "./bu"),
+            CompletionContext::Path
+        );
+        // bare argv0
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "gi"),
+            CompletionContext::Argv0
+        );
+        // argv1+
+        assert_eq!(
+            classify_completion(Focus::Prompt, "git ", "ch"),
+            CompletionContext::Path
+        );
+    }
+
+    #[test]
+    fn pinned_completions_filters_by_prefix() {
+        let mut s = Session::new();
+        let a = s.add_block(vec!["a".into()]);
+        let b = s.add_block(vec!["b".into()]);
+        let c = s.add_block(vec!["c".into()]);
+        s.pin(a, "logs".into());
+        s.pin(b, "long".into());
+        s.pin(c, "other".into());
+        let got = pinned_completions(&s, "@lo");
+        assert_eq!(got, vec!["@logs".to_string(), "@long".to_string()]);
+        let none = pinned_completions(&s, "@zzz");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn slash_completions_returns_known_commands() {
+        let got = slash_completions("/al");
+        assert_eq!(got, vec!["/aliases".to_string()]);
+        let got = slash_completions("/x");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn argv0_completions_includes_builtins_and_aliases() {
+        let mut aliases = AliasFile::default();
+        aliases.upsert(Alias {
+            name: "exalt".into(),
+            argv: vec!["echo".into()],
+            pipeline: vec![],
+        });
+        // Use a prefix that overlaps a builtin and the alias.
+        let got = argv0_completions(&aliases, "ex");
+        assert!(got.iter().any(|s| s == "exit"), "got={got:?}");
+        assert!(got.iter().any(|s| s == "exalt"), "got={got:?}");
+        assert!(got.iter().any(|s| s == "export"), "got={got:?}");
+    }
+
+    #[test]
+    fn env_completions_pulls_from_environment() {
+        // SAFETY: test-only mutation; tests run on a single thread by
+        // default in cargo, but env mutation is racy if other tests
+        // read $TAB_COMPLETION_TEST_VAR concurrently. The name is
+        // unique enough that we accept the risk.
+        unsafe {
+            std::env::set_var("TAB_COMPLETION_TEST_VAR", "1");
+        }
+        let got = env_completions("$TAB_COMPLETION_TEST");
+        assert!(
+            got.iter().any(|s| s == "$TAB_COMPLETION_TEST_VAR"),
+            "got={got:?}"
+        );
+        unsafe {
+            std::env::remove_var("TAB_COMPLETION_TEST_VAR");
+        }
+    }
+
+    #[test]
+    fn cycle_completion_advances_and_wraps() {
+        let mut s = Session::new();
+        let a = s.add_block(vec!["a".into()]);
+        let b = s.add_block(vec!["b".into()]);
+        s.pin(a, "alpha".into());
+        s.pin(b, "alphabet".into());
+        let mut app = App::new();
+        app.session = s;
+        app.history.clear();
+        app.prompt = "cat @alp".into();
+
+        cycle_completion(&mut app, 1);
+        let first = app.prompt.clone();
+        assert!(first == "cat @alpha" || first == "cat @alphabet", "first={first}");
+        assert!(app.completion.is_some());
+
+        cycle_completion(&mut app, 1);
+        let second = app.prompt.clone();
+        assert_ne!(first, second);
+
+        // Wrap back to first
+        cycle_completion(&mut app, 1);
+        assert_eq!(app.prompt, first);
+
+        // Backwards cycles in reverse
+        cycle_completion(&mut app, -1);
+        assert_eq!(app.prompt, second);
+    }
+
+    #[test]
+    fn cycle_completion_with_no_matches_flashes() {
+        let mut app = App::new();
+        app.history.clear();
+        app.prompt = "@thiswillnevermatchanypin".into();
+        cycle_completion(&mut app, 1);
+        assert!(app.completion.is_none());
+        assert!(app.flash.as_deref() == Some("no completions"));
+    }
+
+    #[test]
+    fn non_tab_key_resets_completion_state() {
+        // Simulate the `if !is_tab { app.completion = None }` guard.
+        let mut app = App::new();
+        app.history.clear();
+        app.completion = Some(CompletionState {
+            base_text: "x ".into(),
+            matches: vec!["y".into()],
+            idx: 0,
+        });
+        // Any key handler starts with this reset for non-tab keys.
+        let is_tab = false;
+        if !is_tab {
+            app.completion = None;
+        }
+        assert!(app.completion.is_none());
     }
 }

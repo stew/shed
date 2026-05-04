@@ -268,6 +268,28 @@ undoable — re-runs are runtime, not structural, and don't dirty the
 notebook. Undo restores notebook structure; if you want to revert a
 re-run's output, save before re-running and reload.
 
+### Tab completion
+
+Available at the Prompt and inside the in-place command editor (the bar
+that appears after `e` → `f` on a block's command). Tab cycles forward
+through matches; Shift-Tab cycles backward. There's no popup list — the
+input itself is rewritten to the next candidate. Any non-Tab keystroke
+ends the cycle.
+
+The token under the cursor (everything after the last whitespace)
+decides what to complete:
+
+| Token shape | Source |
+|-------------|--------|
+| `$FOO`      | environment variable names |
+| `@name`     | pinned block names |
+| `/cmd` (Prompt only, first token) | slash commands (`/aliases`) |
+| first token, otherwise | commands on `$PATH` ∪ saved aliases ∪ shell builtins (`cd`, `export`, `unset`, `exit`) |
+| second token onward, or any path-shaped token (`./`, `../`, `/...`, `~/`) | filesystem paths (directories get a trailing `/`; hidden entries appear only when the prefix starts with `.`) |
+
+If no candidates match, the flash bar shows "no completions" and the
+input is left untouched.
+
 ### Notebooks
 
 A *notebook* is the saveable form of a session: an ordered list of
@@ -351,6 +373,7 @@ so you don't lose data without noticing.
 |-----------|--------|
 | Enter     | run command |
 | `↑` / `↓` | recall previous / next command from history (persisted across sessions in `$XDG_CACHE_HOME/shed/history`, default `~/.cache/shed/history`) |
+| Tab / Shift-Tab | cycle through completions for the token at the end of the line (see Tab completion). |
 | `!cmd`    | force fullscreen handover (typed prefix) |
 | `@name`   | snapshot the output of pinned block `@name` into a new block (see Pinned references) |
 | Esc       | focus newest block |
@@ -399,6 +422,7 @@ returns to BlockCursor for those.
 |-----------|--------|
 | `↑↓`      | navigate vertically through the command, each filter, and the `+ add` slot. `↑` at the first filter steps onto the command (highlighted in magenta); `↓` from the command returns to the filter list. `←→` are aliases for muscle memory. |
 | `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
+| Tab / Shift-Tab | (in-place command editor only) cycle through completions for the token at the end of the line (see Tab completion). |
 | `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
 | `d`       | drop the filter at cursor (or last if on add slot) |
