@@ -27,7 +27,7 @@ use bytes::Bytes;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use shed_core::Capture;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Error)]
@@ -46,6 +46,14 @@ pub enum ExecError {
 
 pub type Killer = Box<dyn ChildKiller + Send + Sync>;
 pub type ExecHandle = JoinHandle<Result<CaptureOutcome, ExecError>>;
+
+/// Receiver yielded from [`spawn_command`] alongside the join handle.
+/// Each PTY read that contributes bytes to the eventual capture also
+/// sends those bytes through this channel, so the TUI can stream the
+/// output into the block's `capture` while the command is still
+/// running. The sender side is closed when the reader task ends; the
+/// receiver becomes `Disconnected` after that.
+pub type ChunkReceiver = mpsc::UnboundedReceiver<Bytes>;
 
 /// What a finished PTY reader task hands back.
 ///
@@ -74,20 +82,27 @@ pub fn contains_alt_screen(haystack: &[u8]) -> bool {
         .any(|p| haystack.windows(p.len()).any(|w| w == *p))
 }
 
-/// Spawn a command attached to a pseudo-terminal. Returns a JoinHandle for the
-/// blocking task that captures output AND a separate killer that lets the
-/// caller terminate the child process while the task is still reading. The
-/// killer is delivered via a oneshot once the child has actually been spawned,
-/// so this fn is async (typically completes within microseconds).
+/// Spawn a command attached to a pseudo-terminal. Returns:
+/// - the [`ExecHandle`] for the blocking task that captures output
+///   (await it to get the final [`CaptureOutcome`]);
+/// - a [`Killer`] that terminates the child while the task is still reading;
+/// - a [`ChunkReceiver`] that yields each captured chunk in flight, so the
+///   TUI can stream output into the block while the command runs.
+///
+/// The killer is delivered via a oneshot once the child has actually
+/// been spawned, so this fn is async (typically completes within
+/// microseconds).
 pub async fn spawn_command(
     argv: Vec<String>,
     cap_bytes: usize,
-) -> Result<(ExecHandle, Killer), ExecError> {
+) -> Result<(ExecHandle, Killer, ChunkReceiver), ExecError> {
     let (killer_tx, killer_rx) = oneshot::channel::<Result<Killer, ExecError>>();
-    let handle = tokio::task::spawn_blocking(move || run_blocking(argv, cap_bytes, killer_tx));
+    let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Bytes>();
+    let handle =
+        tokio::task::spawn_blocking(move || run_blocking(argv, cap_bytes, killer_tx, chunk_tx));
 
     match killer_rx.await {
-        Ok(Ok(killer)) => Ok((handle, killer)),
+        Ok(Ok(killer)) => Ok((handle, killer, chunk_rx)),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(ExecError::NotStarted),
     }
@@ -97,6 +112,7 @@ fn run_blocking(
     argv: Vec<String>,
     cap_bytes: usize,
     killer_tx: oneshot::Sender<Result<Killer, ExecError>>,
+    chunk_tx: mpsc::UnboundedSender<Bytes>,
 ) -> Result<CaptureOutcome, ExecError> {
     let started_at = Instant::now();
 
@@ -187,11 +203,19 @@ fn run_blocking(
             continue;
         }
         let remaining = cap_bytes.saturating_sub(buf.len());
-        if n <= remaining {
+        let kept = if n <= remaining {
             buf.extend_from_slice(&chunk[..n]);
+            &chunk[..n]
         } else {
             buf.extend_from_slice(&chunk[..remaining]);
             truncated = true;
+            &chunk[..remaining]
+        };
+        if !kept.is_empty() {
+            // Receiver gone (TUI dropped the block / shut down) — keep
+            // reading anyway so the local `buf` and exit code stay
+            // consistent, just stop streaming.
+            let _ = chunk_tx.send(Bytes::copy_from_slice(kept));
         }
     }
 
@@ -232,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code() {
-        let (handle, _killer) = spawn_command(
+        let (handle, _killer, _chunks) = spawn_command(
             vec!["printf".into(), "a\nb\nc\n".into()],
             1024,
         )
@@ -248,14 +272,14 @@ mod tests {
 
     #[tokio::test]
     async fn captures_nonzero_exit() {
-        let (handle, _killer) = spawn_command(vec!["false".into()], 1024).await.unwrap();
+        let (handle, _killer, _chunks) = spawn_command(vec!["false".into()], 1024).await.unwrap();
         let capture = unwrap_captured(handle.await.unwrap().unwrap());
         assert_eq!(capture.exit_code, Some(1));
     }
 
     #[tokio::test]
     async fn truncation_marks_capture_and_drains_child() {
-        let (handle, _killer) = spawn_command(
+        let (handle, _killer, _chunks) = spawn_command(
             vec!["seq".into(), "1".into(), "100000".into()],
             64,
         )
@@ -271,7 +295,7 @@ mod tests {
     async fn alt_screen_detected_in_output_triggers_handover_signal() {
         // printf emits a literal alt-screen-enter sequence; the reader
         // should detect it and return NeededFullscreen.
-        let (handle, _killer) = spawn_command(
+        let (handle, _killer, _chunks) = spawn_command(
             vec!["printf".into(), "\\x1b[?1049hhello".into()],
             1024,
         )
@@ -303,8 +327,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streams_chunks_through_receiver_while_running() {
+        let (handle, _killer, mut chunks) = spawn_command(
+            vec!["printf".into(), "hello\n".into()],
+            1024,
+        )
+        .await
+        .unwrap();
+        // Wait for the command to finish so all chunks are sent and
+        // the channel is closed.
+        let outcome = handle.await.unwrap().unwrap();
+        let mut all = Vec::new();
+        while let Some(chunk) = chunks.recv().await {
+            all.extend_from_slice(&chunk);
+        }
+        let capture = unwrap_captured(outcome);
+        // The streamed bytes match the final capture's stdout.
+        assert_eq!(all, capture.stdout.as_ref());
+        assert!(String::from_utf8_lossy(&all).contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn streamed_chunks_respect_capture_cap() {
+        // 64-byte cap: streaming should also stop after 64 bytes, even
+        // though the child produces far more.
+        let (handle, _killer, mut chunks) = spawn_command(
+            vec!["seq".into(), "1".into(), "100000".into()],
+            64,
+        )
+        .await
+        .unwrap();
+        let _ = handle.await.unwrap().unwrap();
+        let mut total = 0usize;
+        while let Some(chunk) = chunks.recv().await {
+            total += chunk.len();
+        }
+        assert!(total <= 64, "streamed {total} bytes, cap was 64");
+    }
+
+    #[tokio::test]
     async fn killer_cancels_a_long_running_child() {
-        let (handle, mut killer) = spawn_command(
+        let (handle, mut killer, _chunks) = spawn_command(
             vec!["sleep".into(), "30".into()],
             1024,
         )

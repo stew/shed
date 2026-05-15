@@ -151,6 +151,18 @@ spans. Cursor-positioning sequences are dropped, so non-curses programs
 render cleanly. Programs that try to take over the screen get
 **fullscreen handover** instead.
 
+Output streams in: each chunk the reader pulls off the PTY is sent
+through an mpsc channel that the event loop drains every tick and
+mirrors onto the block's `capture` while the command is still running.
+The pipeline re-applies on every render, so `from-lines | where …`
+shows partial rows accumulate in real time. The final `Capture` (with
+exit code + finished timestamp) replaces the partial one when the
+reader task completes. While a block is `Running`, its inline preview
+*tails* the output (most recent rows at the bottom, with `… N more
+rows` pinned to the top) so the latest activity is always visible.
+Once the block reaches `Done`, the preview reverts to the standard
+head-with-`… N more` style.
+
 ### Builtins
 
 A few commands aren't external programs and are handled inside shed

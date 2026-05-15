@@ -45,7 +45,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -68,6 +68,14 @@ type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
 struct RunningCommand {
     handle: CommandTask,
     killer: Killer,
+    /// Receiver of streaming output chunks from the reader task. Drained
+    /// each tick by [`drain_streams`] into `stream_buf`.
+    chunks: exec::ChunkReceiver,
+    /// Accumulated bytes for the in-flight block. Mirrored into
+    /// `block.capture.stdout` (as a `Bytes` copy) every time new chunks
+    /// arrive, so the renderer sees streaming output. Dropped on reap;
+    /// the final [`Capture`] from `handle.await` replaces it.
+    stream_buf: BytesMut,
 }
 
 #[derive(Debug, Clone)]
@@ -1672,6 +1680,7 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
                 perform_run_in_place(&mut app, next).await;
             }
         }
+        drain_streams(&mut app);
         reap_completed(&mut app).await;
         advance_run_chain(&mut app);
         terminal.draw(|f| draw(f, &app))?;
@@ -1728,8 +1737,16 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
         }
     }
     match exec::spawn_command(req.argv, CAPTURE_CAP).await {
-        Ok((handle, killer)) => {
-            app.running.insert(id, RunningCommand { handle, killer });
+        Ok((handle, killer, chunks)) => {
+            app.running.insert(
+                id,
+                RunningCommand {
+                    handle,
+                    killer,
+                    chunks,
+                    stream_buf: BytesMut::new(),
+                },
+            );
         }
         Err(e) => {
             app.session.set_state(id, BlockState::Failed(e.to_string()));
@@ -2119,8 +2136,16 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
         b.state = BlockState::Running;
     }
     match exec::spawn_command(argv, CAPTURE_CAP).await {
-        Ok((handle, killer)) => {
-            app.running.insert(id, RunningCommand { handle, killer });
+        Ok((handle, killer, chunks)) => {
+            app.running.insert(
+                id,
+                RunningCommand {
+                    handle,
+                    killer,
+                    chunks,
+                    stream_buf: BytesMut::new(),
+                },
+            );
         }
         Err(e) => {
             app.session.set_state(id, BlockState::Failed(e.to_string()));
@@ -2163,6 +2188,50 @@ async fn perform_handover(
         app.flash = Some(format!("%{} switched to fullscreen mode", id.0));
     }
     Ok(())
+}
+
+/// Pull every pending stream chunk from each running command into its
+/// `stream_buf`, and mirror the (possibly grown) buffer onto the
+/// block's `capture.stdout` so the renderer sees streaming output.
+///
+/// While streaming, the block's capture has `exit_code: None` and
+/// `finished_at: None` — those land when [`reap_completed`] replaces
+/// the partial capture with the final one from the reader task.
+fn drain_streams(app: &mut App) {
+    let ids: Vec<BlockId> = app.running.keys().copied().collect();
+    for id in ids {
+        let Some(cmd) = app.running.get_mut(&id) else {
+            continue;
+        };
+        let mut got_bytes = false;
+        while let Ok(chunk) = cmd.chunks.try_recv() {
+            cmd.stream_buf.extend_from_slice(&chunk);
+            got_bytes = true;
+        }
+        if !got_bytes {
+            continue;
+        }
+        // Snapshot the running buffer as a fresh Bytes and mirror onto
+        // the block. Cost is O(N) per snapshot; render frequency caps
+        // total work, and this is the simplest way to keep the
+        // renderer (which reads `block.capture`) unchanged.
+        let snapshot = Bytes::copy_from_slice(&cmd.stream_buf);
+        let started_at = app
+            .session
+            .block(id)
+            .and_then(|b| b.capture.as_ref().map(|c| c.started_at))
+            .unwrap_or_else(Instant::now);
+        let partial = Capture {
+            stdout: snapshot,
+            stderr: Bytes::new(),
+            exit_code: None,
+            started_at,
+            finished_at: None,
+            truncated: false,
+            snapshotted: false,
+        };
+        app.session.set_capture(id, partial);
+    }
 }
 
 async fn reap_completed(app: &mut App) {
@@ -3980,7 +4049,7 @@ fn jump_to_search(app: &mut App, forward: bool) {
 fn compute_block_lines(block: &Block) -> Vec<Line<'static>> {
     match block.capture.as_ref() {
         Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
-            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX),
+            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
         None => Vec::new(),
@@ -4629,8 +4698,16 @@ async fn spawn_prompt(app: &mut App) {
     app.savepoint();
     let id = app.session.add_block(argv.clone());
     match exec::spawn_command(argv, CAPTURE_CAP).await {
-        Ok((handle, killer)) => {
-            app.running.insert(id, RunningCommand { handle, killer });
+        Ok((handle, killer, chunks)) => {
+            app.running.insert(
+                id,
+                RunningCommand {
+                    handle,
+                    killer,
+                    chunks,
+                    stream_buf: BytesMut::new(),
+                },
+            );
         }
         Err(e) => {
             app.session
@@ -5588,7 +5665,7 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
     // Compute the full pipeline output (no row cap) and the lines to render.
     let all_lines: Vec<Line<'static>> = match block.capture.as_ref() {
         Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
-            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX),
+            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
         None => vec![Line::from(Span::styled(
@@ -6033,8 +6110,12 @@ fn render_block(
         }
     }
 
+    // Running blocks tail their preview: the most recent rows are
+    // visible at the bottom, with "N more" pinned at the top. Finished
+    // blocks keep the existing head behaviour.
+    let tail = matches!(block.state, BlockState::Running);
     match pipeline_outcome {
-        Some(Ok((value, _))) => lines.extend(render_pipeline_value(value)),
+        Some(Ok((value, _))) => lines.extend(render_pipeline_value(value, tail)),
         Some(Err(e)) => lines.extend(filter_error_lines(&e)),
         None => {}
     }
@@ -6149,31 +6230,43 @@ fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
     ])]
 }
 
-fn render_raw_lines(bytes: &bytes::Bytes, max: usize) -> Vec<Line<'static>> {
-    let parsed = ansi::parse_to_lines(bytes, "      ", max);
-    let mut out = parsed.lines;
-    if parsed.truncated {
-        out.push(Line::from(Span::styled(
-            format!("      … {} more lines", parsed.total - max),
+fn render_raw_lines(bytes: &bytes::Bytes, max: usize, tail: bool) -> Vec<Line<'static>> {
+    let parsed = ansi::parse_to_lines(bytes, "      ", max, tail);
+    let extra = parsed.total.saturating_sub(max);
+    let more_line = || {
+        Line::from(Span::styled(
+            format!("      … {extra} more lines"),
             Style::default().fg(Color::DarkGray),
-        )));
+        ))
+    };
+    let mut out = Vec::with_capacity(parsed.lines.len() + 1);
+    if parsed.truncated && tail {
+        out.push(more_line());
+    }
+    out.extend(parsed.lines);
+    if parsed.truncated && !tail {
+        out.push(more_line());
     }
     out
 }
 
-fn render_pipeline_value(value: PipelineValue) -> Vec<Line<'static>> {
-    render_pipeline_value_with_max(value, PREVIEW_LINES)
+fn render_pipeline_value(value: PipelineValue, tail: bool) -> Vec<Line<'static>> {
+    render_pipeline_value_with_max(value, PREVIEW_LINES, tail)
 }
 
-fn render_pipeline_value_with_max(value: PipelineValue, max: usize) -> Vec<Line<'static>> {
+fn render_pipeline_value_with_max(
+    value: PipelineValue,
+    max: usize,
+    tail: bool,
+) -> Vec<Line<'static>> {
     match value {
-        PipelineValue::Bytes(b) => render_raw_lines(&b, max),
+        PipelineValue::Bytes(b) => render_raw_lines(&b, max, tail),
         PipelineValue::Structured(Value::List(items)) => {
             let columns = schema_of(&items);
             if columns.is_empty() {
-                render_scalar_list(&items, max)
+                render_scalar_list(&items, max, tail)
             } else {
-                render_table(&items, &columns, max)
+                render_table(&items, &columns, max, tail)
             }
         }
         PipelineValue::Structured(other) => vec![Line::from(vec![
@@ -6187,7 +6280,16 @@ fn render_pipeline_value_with_max(value: PipelineValue, max: usize) -> Vec<Line<
 /// row + data rows. Column widths are computed across ALL records so the
 /// table doesn't jiggle as the user scrolls in the pager. Vertical
 /// dividers (`│`) make space-containing cell values unambiguous.
-fn render_table(items: &[Value], columns: &[String], max_rows: usize) -> Vec<Line<'static>> {
+///
+/// With `tail = true` the *last* `max_rows` rows are shown and the
+/// "N more rows" indicator goes between the separator and the data rows
+/// (so the freshest row is always at the bottom — useful for streaming).
+fn render_table(
+    items: &[Value],
+    columns: &[String],
+    max_rows: usize,
+    tail: bool,
+) -> Vec<Line<'static>> {
     let widths = compute_column_widths(items, columns);
     let total = items.len();
     let dim = Style::default().fg(Color::DarkGray);
@@ -6217,8 +6319,25 @@ fn render_table(items: &[Value], columns: &[String], max_rows: usize) -> Vec<Lin
     }
     lines.push(Line::from(sep_spans));
 
-    // Data rows
-    for item in items.iter().take(max_rows) {
+    let truncated = total > max_rows;
+    let more_line = || {
+        Line::from(Span::styled(
+            format!("      … {} more rows", total - max_rows),
+            dim,
+        ))
+    };
+
+    if truncated && tail {
+        lines.push(more_line());
+    }
+
+    // Data rows: head or tail slice.
+    let slice: Box<dyn Iterator<Item = &Value>> = if tail && truncated {
+        Box::new(items.iter().skip(total - max_rows))
+    } else {
+        Box::new(items.iter().take(max_rows))
+    };
+    for item in slice {
         let mut row_spans = vec![Span::raw("      ")];
         for (i, col) in columns.iter().enumerate() {
             if i > 0 {
@@ -6233,11 +6352,8 @@ fn render_table(items: &[Value], columns: &[String], max_rows: usize) -> Vec<Lin
         lines.push(Line::from(row_spans));
     }
 
-    if total > max_rows {
-        lines.push(Line::from(Span::styled(
-            format!("      … {} more rows", total - max_rows),
-            dim,
-        )));
+    if truncated && !tail {
+        lines.push(more_line());
     }
     if total == 0 {
         lines.push(Line::from(Span::styled("      (no rows)", dim)));
@@ -6262,21 +6378,34 @@ fn compute_column_widths(items: &[Value], columns: &[String]) -> Vec<usize> {
     widths
 }
 
-fn render_scalar_list(items: &[Value], max: usize) -> Vec<Line<'static>> {
+fn render_scalar_list(items: &[Value], max: usize, tail: bool) -> Vec<Line<'static>> {
     let total = items.len();
     let dim = Style::default().fg(Color::DarkGray);
+    let truncated = total > max;
+    let more_line = || {
+        Line::from(Span::styled(
+            format!("      … {} more rows", total - max),
+            dim,
+        ))
+    };
+
     let mut out = Vec::new();
-    for item in items.iter().take(max) {
+    if truncated && tail {
+        out.push(more_line());
+    }
+    let slice: Box<dyn Iterator<Item = &Value>> = if tail && truncated {
+        Box::new(items.iter().skip(total - max))
+    } else {
+        Box::new(items.iter().take(max))
+    };
+    for item in slice {
         out.push(Line::from(vec![
             Span::raw("      "),
             Span::raw(format_scalar(item)),
         ]));
     }
-    if total > max {
-        out.push(Line::from(Span::styled(
-            format!("      … {} more rows", total - max),
-            dim,
-        )));
+    if truncated && !tail {
+        out.push(more_line());
     }
     if total == 0 {
         out.push(Line::from(Span::styled("      (no rows)", dim)));
@@ -6439,7 +6568,7 @@ fn draw_preview_pane(
             "      (no capture)",
             Style::default().fg(Color::DarkGray),
         ))],
-        Some(Ok((value, _))) => render_pipeline_value_with_max(value.clone(), max),
+        Some(Ok((value, _))) => render_pipeline_value_with_max(value.clone(), max, false),
         Some(Err(e)) => filter_error_lines(e),
     };
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -8965,6 +9094,86 @@ mod tests {
             InputOutcome::Continue
         );
         assert_eq!(t, "abc");
+    }
+
+    #[test]
+    fn render_table_tail_puts_more_indicator_at_top_and_shows_last_rows() {
+        use shed_core::Value;
+        let cols = vec!["n".to_string()];
+        let items: Vec<Value> = (1..=10)
+            .map(|i| {
+                let mut r = indexmap::IndexMap::new();
+                r.insert("n".to_string(), Value::Int(i));
+                Value::Record(r)
+            })
+            .collect();
+        let lines = render_table(&items, &cols, 3, true);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        // Header, separator, "… N more rows", then last 3 records (8, 9, 10).
+        assert!(texts[0].contains("n"));
+        assert!(texts[1].contains("─"));
+        assert!(texts[2].contains("… 7 more rows"), "got: {:?}", texts[2]);
+        assert!(texts[3].contains("8"));
+        assert!(texts[4].contains("9"));
+        assert!(texts[5].contains("10"));
+    }
+
+    #[test]
+    fn render_scalar_list_tail_puts_more_at_top_and_shows_last_items() {
+        use shed_core::Value;
+        let items: Vec<Value> = (1..=10).map(Value::Int).collect();
+        let lines = render_scalar_list(&items, 3, true);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts[0].contains("… 7 more rows"));
+        assert!(texts[1].trim().ends_with("8"));
+        assert!(texts[2].trim().ends_with("9"));
+        assert!(texts[3].trim().ends_with("10"));
+    }
+
+    #[test]
+    fn render_raw_lines_tail_puts_more_at_top_and_shows_last_lines() {
+        let bytes = bytes::Bytes::from_static(b"a\nb\nc\nd\ne\nf\n");
+        let lines = render_raw_lines(&bytes, 3, true);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts[0].contains("… 3 more lines"));
+        assert!(texts[1].trim().ends_with("d"));
+        assert!(texts[2].trim().ends_with("e"));
+        assert!(texts[3].trim().ends_with("f"));
+    }
+
+    #[tokio::test]
+    async fn drain_streams_mirrors_chunks_into_block_capture() {
+        // Spawn a real `printf` so the reader task actually streams
+        // bytes through the channel. Awaiting the handle guarantees
+        // the sender closed, so try_recv after will yield every chunk
+        // synchronously when drain_streams runs.
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_block(vec!["printf".into(), "hello".into()]);
+        let (handle, killer, chunks) =
+            crate::exec::spawn_command(vec!["printf".into(), "hello".into()], 1024)
+                .await
+                .unwrap();
+        app.running.insert(
+            id,
+            RunningCommand {
+                handle,
+                killer,
+                chunks,
+                stream_buf: BytesMut::new(),
+            },
+        );
+        // Wait for the child to finish so all chunks are sent.
+        while !app.running.get(&id).unwrap().handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        drain_streams(&mut app);
+        let cap = app.session.block(id).unwrap().capture.as_ref().unwrap();
+        assert_eq!(cap.stdout.as_ref(), b"hello");
+        // Streaming sets a partial capture: no exit code, no finish ts.
+        assert!(cap.exit_code.is_none());
+        assert!(cap.finished_at.is_none());
     }
 
     #[test]

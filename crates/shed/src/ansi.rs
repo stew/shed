@@ -37,8 +37,16 @@ use ratatui::{
 use vte::{Params, Parser, Perform};
 
 /// Parse `bytes` as a stream of text + ANSI escape sequences and produce
-/// styled `Line`s suitable for ratatui rendering.
-pub fn parse_to_lines(bytes: &[u8], indent: &str, max_lines: usize) -> ParsedPreview {
+/// styled `Line`s suitable for ratatui rendering. With `tail = false`
+/// the first `max_lines` are kept (head); with `tail = true` the *last*
+/// `max_lines` are kept — useful for streaming output where the user
+/// wants the most recent lines visible.
+pub fn parse_to_lines(
+    bytes: &[u8],
+    indent: &str,
+    max_lines: usize,
+    tail: bool,
+) -> ParsedPreview {
     let mut performer = AnsiToLines::new(indent.to_string());
     let mut parser = Parser::new();
     for &b in bytes {
@@ -48,11 +56,11 @@ pub fn parse_to_lines(bytes: &[u8], indent: &str, max_lines: usize) -> ParsedPre
 
     let total = performer.lines.len();
     let truncated = total > max_lines;
-    let lines: Vec<Line<'static>> = performer
-        .lines
-        .into_iter()
-        .take(max_lines)
-        .collect();
+    let lines: Vec<Line<'static>> = if tail && truncated {
+        performer.lines.into_iter().skip(total - max_lines).collect()
+    } else {
+        performer.lines.into_iter().take(max_lines).collect()
+    };
     ParsedPreview {
         lines,
         total,
@@ -307,14 +315,14 @@ mod tests {
 
     #[test]
     fn plain_text_makes_one_line_per_newline() {
-        let p = parse_to_lines(b"alpha\nbeta\n", "  ", 10);
+        let p = parse_to_lines(b"alpha\nbeta\n", "  ", 10, false);
         assert_eq!(p.total, 2);
         assert!(!p.truncated);
     }
 
     #[test]
     fn cr_lf_collapses_to_a_single_line_break() {
-        let p = parse_to_lines(b"alpha\r\nbeta\r\n", "  ", 10);
+        let p = parse_to_lines(b"alpha\r\nbeta\r\n", "  ", 10, false);
         assert_eq!(p.total, 2);
         assert_eq!(line_text(&p.lines[0]), "  alpha");
         assert_eq!(line_text(&p.lines[1]), "  beta");
@@ -322,15 +330,34 @@ mod tests {
 
     #[test]
     fn truncation_is_reported() {
-        let p = parse_to_lines(b"a\nb\nc\nd\ne\n", "  ", 3);
+        let p = parse_to_lines(b"a\nb\nc\nd\ne\n", "  ", 3, false);
         assert_eq!(p.total, 5);
         assert!(p.truncated);
         assert_eq!(p.lines.len(), 3);
     }
 
     #[test]
+    fn tail_mode_keeps_last_lines() {
+        let p = parse_to_lines(b"a\nb\nc\nd\ne\n", "  ", 3, true);
+        assert_eq!(p.total, 5);
+        assert!(p.truncated);
+        let texts: Vec<String> = p.lines.iter().map(line_text).collect();
+        assert_eq!(texts, vec!["  c", "  d", "  e"]);
+    }
+
+    #[test]
+    fn tail_mode_without_truncation_matches_head() {
+        let head = parse_to_lines(b"a\nb\n", "  ", 5, false);
+        let tail = parse_to_lines(b"a\nb\n", "  ", 5, true);
+        assert_eq!(
+            head.lines.iter().map(line_text).collect::<Vec<_>>(),
+            tail.lines.iter().map(line_text).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn sgr_red_emits_styled_span() {
-        let p = parse_to_lines(b"\x1b[31mred\x1b[0m\n", "", 10);
+        let p = parse_to_lines(b"\x1b[31mred\x1b[0m\n", "", 10, false);
         assert_eq!(p.total, 1);
         let any_red = p.lines.iter().any(|l| {
             l.spans.iter().any(|s| s.style.fg == Some(Color::Red))
@@ -340,21 +367,21 @@ mod tests {
 
     #[test]
     fn cursor_moves_are_dropped() {
-        let p = parse_to_lines(b"\x1b[2J\x1b[Hhello\x1b[K\nworld\n", "", 10);
+        let p = parse_to_lines(b"\x1b[2J\x1b[Hhello\x1b[K\nworld\n", "", 10, false);
         assert_eq!(p.total, 2);
     }
 
     #[test]
     fn cr_overwrites_existing_chars_on_same_line() {
         // "hello" → \r → "XY" overwrites first two chars → final "XYllo".
-        let p = parse_to_lines(b"hello\rXY\n", "", 10);
+        let p = parse_to_lines(b"hello\rXY\n", "", 10, false);
         assert_eq!(p.total, 1);
         assert_eq!(line_text(&p.lines[0]), "XYllo");
     }
 
     #[test]
     fn cr_plus_erase_line_then_write_replaces_line() {
-        let p = parse_to_lines(b"hello\r\x1b[Kworld\n", "", 10);
+        let p = parse_to_lines(b"hello\r\x1b[Kworld\n", "", 10, false);
         assert_eq!(line_text(&p.lines[0]), "world");
     }
 
@@ -362,7 +389,7 @@ mod tests {
     fn cargo_style_progress_bar_collapses_to_final_state() {
         let input =
             b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
-        let p = parse_to_lines(input, "", 10);
+        let p = parse_to_lines(input, "", 10, false);
         assert_eq!(p.total, 2);
         assert_eq!(line_text(&p.lines[0]), "Building (100%)");
         assert_eq!(line_text(&p.lines[1]), "Done");
@@ -370,7 +397,7 @@ mod tests {
 
     #[test]
     fn tab_expands_to_next_multiple_of_eight() {
-        let p = parse_to_lines(b"a\tb\n", "", 10);
+        let p = parse_to_lines(b"a\tb\n", "", 10, false);
         assert_eq!(line_text(&p.lines[0]), "a       b");
     }
 
@@ -378,7 +405,7 @@ mod tests {
     fn sgr_color_persists_after_overwrite() {
         // First write "hello" in red, \r, write "X" in default style. Cell 0
         // should be 'X' with default style; cells 1-4 stay red.
-        let p = parse_to_lines(b"\x1b[31mhello\x1b[0m\rX\n", "", 10);
+        let p = parse_to_lines(b"\x1b[31mhello\x1b[0m\rX\n", "", 10, false);
         assert_eq!(line_text(&p.lines[0]), "Xello");
         // The 'X' span should NOT be red.
         let first_char_red = p.lines[0]
