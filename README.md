@@ -290,6 +290,32 @@ decides what to complete:
 If no candidates match, the flash bar shows "no completions" and the
 input is left untouched.
 
+### Line editing
+
+Every single-line input bar in shed (the main prompt, in-place command
+editor, pin / rerun / write / alias-name / save / open paths, pager
+search) supports readline-style editing. The cursor is rendered inline
+as an inverted block; arrow keys move it; characters insert at the
+cursor; Backspace / Delete remove around it.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→`         | move one char left / right |
+| Ctrl-B / Ctrl-F   | same as `←` / `→` |
+| Alt-`←` / Alt-`→` | move one word left / right |
+| Alt-B / Alt-F     | same as Alt-`←` / Alt-`→` |
+| Home / End        | jump to beginning / end |
+| Ctrl-A / Ctrl-E   | same as Home / End |
+| Backspace         | delete char before the cursor |
+| Delete            | delete char under the cursor |
+| Ctrl-W            | kill the word before the cursor |
+| Ctrl-U            | kill from cursor to beginning of line |
+| Ctrl-K            | kill from cursor to end of line |
+
+The palette lives on **Ctrl-P** (so that **Ctrl-K** is free for
+kill-to-end), and the env editor is reachable via the palette only
+(rather than a Ctrl-E shortcut, which is now end-of-line).
+
 ### Notebooks
 
 A *notebook* is the saveable form of a session: an ordered list of
@@ -373,13 +399,21 @@ so you don't lose data without noticing.
 |-----------|--------|
 | Enter     | run command |
 | `↑` / `↓` | recall previous / next command from history (persisted across sessions in `$XDG_CACHE_HOME/shed/history`, default `~/.cache/shed/history`) |
-| Tab / Shift-Tab | cycle through completions for the token at the end of the line (see Tab completion). |
+| Tab / Shift-Tab | cycle through completions for the token at the cursor (see Tab completion). |
+| Ctrl-A / Ctrl-E | jump to beginning / end of line |
+| Ctrl-U / Ctrl-K | kill to beginning / end of line |
+| Ctrl-W          | kill the word before the cursor |
+| Ctrl-B / Ctrl-F | move one char left / right (same as ← / →) |
+| Alt-B / Alt-F   | move one word left / right (same as Alt-← / Alt-→) |
+| Home / End      | jump to beginning / end of line |
+| Left / Right    | move one char |
+| Delete          | delete the char under the cursor |
 | `!cmd`    | force fullscreen handover (typed prefix) |
 | `@name`   | snapshot the output of pinned block `@name` into a new block (see Pinned references) |
 | Esc       | focus newest block |
 | Ctrl-D    | quit (or prompt if unsaved) |
 | Ctrl-C    | quit (no running selection) |
-| Ctrl-K    | open the command palette |
+| Ctrl-P    | open the command palette |
 | Ctrl-S    | save notebook (input bar if no path bound) |
 | Ctrl-O    | open notebook (replaces the current session) |
 | Ctrl-Z / Ctrl-Y | undo / redo the most recent structural change (see Undo / redo) |
@@ -444,7 +478,7 @@ returns to BlockCursor for those.
 
 ### Palette (command palette)
 
-Opened from any focus by **Ctrl-K**. A fuzzy-search list of every named
+Opened from any focus by **Ctrl-P**. A fuzzy-search list of every named
 action shed supports — quit, focus newest block, open env editor, pin /
 unpin / expand / write / rerun the selected block, open the filter
 form, etc. Actions whose preconditions aren't met (e.g. "Pin block"
@@ -461,7 +495,8 @@ something it can't do.
 
 ### EnvEdit (environment-variable editor)
 
-Triggered by `Ctrl-E` from the prompt. A scrollable list of every
+Reachable from the **command palette** (Ctrl-P → "Open env editor").
+A scrollable list of every
 environment variable in shed's process, sorted by key, with edit /
 add / delete affordances. Changes are visible to subsequent spawned
 commands immediately.

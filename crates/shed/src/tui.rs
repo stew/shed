@@ -313,6 +313,7 @@ const ACTIONS: &[Action] = &[
             app.focus = Focus::BlockCursor;
             app.write_input_mode = true;
             app.write_input.clear();
+            app.write_cursor = 0;
         },
     },
     Action {
@@ -326,6 +327,7 @@ const ACTIONS: &[Action] = &[
                     .block(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
+                app.pin_cursor = existing.len();
                 app.pin_input = existing;
                 app.pin_input_mode = true;
                 app.focus = Focus::BlockCursor;
@@ -361,6 +363,7 @@ const ACTIONS: &[Action] = &[
                 if let Some(block) = app.session.block(id) {
                     let joined = shlex::try_join(block.argv.iter().map(String::as_str))
                         .unwrap_or_else(|_| block.argv.join(" "));
+                    app.rerun_cursor = joined.len();
                     app.rerun_input = joined;
                     app.rerun_input_mode = true;
                     app.rerun_source_id = Some(id);
@@ -1391,6 +1394,9 @@ fn compute_schema_at(block: &Block, before_index: usize) -> Vec<String> {
 struct App {
     session: Session,
     prompt: String,
+    /// Byte offset of the insertion caret in [`App::prompt`]. Always a
+    /// char boundary in `[0, prompt.len()]`.
+    prompt_cursor: usize,
     history: Vec<String>,
     history_cursor: Option<usize>,
     /// Active tab-completion cycle, or `None` if Tab hasn't been pressed
@@ -1399,10 +1405,13 @@ struct App {
     completion: Option<CompletionState>,
     write_input_mode: bool,
     write_input: String,
+    write_cursor: usize,
     pin_input_mode: bool,
     pin_input: String,
+    pin_cursor: usize,
     rerun_input_mode: bool,
     rerun_input: String,
+    rerun_cursor: usize,
     rerun_source_id: Option<BlockId>,
     pending_rerun: Option<RerunRequest>,
     /// True when the BlockCursor's "filter cursor" has been pulled left
@@ -1411,6 +1420,7 @@ struct App {
     command_focused: bool,
     cmd_edit_input_mode: bool,
     cmd_edit_input: String,
+    cmd_edit_cursor: usize,
     last_cwd: Option<PathBuf>,
     env_edit: Option<EnvEditState>,
     note_edit: Option<NoteEditState>,
@@ -1422,6 +1432,7 @@ struct App {
     expand_scroll: usize,
     search_query: String,
     search_input: String,
+    search_cursor: usize,
     search_input_mode: bool,
     search_anchor_scroll: usize,
     search_input_backward: bool,
@@ -1441,6 +1452,7 @@ struct App {
     aliases_path: Option<PathBuf>,
     alias_name_input_mode: bool,
     alias_name_input: String,
+    alias_name_cursor: usize,
     /// Pending overwrite confirmation when `A` collides with an existing
     /// alias name. Holds the would-be entry; user resolves with y/n/c.
     alias_overwrite: Option<Alias>,
@@ -1470,9 +1482,11 @@ struct App {
     /// Save-as input bar (Ctrl-S without a bound path).
     save_input_mode: bool,
     save_input: String,
+    save_cursor: usize,
     /// Open input bar (Ctrl-O).
     open_input_mode: bool,
     open_input: String,
+    open_cursor: usize,
     /// "Save before quitting?" exit prompt. Showing while non-None;
     /// keys map to y / n / c (cancel).
     exit_prompt: Option<ExitPrompt>,
@@ -1505,20 +1519,25 @@ impl App {
         Self {
             session: Session::new(),
             prompt: String::new(),
+            prompt_cursor: 0,
             history: load_history_from_default_path().unwrap_or_default(),
             history_cursor: None,
             completion: None,
             write_input_mode: false,
             write_input: String::new(),
+            write_cursor: 0,
             pin_input_mode: false,
             pin_input: String::new(),
+            pin_cursor: 0,
             rerun_input_mode: false,
             rerun_input: String::new(),
+            rerun_cursor: 0,
             rerun_source_id: None,
             pending_rerun: None,
             command_focused: false,
             cmd_edit_input_mode: false,
             cmd_edit_input: String::new(),
+            cmd_edit_cursor: 0,
             last_cwd: None,
             env_edit: None,
             note_edit: None,
@@ -1530,6 +1549,7 @@ impl App {
             expand_scroll: 0,
             search_query: String::new(),
             search_input: String::new(),
+            search_cursor: 0,
             search_input_mode: false,
             search_anchor_scroll: 0,
             search_input_backward: false,
@@ -1543,6 +1563,7 @@ impl App {
             aliases_path: aliases_file_path(),
             alias_name_input_mode: false,
             alias_name_input: String::new(),
+            alias_name_cursor: 0,
             alias_overwrite: None,
             alias_manage: None,
             dirty: false,
@@ -1552,8 +1573,10 @@ impl App {
             redo_stack: Vec::new(),
             save_input_mode: false,
             save_input: String::new(),
+            save_cursor: 0,
             open_input_mode: false,
             open_input: String::new(),
+            open_cursor: 0,
             exit_prompt: None,
         }
     }
@@ -1834,6 +1857,7 @@ fn open_cmd_edit(app: &mut App) {
     }
     let joined = shlex::try_join(block.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| block.argv.join(" "));
+    app.cmd_edit_cursor = joined.len();
     app.cmd_edit_input = joined;
     app.cmd_edit_input_mode = true;
 }
@@ -1843,6 +1867,7 @@ fn open_cmd_edit(app: &mut App) {
 fn commit_cmd_edit(app: &mut App) {
     let input = std::mem::take(&mut app.cmd_edit_input);
     app.cmd_edit_input_mode = false;
+    app.cmd_edit_cursor = 0;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         app.flash = Some("command required".into());
@@ -2221,7 +2246,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
                 request_quit(app);
                 return;
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('p') => {
                 open_palette(app);
                 return;
             }
@@ -2356,6 +2381,7 @@ fn begin_save(app: &mut App) {
         return;
     }
     app.save_input.clear();
+    app.save_cursor = 0;
     app.save_input_mode = true;
 }
 
@@ -2366,6 +2392,7 @@ fn begin_open(app: &mut App) {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    app.open_cursor = app.open_input.len();
     app.open_input_mode = true;
 }
 
@@ -2417,10 +2444,11 @@ fn load_from_path(app: &mut App, path: &std::path::Path) {
 }
 
 fn handle_save_input_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
+    match handle_text_input(&mut app.save_input, &mut app.save_cursor, &key) {
+        InputOutcome::Cancel => {
             app.save_input_mode = false;
             app.save_input.clear();
+            app.save_cursor = 0;
             // If the save was triggered by the exit prompt and the user
             // bailed out, drop the exit prompt rather than continuing to
             // hold them hostage.
@@ -2428,9 +2456,10 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
                 app.exit_prompt = None;
             }
         }
-        KeyCode::Enter => {
+        InputOutcome::Commit => {
             let path_str = std::mem::take(&mut app.save_input);
             app.save_input_mode = false;
+            app.save_cursor = 0;
             let trimmed = path_str.trim();
             if trimmed.is_empty() {
                 app.flash = Some("path required".into());
@@ -2445,23 +2474,21 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
                 app.quit = true;
             }
         }
-        KeyCode::Char(c) => app.save_input.push(c),
-        KeyCode::Backspace => {
-            app.save_input.pop();
-        }
-        _ => {}
+        InputOutcome::Continue => {}
     }
 }
 
 fn handle_open_input_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
+    match handle_text_input(&mut app.open_input, &mut app.open_cursor, &key) {
+        InputOutcome::Cancel => {
             app.open_input_mode = false;
             app.open_input.clear();
+            app.open_cursor = 0;
         }
-        KeyCode::Enter => {
+        InputOutcome::Commit => {
             let path_str = std::mem::take(&mut app.open_input);
             app.open_input_mode = false;
+            app.open_cursor = 0;
             let trimmed = path_str.trim();
             if trimmed.is_empty() {
                 app.flash = Some("path required".into());
@@ -2470,11 +2497,7 @@ fn handle_open_input_key(app: &mut App, key: KeyEvent) {
             let path = PathBuf::from(expand_tilde(trimmed));
             load_from_path(app, &path);
         }
-        KeyCode::Char(c) => app.open_input.push(c),
-        KeyCode::Backspace => {
-            app.open_input.pop();
-        }
-        _ => {}
+        InputOutcome::Continue => {}
     }
 }
 
@@ -2502,6 +2525,7 @@ fn handle_exit_prompt_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.exit_prompt = Some(ExitPrompt::AwaitingPath);
                 app.save_input.clear();
+                app.save_cursor = 0;
                 app.save_input_mode = true;
             }
         }
@@ -2587,6 +2611,278 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+// === Readline-style line editing ===========================================
+//
+// Pure helpers operating on a `(text: &mut String, cursor: &mut usize)`
+// pair. Cursor is a byte offset into `text`, always at a char boundary
+// in `[0, text.len()]`. `apply_readline_edit` dispatches readline-style
+// keys (Ctrl-A/E/U/K/W, arrows, Home/End, Delete/Backspace, plain
+// chars) to the right helper and returns `true` if the key was consumed.
+
+fn tf_insert_char(text: &mut String, cursor: &mut usize, c: char) {
+    text.insert(*cursor, c);
+    *cursor += c.len_utf8();
+}
+
+fn tf_backspace(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let prev = text[..*cursor].chars().next_back().expect("non-empty prefix").len_utf8();
+    *cursor -= prev;
+    text.replace_range(*cursor..*cursor + prev, "");
+}
+
+fn tf_delete(text: &mut String, cursor: &mut usize) {
+    if *cursor >= text.len() {
+        return;
+    }
+    let next = text[*cursor..].chars().next().expect("non-empty suffix").len_utf8();
+    text.replace_range(*cursor..*cursor + next, "");
+}
+
+fn tf_left(text: &str, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let prev = text[..*cursor].chars().next_back().expect("non-empty prefix").len_utf8();
+    *cursor -= prev;
+}
+
+fn tf_right(text: &str, cursor: &mut usize) {
+    if *cursor >= text.len() {
+        return;
+    }
+    let next = text[*cursor..].chars().next().expect("non-empty suffix").len_utf8();
+    *cursor += next;
+}
+
+fn tf_home(cursor: &mut usize) {
+    *cursor = 0;
+}
+
+fn tf_end(text: &str, cursor: &mut usize) {
+    *cursor = text.len();
+}
+
+fn tf_kill_to_beginning(text: &mut String, cursor: &mut usize) {
+    text.replace_range(..*cursor, "");
+    *cursor = 0;
+}
+
+fn tf_kill_to_end(text: &mut String, cursor: &mut usize) {
+    text.replace_range(*cursor.., "");
+}
+
+/// Word-back boundary: skip whitespace immediately before `cursor`,
+/// then skip the run of non-whitespace before that. Returns the byte
+/// index of the boundary.
+fn tf_word_back_index(text: &str, cursor: usize) -> usize {
+    let mut end = cursor;
+    while end > 0 {
+        let c = text[..end].chars().next_back().expect("non-empty");
+        if !c.is_whitespace() {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    while end > 0 {
+        let c = text[..end].chars().next_back().expect("non-empty");
+        if c.is_whitespace() {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    end
+}
+
+fn tf_word_forward_index(text: &str, cursor: usize) -> usize {
+    let mut pos = cursor;
+    while pos < text.len() {
+        let c = text[pos..].chars().next().expect("non-empty");
+        if !c.is_whitespace() {
+            break;
+        }
+        pos += c.len_utf8();
+    }
+    while pos < text.len() {
+        let c = text[pos..].chars().next().expect("non-empty");
+        if c.is_whitespace() {
+            break;
+        }
+        pos += c.len_utf8();
+    }
+    pos
+}
+
+fn tf_kill_word_back(text: &mut String, cursor: &mut usize) {
+    let new_pos = tf_word_back_index(text, *cursor);
+    text.replace_range(new_pos..*cursor, "");
+    *cursor = new_pos;
+}
+
+fn tf_word_left(text: &str, cursor: &mut usize) {
+    *cursor = tf_word_back_index(text, *cursor);
+}
+
+fn tf_word_right(text: &str, cursor: &mut usize) {
+    *cursor = tf_word_forward_index(text, *cursor);
+}
+
+/// Outcome of [`handle_text_input`] applied to a single-line input bar:
+/// `Commit` if Enter was pressed, `Cancel` for Esc, `Continue` for an
+/// editing keystroke (any non-terminal key, even one that didn't
+/// actually mutate the buffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOutcome {
+    Commit,
+    Cancel,
+    Continue,
+}
+
+/// Single-line input bar dispatch: handle Enter / Esc as commit /
+/// cancel, route everything else through [`apply_readline_edit`].
+fn handle_text_input(text: &mut String, cursor: &mut usize, key: &KeyEvent) -> InputOutcome {
+    match key.code {
+        KeyCode::Enter => InputOutcome::Commit,
+        KeyCode::Esc => InputOutcome::Cancel,
+        _ => {
+            apply_readline_edit(text, cursor, key);
+            InputOutcome::Continue
+        }
+    }
+}
+
+/// Apply a readline-style key edit. Returns `true` if the key was
+/// consumed (the caller should not run its own key logic). Returns
+/// `false` for keys this layer doesn't handle (Enter, Esc, Tab, Up/Down,
+/// etc.) — the caller handles those.
+fn apply_readline_edit(text: &mut String, cursor: &mut usize, key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char(c) if !ctrl && !alt => {
+            tf_insert_char(text, cursor, c);
+            true
+        }
+        KeyCode::Char('a') if ctrl => {
+            tf_home(cursor);
+            true
+        }
+        KeyCode::Char('e') if ctrl => {
+            tf_end(text, cursor);
+            true
+        }
+        KeyCode::Char('u') if ctrl => {
+            tf_kill_to_beginning(text, cursor);
+            true
+        }
+        KeyCode::Char('k') if ctrl => {
+            tf_kill_to_end(text, cursor);
+            true
+        }
+        KeyCode::Char('w') if ctrl => {
+            tf_kill_word_back(text, cursor);
+            true
+        }
+        KeyCode::Char('b') if ctrl => {
+            tf_left(text, cursor);
+            true
+        }
+        KeyCode::Char('f') if ctrl => {
+            tf_right(text, cursor);
+            true
+        }
+        KeyCode::Char('b') if alt => {
+            tf_word_left(text, cursor);
+            true
+        }
+        KeyCode::Char('f') if alt => {
+            tf_word_right(text, cursor);
+            true
+        }
+        KeyCode::Backspace => {
+            tf_backspace(text, cursor);
+            true
+        }
+        KeyCode::Delete => {
+            tf_delete(text, cursor);
+            true
+        }
+        KeyCode::Home => {
+            tf_home(cursor);
+            true
+        }
+        KeyCode::End => {
+            tf_end(text, cursor);
+            true
+        }
+        KeyCode::Left if alt => {
+            tf_word_left(text, cursor);
+            true
+        }
+        KeyCode::Right if alt => {
+            tf_word_right(text, cursor);
+            true
+        }
+        KeyCode::Left => {
+            tf_left(text, cursor);
+            true
+        }
+        KeyCode::Right => {
+            tf_right(text, cursor);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Render a status-bar style input prompt as a [`Paragraph`]: a label
+/// in `accent`, then `text` with the cursor visualised inline. Used for
+/// every single-line input bar in the bottom status row.
+fn render_input_bar(
+    label: &str,
+    accent: Color,
+    text: &str,
+    cursor: usize,
+) -> Paragraph<'static> {
+    let mut spans = vec![
+        Span::raw(" ".to_string()),
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(input_spans_with_cursor(text, cursor, accent));
+    Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray))
+}
+
+/// Render `text` with the cursor visualised as an inverted block.
+/// `accent` is the colour the cursor block uses for its background;
+/// the text under it renders in black.
+fn input_spans_with_cursor(text: &str, cursor: usize, accent: Color) -> Vec<Span<'static>> {
+    let cursor = cursor.min(text.len());
+    let before = text[..cursor].to_string();
+    let (at, after) = if cursor >= text.len() {
+        (" ".to_string(), String::new())
+    } else {
+        let c_len = text[cursor..].chars().next().expect("non-empty").len_utf8();
+        (
+            text[cursor..cursor + c_len].to_string(),
+            text[cursor + c_len..].to_string(),
+        )
+    };
+    let cursor_style = Style::default()
+        .fg(Color::Black)
+        .bg(accent)
+        .add_modifier(Modifier::BOLD);
+    vec![
+        Span::raw(before),
+        Span::styled(at, cursor_style),
+        Span::raw(after),
+    ]
+}
+
 fn cancel_at_cursor(app: &mut App) -> bool {
     let Some(id) = app.session.cursor() else {
         return false;
@@ -2622,9 +2918,13 @@ const COMPLETION_SLASH: &[&str] = &["/aliases"];
 
 #[derive(Debug, Clone)]
 struct CompletionState {
-    /// The unchanged prefix of the input. Each cycle re-renders the
-    /// input as `base_text + matches[idx]`.
+    /// The unchanged prefix of the input (before the token being
+    /// completed). Each cycle re-renders the input as
+    /// `base_text + matches[idx] + suffix`.
     base_text: String,
+    /// The unchanged suffix of the input (everything after the cursor
+    /// at the moment Tab was first pressed).
+    suffix: String,
     matches: Vec<String>,
     idx: usize,
 }
@@ -2833,18 +3133,26 @@ fn compute_completions(
     (base.to_string(), matches)
 }
 
-fn current_input_text(app: &App) -> Option<String> {
+fn current_input_state(app: &App) -> Option<(String, usize)> {
     match app.focus {
-        Focus::Prompt => Some(app.prompt.clone()),
-        Focus::EditBlock if app.cmd_edit_input_mode => Some(app.cmd_edit_input.clone()),
+        Focus::Prompt => Some((app.prompt.clone(), app.prompt_cursor)),
+        Focus::EditBlock if app.cmd_edit_input_mode => {
+            Some((app.cmd_edit_input.clone(), app.cmd_edit_cursor))
+        }
         _ => None,
     }
 }
 
-fn set_current_input(app: &mut App, text: String) {
+fn set_current_input(app: &mut App, text: String, cursor: usize) {
     match app.focus {
-        Focus::Prompt => app.prompt = text,
-        Focus::EditBlock if app.cmd_edit_input_mode => app.cmd_edit_input = text,
+        Focus::Prompt => {
+            app.prompt = text;
+            app.prompt_cursor = cursor;
+        }
+        Focus::EditBlock if app.cmd_edit_input_mode => {
+            app.cmd_edit_input = text;
+            app.cmd_edit_cursor = cursor;
+        }
         _ => {}
     }
 }
@@ -2855,18 +3163,26 @@ fn set_current_input(app: &mut App, text: String) {
 /// `app.completion.matches`.
 fn cycle_completion(app: &mut App, dir: i32) {
     if app.completion.is_none() {
-        let Some(text) = current_input_text(app) else {
+        let Some((text, cursor)) = current_input_state(app) else {
             return;
         };
+        let prefix = &text[..cursor];
+        let suffix = text[cursor..].to_string();
         let focus = app.focus;
-        let (base, matches) = compute_completions(&app.session, &app.aliases, focus, &text);
+        let (base, matches) = compute_completions(&app.session, &app.aliases, focus, prefix);
         if matches.is_empty() {
             app.flash = Some("no completions".into());
             return;
         }
-        set_current_input(app, format!("{base}{}", matches[0]));
+        let new_cursor = base.len() + matches[0].len();
+        set_current_input(
+            app,
+            format!("{base}{}{suffix}", matches[0]),
+            new_cursor,
+        );
         app.completion = Some(CompletionState {
             base_text: base,
+            suffix,
             matches,
             idx: 0,
         });
@@ -2875,8 +3191,12 @@ fn cycle_completion(app: &mut App, dir: i32) {
     let state = app.completion.as_mut().unwrap();
     let n = state.matches.len() as isize;
     state.idx = ((state.idx as isize + dir as isize).rem_euclid(n)) as usize;
-    let new_text = format!("{}{}", state.base_text, state.matches[state.idx]);
-    set_current_input(app, new_text);
+    let new_cursor = state.base_text.len() + state.matches[state.idx].len();
+    let new_text = format!(
+        "{}{}{}",
+        state.base_text, state.matches[state.idx], state.suffix
+    );
+    set_current_input(app, new_text, new_cursor);
 }
 
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
@@ -2884,14 +3204,15 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     if !is_tab {
         app.completion = None;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        app.env_edit = Some(EnvEditState::new());
-        app.focus = Focus::EnvEdit;
-        return;
-    }
     match key.code {
-        KeyCode::Tab => cycle_completion(app, 1),
-        KeyCode::BackTab => cycle_completion(app, -1),
+        KeyCode::Tab => {
+            cycle_completion(app, 1);
+            return;
+        }
+        KeyCode::BackTab => {
+            cycle_completion(app, -1);
+            return;
+        }
         KeyCode::Esc => {
             if let Some(id) = app.newest_block_id() {
                 app.session.set_cursor(Some(id));
@@ -2900,19 +3221,24 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.flash = Some("no blocks yet".into());
             }
+            return;
         }
-        KeyCode::Up => history_step(app, -1),
-        KeyCode::Down => history_step(app, 1),
-        KeyCode::Char(c) => {
-            app.prompt.push(c);
-            app.history_cursor = None;
+        KeyCode::Up => {
+            history_step(app, -1);
+            return;
         }
-        KeyCode::Backspace => {
-            app.prompt.pop();
-            app.history_cursor = None;
+        KeyCode::Down => {
+            history_step(app, 1);
+            return;
         }
-        KeyCode::Enter => spawn_prompt(app).await,
+        KeyCode::Enter => {
+            spawn_prompt(app).await;
+            return;
+        }
         _ => {}
+    }
+    if apply_readline_edit(&mut app.prompt, &mut app.prompt_cursor, &key) {
+        app.history_cursor = None;
     }
 }
 
@@ -3012,67 +3338,71 @@ fn history_step(app: &mut App, delta: i32) {
         Some(i) => app.history[i].clone(),
         None => String::new(),
     };
+    app.prompt_cursor = app.prompt.len();
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
     if app.rerun_input_mode {
-        match key.code {
-            KeyCode::Esc => {
+        match handle_text_input(&mut app.rerun_input, &mut app.rerun_cursor, &key) {
+            InputOutcome::Commit => commit_rerun(app),
+            InputOutcome::Cancel => {
                 app.rerun_input_mode = false;
                 app.rerun_input.clear();
+                app.rerun_cursor = 0;
                 app.rerun_source_id = None;
             }
-            KeyCode::Enter => commit_rerun(app),
-            KeyCode::Char(c) => app.rerun_input.push(c),
-            KeyCode::Backspace => {
-                app.rerun_input.pop();
-            }
-            _ => {}
+            InputOutcome::Continue => {}
         }
         return;
     }
     if app.pin_input_mode {
-        match key.code {
-            KeyCode::Esc => {
+        match handle_text_input(&mut app.pin_input, &mut app.pin_cursor, &key) {
+            InputOutcome::Commit => commit_pin(app),
+            InputOutcome::Cancel => {
                 app.pin_input_mode = false;
                 app.pin_input.clear();
+                app.pin_cursor = 0;
             }
-            KeyCode::Enter => commit_pin(app),
-            KeyCode::Char(c) => app.pin_input.push(c),
-            KeyCode::Backspace => {
-                app.pin_input.pop();
-            }
-            _ => {}
+            InputOutcome::Continue => {}
         }
         return;
     }
     if app.write_input_mode {
-        match key.code {
-            KeyCode::Esc => {
+        match handle_text_input(&mut app.write_input, &mut app.write_cursor, &key) {
+            InputOutcome::Commit => commit_write(app),
+            InputOutcome::Cancel => {
                 app.write_input_mode = false;
                 app.write_input.clear();
+                app.write_cursor = 0;
             }
-            KeyCode::Enter => commit_write(app),
-            KeyCode::Char(c) => app.write_input.push(c),
-            KeyCode::Backspace => {
-                app.write_input.pop();
-            }
-            _ => {}
+            InputOutcome::Continue => {}
         }
         return;
     }
     if app.cmd_edit_input_mode {
+        let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
+        if !is_tab {
+            app.completion = None;
+        }
         match key.code {
-            KeyCode::Esc => {
-                app.cmd_edit_input_mode = false;
-                app.cmd_edit_input.clear();
+            KeyCode::Tab => {
+                cycle_completion(app, 1);
+                return;
             }
-            KeyCode::Enter => commit_cmd_edit(app),
-            KeyCode::Char(c) => app.cmd_edit_input.push(c),
-            KeyCode::Backspace => {
-                app.cmd_edit_input.pop();
+            KeyCode::BackTab => {
+                cycle_completion(app, -1);
+                return;
             }
             _ => {}
+        }
+        match handle_text_input(&mut app.cmd_edit_input, &mut app.cmd_edit_cursor, &key) {
+            InputOutcome::Commit => commit_cmd_edit(app),
+            InputOutcome::Cancel => {
+                app.cmd_edit_input_mode = false;
+                app.cmd_edit_input.clear();
+                app.cmd_edit_cursor = 0;
+            }
+            InputOutcome::Continue => {}
         }
         return;
     }
@@ -3087,17 +3417,14 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         return;
     }
     if app.alias_name_input_mode {
-        match key.code {
-            KeyCode::Esc => {
+        match handle_text_input(&mut app.alias_name_input, &mut app.alias_name_cursor, &key) {
+            InputOutcome::Commit => commit_alias_save(app),
+            InputOutcome::Cancel => {
                 app.alias_name_input_mode = false;
                 app.alias_name_input.clear();
+                app.alias_name_cursor = 0;
             }
-            KeyCode::Enter => commit_alias_save(app),
-            KeyCode::Char(c) => app.alias_name_input.push(c),
-            KeyCode::Backspace => {
-                app.alias_name_input.pop();
-            }
-            _ => {}
+            InputOutcome::Continue => {}
         }
         return;
     }
@@ -3121,6 +3448,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             app.command_focused = false;
             app.prompt.clear();
             app.prompt.push('/');
+            app.prompt_cursor = app.prompt.len();
             app.history_cursor = None;
         }
         KeyCode::Char('v') => {
@@ -3133,6 +3461,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             if app.session.cursor().is_some() {
                 app.write_input_mode = true;
                 app.write_input.clear();
+                app.write_cursor = 0;
             }
         }
         KeyCode::Char('p') => {
@@ -3142,6 +3471,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                     .block(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
+                app.pin_cursor = existing.len();
                 app.pin_input = existing;
                 app.pin_input_mode = true;
             }
@@ -3164,6 +3494,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 if let Some(block) = app.session.block(id) {
                     let joined = shlex::try_join(block.argv.iter().map(String::as_str))
                         .unwrap_or_else(|_| block.argv.join(" "));
+                    app.rerun_cursor = joined.len();
                     app.rerun_input = joined;
                     app.rerun_input_mode = true;
                     app.rerun_source_id = Some(id);
@@ -3193,18 +3524,24 @@ fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
             app.completion = None;
         }
         match key.code {
-            KeyCode::Tab => cycle_completion(app, 1),
-            KeyCode::BackTab => cycle_completion(app, -1),
-            KeyCode::Esc => {
-                app.cmd_edit_input_mode = false;
-                app.cmd_edit_input.clear();
+            KeyCode::Tab => {
+                cycle_completion(app, 1);
+                return;
             }
-            KeyCode::Enter => commit_cmd_edit(app),
-            KeyCode::Char(c) => app.cmd_edit_input.push(c),
-            KeyCode::Backspace => {
-                app.cmd_edit_input.pop();
+            KeyCode::BackTab => {
+                cycle_completion(app, -1);
+                return;
             }
             _ => {}
+        }
+        match handle_text_input(&mut app.cmd_edit_input, &mut app.cmd_edit_cursor, &key) {
+            InputOutcome::Commit => commit_cmd_edit(app),
+            InputOutcome::Cancel => {
+                app.cmd_edit_input_mode = false;
+                app.cmd_edit_input.clear();
+                app.cmd_edit_cursor = 0;
+            }
+            InputOutcome::Continue => {}
         }
         return;
     }
@@ -3235,6 +3572,7 @@ fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
 fn commit_rerun(app: &mut App) {
     let input = std::mem::take(&mut app.rerun_input);
     app.rerun_input_mode = false;
+    app.rerun_cursor = 0;
     let source_id = app.rerun_source_id.take();
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -3266,6 +3604,7 @@ fn commit_rerun(app: &mut App) {
 fn commit_pin(app: &mut App) {
     let name = std::mem::take(&mut app.pin_input).trim().to_string();
     app.pin_input_mode = false;
+    app.pin_cursor = 0;
     let Some(id) = app.session.cursor() else { return };
 
     if name.is_empty() {
@@ -3330,6 +3669,7 @@ impl WriteFormat {
 fn commit_write(app: &mut App) {
     let path = std::mem::take(&mut app.write_input);
     app.write_input_mode = false;
+    app.write_cursor = 0;
     let path = path.trim();
     if path.is_empty() {
         app.flash = Some("path required".into());
@@ -3485,26 +3825,21 @@ fn value_to_field_string(v: &Value) -> String {
 
 fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
     if app.search_input_mode {
-        match key.code {
-            KeyCode::Esc => {
+        match handle_text_input(&mut app.search_input, &mut app.search_cursor, &key) {
+            InputOutcome::Cancel => {
                 app.search_input_mode = false;
                 app.search_input.clear();
+                app.search_cursor = 0;
                 app.search_query.clear();
                 app.expand_scroll = app.search_anchor_scroll;
             }
-            KeyCode::Enter => {
+            InputOutcome::Commit => {
                 app.search_input_mode = false;
                 // search_query is already in sync via update_search; nothing to do.
             }
-            KeyCode::Char(c) => {
-                app.search_input.push(c);
+            InputOutcome::Continue => {
                 update_search(app);
             }
-            KeyCode::Backspace => {
-                app.search_input.pop();
-                update_search(app);
-            }
-            _ => {}
         }
         return;
     }
@@ -3528,6 +3863,7 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
             app.search_input_mode = true;
             app.search_input_backward = false;
             app.search_input.clear();
+            app.search_cursor = 0;
             app.search_query.clear();
             app.search_anchor_scroll = app.expand_scroll;
         }
@@ -3535,6 +3871,7 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
             app.search_input_mode = true;
             app.search_input_backward = true;
             app.search_input.clear();
+            app.search_cursor = 0;
             app.search_query.clear();
             app.search_anchor_scroll = app.expand_scroll;
         }
@@ -4207,6 +4544,7 @@ async fn spawn_prompt(app: &mut App) {
     if let Some(rest) = trimmed.strip_prefix('/') {
         let cmd = rest.trim().to_string();
         app.prompt.clear();
+        app.prompt_cursor = 0;
         app.history_cursor = None;
         match cmd.as_str() {
             "aliases" => open_alias_manage(app),
@@ -4241,6 +4579,7 @@ async fn spawn_prompt(app: &mut App) {
     }
     app.history_cursor = None;
     app.prompt.clear();
+    app.prompt_cursor = 0;
 
     // Aliases shadow real binaries: a single-token input matching a
     // saved alias materialises a block with that alias's argv + pipeline
@@ -4893,12 +5232,14 @@ fn open_alias_save(app: &mut App) {
         return;
     }
     app.alias_name_input.clear();
+    app.alias_name_cursor = 0;
     app.alias_name_input_mode = true;
 }
 
 fn commit_alias_save(app: &mut App) {
     let raw = std::mem::take(&mut app.alias_name_input);
     app.alias_name_input_mode = false;
+    app.alias_name_cursor = 0;
     let name = match validate_alias_name(&raw) {
         Ok(n) => n,
         Err(e) => {
@@ -4949,6 +5290,7 @@ fn spawn_alias(app: &mut App, alias: &Alias) {
     let joined = shlex::try_join(alias.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| alias.argv.join(" "));
     app.cmd_edit_input = format!("{joined} ");
+    app.cmd_edit_cursor = app.cmd_edit_input.len();
     app.cmd_edit_input_mode = true;
 }
 
@@ -5514,21 +5856,18 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(widget, area);
 
     let body = if active {
-        Line::from(vec![
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.prompt.clone()),
-            Span::styled(
-                "▏",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
+        let mut spans = vec![Span::styled(
+            "› ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(input_spans_with_cursor(
+            &app.prompt,
+            app.prompt_cursor,
+            Color::Green,
+        ));
+        Line::from(spans)
     } else {
         Line::from(Span::styled(
             "  press / or ↓ to start typing a command",
@@ -6634,67 +6973,41 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         // AwaitingPath falls through; the save_input_mode bar takes over.
     }
     if app.save_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                "save to: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.save_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Green)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+        f.render_widget(
+            render_input_bar("save to: ", Color::Green, &app.save_input, app.save_cursor),
+            area,
+        );
         return;
     }
     if app.open_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                "open: ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(app.open_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Green)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+        f.render_widget(
+            render_input_bar("open: ", Color::Green, &app.open_input, app.open_cursor),
+            area,
+        );
         return;
     }
     if app.rerun_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
+        f.render_widget(
+            render_input_bar(
                 "rerun: ",
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
+                Color::LightCyan,
+                &app.rerun_input,
+                app.rerun_cursor,
             ),
-            Span::raw(app.rerun_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::LightCyan)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+            area,
+        );
         return;
     }
     if app.cmd_edit_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
+        f.render_widget(
+            render_input_bar(
                 "edit cmd: ",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
+                Color::LightMagenta,
+                &app.cmd_edit_input,
+                app.cmd_edit_cursor,
             ),
-            Span::raw(app.cmd_edit_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+            area,
+        );
         return;
     }
     if let Some(pending) = &app.alias_overwrite {
@@ -6722,51 +7035,39 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     if app.alias_name_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
+        f.render_widget(
+            render_input_bar(
                 "alias name: ",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
+                Color::LightMagenta,
+                &app.alias_name_input,
+                app.alias_name_cursor,
             ),
-            Span::raw(app.alias_name_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+            area,
+        );
         return;
     }
     if app.pin_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
+        f.render_widget(
+            render_input_bar(
                 "pin name: ",
-                Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
+                Color::LightMagenta,
+                &app.pin_input,
+                app.pin_cursor,
             ),
-            Span::raw(app.pin_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::LightMagenta)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+            area,
+        );
         return;
     }
     if app.write_input_mode {
-        let widget = Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
+        f.render_widget(
+            render_input_bar(
                 "write to: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Color::Yellow,
+                &app.write_input,
+                app.write_cursor,
             ),
-            Span::raw(app.write_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Yellow)),
-        ]))
-        .style(Style::default().bg(Color::DarkGray));
-        f.render_widget(widget, area);
+            area,
+        );
         return;
     }
     if app.search_input_mode {
@@ -6774,16 +7075,19 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             && try_compile(&app.search_input, app.search_case_insensitive).is_none();
         let prefix = if app.search_input_backward { "?" } else { "/" };
         let mut spans = vec![
-            Span::raw(" "),
+            Span::raw(" ".to_string()),
             Span::styled(
                 prefix.to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(app.search_input.clone()),
-            Span::styled("▏", Style::default().fg(Color::Yellow)),
         ];
+        spans.extend(input_spans_with_cursor(
+            &app.search_input,
+            app.search_cursor,
+            Color::Yellow,
+        ));
         if app.search_case_insensitive {
             spans.push(Span::styled(
                 "  (i)",
@@ -6817,8 +7121,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("!cmd", "fullscreen"),
             ("@name", "snapshot"),
             ("/aliases", "manage"),
-            ("Ctrl-E", "env"),
-            ("Ctrl-K", "palette"),
+            ("Ctrl-A/E/U/K/W", "line edit"),
+            ("Ctrl-P", "palette"),
             ("Ctrl-S/O", "save/open"),
             ("Ctrl-Z/Y", "undo/redo"),
             ("Esc", "focus block"),
@@ -8466,6 +8770,7 @@ mod tests {
         app.session = s;
         app.history.clear();
         app.prompt = "cat @alp".into();
+        app.prompt_cursor = app.prompt.len();
 
         cycle_completion(&mut app, 1);
         let first = app.prompt.clone();
@@ -8490,6 +8795,7 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         app.prompt = "@thiswillnevermatchanypin".into();
+        app.prompt_cursor = app.prompt.len();
         cycle_completion(&mut app, 1);
         assert!(app.completion.is_none());
         assert!(app.flash.as_deref() == Some("no completions"));
@@ -8502,6 +8808,7 @@ mod tests {
         app.history.clear();
         app.completion = Some(CompletionState {
             base_text: "x ".into(),
+            suffix: String::new(),
             matches: vec!["y".into()],
             idx: 0,
         });
@@ -8511,5 +8818,170 @@ mod tests {
             app.completion = None;
         }
         assert!(app.completion.is_none());
+    }
+
+    // === readline-style editing ===
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn tf_insert_inserts_at_cursor_and_advances() {
+        let mut text = "ad".to_string();
+        let mut cursor = 1;
+        tf_insert_char(&mut text, &mut cursor, 'b');
+        assert_eq!(text, "abd");
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn tf_backspace_removes_char_before_cursor() {
+        let mut text = "abc".to_string();
+        let mut cursor = 2;
+        tf_backspace(&mut text, &mut cursor);
+        assert_eq!(text, "ac");
+        assert_eq!(cursor, 1);
+        // No-op at start.
+        cursor = 0;
+        tf_backspace(&mut text, &mut cursor);
+        assert_eq!(text, "ac");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn tf_delete_removes_char_after_cursor() {
+        let mut text = "abc".to_string();
+        let mut cursor = 1;
+        tf_delete(&mut text, &mut cursor);
+        assert_eq!(text, "ac");
+        assert_eq!(cursor, 1);
+        // No-op at end.
+        cursor = text.len();
+        tf_delete(&mut text, &mut cursor);
+        assert_eq!(text, "ac");
+    }
+
+    #[test]
+    fn tf_kill_to_beginning_and_end() {
+        let mut text = "hello world".to_string();
+        let mut cursor = 6;
+        tf_kill_to_beginning(&mut text, &mut cursor);
+        assert_eq!(text, "world");
+        assert_eq!(cursor, 0);
+
+        let mut text = "hello world".to_string();
+        let mut cursor = 5;
+        tf_kill_to_end(&mut text, &mut cursor);
+        assert_eq!(text, "hello");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn tf_kill_word_back_eats_one_word_and_trailing_ws() {
+        let mut text = "git checkout main".to_string();
+        let mut cursor = text.len();
+        tf_kill_word_back(&mut text, &mut cursor);
+        assert_eq!(text, "git checkout ");
+        assert_eq!(cursor, "git checkout ".len());
+        tf_kill_word_back(&mut text, &mut cursor);
+        assert_eq!(text, "git ");
+    }
+
+    #[test]
+    fn tf_word_left_right_jump_by_word() {
+        let text = "one two  three";
+        let mut cursor = text.len();
+        tf_word_left(text, &mut cursor);
+        assert_eq!(&text[cursor..], "three");
+        tf_word_left(text, &mut cursor);
+        assert_eq!(&text[cursor..], "two  three");
+
+        let mut cursor = 0;
+        tf_word_right(text, &mut cursor);
+        assert_eq!(&text[..cursor], "one");
+        tf_word_right(text, &mut cursor);
+        assert_eq!(&text[..cursor], "one two");
+    }
+
+    #[test]
+    fn apply_readline_handles_basic_keys() {
+        let mut t = String::from("ab");
+        let mut c = 2;
+        assert!(apply_readline_edit(&mut t, &mut c, &key(KeyCode::Char('c'))));
+        assert_eq!(t, "abc");
+        assert_eq!(c, 3);
+
+        assert!(apply_readline_edit(&mut t, &mut c, &ctrl('a')));
+        assert_eq!(c, 0);
+        assert!(apply_readline_edit(&mut t, &mut c, &ctrl('e')));
+        assert_eq!(c, 3);
+        assert!(apply_readline_edit(&mut t, &mut c, &ctrl('u')));
+        assert_eq!(t, "");
+        assert_eq!(c, 0);
+
+        // Returns false for keys it doesn't own.
+        assert!(!apply_readline_edit(&mut t, &mut c, &key(KeyCode::Enter)));
+        assert!(!apply_readline_edit(&mut t, &mut c, &key(KeyCode::Esc)));
+        assert!(!apply_readline_edit(&mut t, &mut c, &key(KeyCode::Tab)));
+    }
+
+    #[test]
+    fn apply_readline_alt_word_movement() {
+        let mut t = String::from("one two three");
+        let mut c = t.len();
+        assert!(apply_readline_edit(&mut t, &mut c, &alt('b')));
+        assert_eq!(&t[c..], "three");
+        assert!(apply_readline_edit(
+            &mut t,
+            &mut c,
+            &KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+        ));
+        assert_eq!(&t[c..], "two three");
+    }
+
+    #[test]
+    fn input_outcome_routes_enter_esc_and_edits() {
+        let mut t = String::from("ab");
+        let mut c = 2;
+        assert_eq!(
+            handle_text_input(&mut t, &mut c, &key(KeyCode::Enter)),
+            InputOutcome::Commit
+        );
+        assert_eq!(
+            handle_text_input(&mut t, &mut c, &key(KeyCode::Esc)),
+            InputOutcome::Cancel
+        );
+        assert_eq!(
+            handle_text_input(&mut t, &mut c, &key(KeyCode::Char('c'))),
+            InputOutcome::Continue
+        );
+        assert_eq!(t, "abc");
+    }
+
+    #[test]
+    fn tab_completion_respects_cursor_mid_string() {
+        // Cursor mid-token: completion should replace just the token
+        // under cursor, preserving the suffix.
+        let mut app = App::new();
+        app.history.clear();
+        app.prompt = "ex foo".into();
+        // Cursor right after "ex".
+        app.prompt_cursor = 2;
+        cycle_completion(&mut app, 1);
+        // After tab, prompt is "<match> foo"; cursor sits at end of match.
+        assert!(app.prompt.ends_with(" foo"), "got: {:?}", app.prompt);
+        assert!(app.completion.is_some());
+        let state = app.completion.as_ref().unwrap();
+        assert_eq!(state.suffix, " foo");
+        assert_eq!(app.prompt_cursor, app.prompt.len() - " foo".len());
     }
 }
