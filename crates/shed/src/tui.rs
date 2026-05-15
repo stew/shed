@@ -46,7 +46,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -64,6 +67,20 @@ use crate::ansi;
 use crate::exec::{self, CaptureOutcome, ExecError, Killer};
 
 type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
+
+/// A clickable region of the screen registered by a draw pass.
+/// Rebuilt every frame; hit-tested in [`handle_mouse_click`].
+#[derive(Debug, Clone)]
+struct ClickRegion {
+    rect: Rect,
+    action: ClickAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClickAction {
+    /// Click on the `×` button on a block — delete the block.
+    DeleteBlock(BlockId),
+}
 
 struct RunningCommand {
     handle: CommandTask,
@@ -1498,6 +1515,9 @@ struct App {
     /// "Save before quitting?" exit prompt. Showing while non-None;
     /// keys map to y / n / c (cancel).
     exit_prompt: Option<ExitPrompt>,
+    /// Clickable screen regions registered by the last draw pass.
+    /// Rebuilt every frame; hit-tested when a mouse click arrives.
+    click_regions: Vec<ClickRegion>,
 }
 
 /// Disposition of the save-on-quit prompt. `AwaitingPath` is the rare
@@ -1586,6 +1606,7 @@ impl App {
             open_input: String::new(),
             open_cursor: 0,
             exit_prompt: None,
+            click_regions: Vec::new(),
         }
     }
 
@@ -1649,10 +1670,28 @@ impl App {
 }
 
 pub async fn run(notebook: Option<PathBuf>) -> io::Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = enter_tui();
     let result = app_loop(&mut terminal, notebook).await;
-    ratatui::restore();
+    leave_tui();
     result
+}
+
+/// Initialise ratatui *and* enable mouse capture. Mirrors
+/// `ratatui::init()` but also turns on crossterm mouse events so
+/// clicks on per-block `×` buttons (and any future click targets) are
+/// delivered to the event loop. Best-effort: if the terminal doesn't
+/// support mouse capture, `execute!` silently fails and we still
+/// return a usable TUI.
+fn enter_tui() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+    terminal
+}
+
+/// Tear down what [`enter_tui`] set up. Must be paired one-to-one.
+fn leave_tui() {
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+    ratatui::restore();
 }
 
 async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> io::Result<()> {
@@ -1683,16 +1722,22 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
         drain_streams(&mut app);
         reap_completed(&mut app).await;
         advance_run_chain(&mut app);
-        terminal.draw(|f| draw(f, &app))?;
+        let mut regions: Vec<ClickRegion> = Vec::new();
+        terminal.draw(|f| draw(f, &app, &mut regions))?;
+        app.click_regions = regions;
         if app.quit {
             return Ok(());
         }
         if event::poll(POLL_TIMEOUT)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.flash = None;
                     handle_key(&mut app, key).await;
                 }
+                Event::Mouse(me) => {
+                    handle_mouse(&mut app, me);
+                }
+                _ => {}
             }
         }
     }
@@ -2030,6 +2075,15 @@ fn delete_block_at_cursor(app: &mut App) {
         app.flash = Some("no block selected".into());
         return;
     };
+    delete_block(app, id);
+}
+
+/// Remove a specific block by id. Kills its running command (if any),
+/// pulls it from the run chain, and removes it from the session. If
+/// the deleted block was under the cursor, advance the cursor to its
+/// next sibling (or previous, or return to prompt if the session is
+/// now empty); otherwise leave the cursor alone.
+fn delete_block(app: &mut App, id: BlockId) {
     if app.session.block(id).is_none() {
         return;
     }
@@ -2042,6 +2096,7 @@ fn delete_block_at_cursor(app: &mut App) {
     if app.chain_in_flight == Some(id) {
         app.chain_in_flight = None;
     }
+    let was_cursor = app.session.cursor() == Some(id);
     let ids = app.block_ids_in_order();
     let next_cursor = ids
         .iter()
@@ -2053,11 +2108,13 @@ fn delete_block_at_cursor(app: &mut App) {
     if removed.is_none() {
         return;
     }
-    app.session.set_cursor(next_cursor);
-    if next_cursor.is_some() {
-        app.reset_pipeline_cursor();
-    } else {
-        app.focus = Focus::Prompt;
+    if was_cursor {
+        app.session.set_cursor(next_cursor);
+        if next_cursor.is_some() {
+            app.reset_pipeline_cursor();
+        } else {
+            app.focus = Focus::Prompt;
+        }
     }
     app.flash = Some(format!("deleted %{}", id.0));
 }
@@ -2158,7 +2215,7 @@ async fn perform_handover(
     app: &mut App,
     req: HandoverRequest,
 ) -> io::Result<()> {
-    ratatui::restore();
+    leave_tui();
 
     let id = match req.reuse_block {
         Some(existing) => existing,
@@ -2172,7 +2229,7 @@ async fn perform_handover(
         .status()
         .await;
 
-    *terminal = ratatui::init();
+    *terminal = enter_tui();
 
     match status_result {
         Ok(status) => {
@@ -3266,6 +3323,32 @@ fn cycle_completion(app: &mut App, dir: i32) {
         state.base_text, state.matches[state.idx], state.suffix
     );
     set_current_input(app, new_text, new_cursor);
+}
+
+/// Dispatch a mouse event by hit-testing the click regions registered
+/// during the last draw pass. Only left-button-down counts as a
+/// "click" today; scroll and motion events are ignored.
+fn handle_mouse(app: &mut App, me: MouseEvent) {
+    if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    let hit = app
+        .click_regions
+        .iter()
+        .find(|r| {
+            me.column >= r.rect.x
+                && me.column < r.rect.x + r.rect.width
+                && me.row >= r.rect.y
+                && me.row < r.rect.y + r.rect.height
+        })
+        .map(|r| r.action);
+    let Some(action) = hit else {
+        return;
+    };
+    app.flash = None;
+    match action {
+        ClickAction::DeleteBlock(id) => delete_block(app, id),
+    }
 }
 
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
@@ -5121,7 +5204,7 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
         Focus::BlockExpand => draw_block_expand(f, app),
@@ -5129,7 +5212,7 @@ fn draw(f: &mut Frame, app: &App) {
         Focus::Palette => draw_palette(f, app),
         Focus::NoteEdit => draw_note_edit(f, app),
         Focus::AliasManage => draw_alias_manage(f, app),
-        _ => draw_repl(f, app),
+        _ => draw_repl(f, app, regions),
     }
 }
 
@@ -5727,7 +5810,7 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
     draw_status(f, chunks[2], app);
 }
 
-fn draw_repl(f: &mut Frame, app: &App) {
+fn draw_repl(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -5742,7 +5825,7 @@ fn draw_repl(f: &mut Frame, app: &App) {
         .map(|p| collapse_home_in_path(&p))
         .unwrap_or_else(|| "?".into());
     draw_header(f, chunks[0], &cwd);
-    draw_blocks(f, chunks[1], app);
+    draw_blocks(f, chunks[1], app, regions);
     draw_status(f, chunks[2], app);
 }
 
@@ -5833,7 +5916,7 @@ fn draw_header(f: &mut Frame, area: Rect, title: &str) {
     f.render_widget(header, area);
 }
 
-fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
+fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
     let cursor_id = app.session.cursor();
     let cursor_visible = matches!(app.focus, Focus::BlockCursor | Focus::EditBlock);
     let blocks: Vec<&shed_core::Block> = app.session.blocks().collect();
@@ -5891,7 +5974,15 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     for (i, (lines, selected, editing)) in visible.iter().enumerate() {
-        draw_one_block(f, rects[i], blocks[start + i], lines, *selected, *editing);
+        draw_one_block(
+            f,
+            rects[i],
+            blocks[start + i],
+            lines,
+            *selected,
+            *editing,
+            regions,
+        );
     }
     let scratch_rect = rects[rects.len() - 1];
     draw_scratch_box(f, scratch_rect, app);
@@ -5965,6 +6056,7 @@ fn draw_one_block(
     lines: &[Line<'static>],
     selected: bool,
     editing: bool,
+    regions: &mut Vec<ClickRegion>,
 ) {
     let pinned = block.name.is_some();
     let id_text = match &block.name {
@@ -6022,6 +6114,32 @@ fn draw_one_block(
     f.render_widget(widget, area);
     let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+
+    // Clickable `×` on the top-right border. Three cells (` × `) so
+    // the hit-target is forgiving; only render when the block is wide
+    // enough that it can't collide with the title (left side).
+    let close_width: u16 = 3;
+    let min_room: u16 = 6; // corner + 1 padding + title room + close + corner
+    if area.width >= min_room {
+        let close_x = area.right().saturating_sub(close_width + 1);
+        let buf = f.buffer_mut();
+        let close_style = Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD);
+        // Repaint the three cells over the top border with `[×]` (or
+        // ` × ` for a softer look). Picking `[×]` so it visually
+        // reads as a button.
+        let _ = buf.set_string(close_x, area.y, "[×]", close_style);
+        regions.push(ClickRegion {
+            rect: Rect {
+                x: close_x,
+                y: area.y,
+                width: close_width,
+                height: 1,
+            },
+            action: ClickAction::DeleteBlock(block.id),
+        });
+    }
 }
 
 fn render_block(
@@ -9094,6 +9212,93 @@ mod tests {
             InputOutcome::Continue
         );
         assert_eq!(t, "abc");
+    }
+
+    #[test]
+    fn delete_block_via_id_removes_block_without_moving_cursor_if_not_on_it() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        let b = app.session.add_block(vec!["b".into()]);
+        let c = app.session.add_block(vec!["c".into()]);
+        app.session.set_cursor(Some(a));
+        delete_block(&mut app, c);
+        assert!(app.session.block(c).is_none());
+        assert_eq!(app.session.cursor(), Some(a), "cursor unaffected");
+        assert!(app.session.block(b).is_some());
+    }
+
+    #[test]
+    fn delete_block_via_id_moves_cursor_if_it_was_on_the_target() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        let b = app.session.add_block(vec!["b".into()]);
+        app.session.set_cursor(Some(a));
+        delete_block(&mut app, a);
+        assert_eq!(app.session.cursor(), Some(b), "cursor advances to next");
+    }
+
+    #[test]
+    fn handle_mouse_click_in_delete_region_removes_that_block() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        let b = app.session.add_block(vec!["b".into()]);
+        // Pretend the renderer placed a delete region for block b at
+        // (10, 5) - 3 cells wide, 1 cell tall.
+        app.click_regions.push(ClickRegion {
+            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            action: ClickAction::DeleteBlock(b),
+        });
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.session.block(b).is_none(), "block b deleted");
+        assert!(app.session.block(a).is_some(), "block a kept");
+    }
+
+    #[test]
+    fn handle_mouse_click_outside_regions_does_nothing() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        app.click_regions.push(ClickRegion {
+            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            action: ClickAction::DeleteBlock(a),
+        });
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.session.block(a).is_some(), "block a still present");
+    }
+
+    #[test]
+    fn handle_mouse_ignores_non_click_events() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        app.click_regions.push(ClickRegion {
+            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            action: ClickAction::DeleteBlock(a),
+        });
+        // A scroll event right inside the region — must not delete.
+        let me = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 11,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.session.block(a).is_some());
     }
 
     #[test]

@@ -88,6 +88,13 @@ pressure (LRU); pinned blocks count toward the budget but never evict.
 Pin a block with `p` from BlockCursor — it renders with `◉ <name>`
 next to its command. `u` unpins.
 
+Each block's top-right border carries a clickable `[×]` button — left
+click on it to delete that block (kills the running command first if
+it's still in flight). Same effect as pressing `x` with the block
+selected, and equally undoable via `Ctrl-Z`. Mouse capture is enabled
+automatically and toggled off during fullscreen handover so the child
+program owns the terminal.
+
 ### Pipelines
 
 A pipeline is an ordered list of filters applied to a block's captured
