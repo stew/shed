@@ -14,7 +14,7 @@
 //! - **`\r`** (carriage return): resets the column to 0, so subsequent
 //!   prints overwrite earlier characters on the same line. This is what
 //!   makes cargo's `Building (10%) … (100%)` progress bar collapse to
-//!   only the final state in the captured block.
+//!   only the final state in the captured shed.
 //! - **`\x1b[K`** (Erase in Line): truncates from cursor to end (param 0
 //!   or default), erases from start to cursor (param 1), or clears the
 //!   whole line (param 2). Combined with `\r` this is the standard

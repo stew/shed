@@ -3,7 +3,7 @@
 > An interactive shell where the pipeline comes after the command.
 
 shed is a TUI shell (Linux/macOS) that captures every command's output as a
-structured **block** and lets you build pipelines **retroactively** — adding,
+structured **shed** and lets you build pipelines **retroactively** — adding,
 editing, removing, and reordering filters with live preview. The killer
 feature is that you don't have to know what filter you want before you run
 the command. Run it; look at the output; sculpt the pipeline.
@@ -33,7 +33,7 @@ source.
 
   ─────────────────────────────────────────────────────────────────
   ▶ |
-   Enter run · !cmd fullscreen · Esc focus block · Ctrl-D quit
+   Enter run · !cmd fullscreen · Esc focus shed · Ctrl-D quit
 ```
 
 The yellow `ⓘ-1` next to `where _5 > 1000` says: *one row was dropped
@@ -51,18 +51,18 @@ cargo run -- ./demo.json           # open a notebook (created if absent)
 
 A walkthrough:
 
-1. Type a command — `ls -la /etc` — and press **Enter**. Block `%1` appears
+1. Type a command — `ls -la /etc` — and press **Enter**. Shed `%1` appears
    with colored output (shed runs commands in a PTY so terminal-aware
    programs emit color).
-2. Press **Esc** to focus the newest block. The prompt at the bottom
-   changes to `(block %1 selected)`. The block highlights in cyan.
+2. Press **Esc** to focus the newest shed. The prompt at the bottom
+   changes to `(shed %1 selected)`. The shed highlights in cyan.
 3. Press **f** to open the filter form. You're now in *FilterEdit* focus:
    the screen splits into preview / pipeline stack / form.
 4. The form's first field is the filter type. Use **←→** to cycle:
    `from-lines`, `from-fields`, `from-csv`, `from-json`, `from-regex`,
    `where`, `select`, `drop`, `take`, `skip`, `sort-by`, `uniq`, `count`,
    `rename`. Pick `from-fields` and press **Enter**.
-5. The block now shows columns `_1` through `_9` and the inline pipeline
+5. The shed now shows columns `_1` through `_9` and the inline pipeline
    reads `from-fields`.
 6. Press **f** again to add another filter. The form defaults to `where`
    because the schema is non-empty. **Tab** through fields:
@@ -74,30 +74,30 @@ To quit: `Ctrl-D`.
 
 ## Concepts
 
-### Blocks
+### Sheds
 
-Each command spawns a *block* with:
+Each command spawns a *shed* with:
 
 - captured stdout (PTY merges stderr into stdout; cap defaults to 16 MB)
 - exit code
 - a retroactive pipeline of filters
 - a monotonic id (`%1`, `%2`, …) and an optional pinned name (`◉ name`)
 
-Blocks live in a session-wide store. Unnamed blocks evict on memory
-pressure (LRU); pinned blocks count toward the budget but never evict.
-Pin a block with `p` from BlockCursor — it renders with `◉ <name>`
+Sheds live in a session-wide store. Unnamed sheds evict on memory
+pressure (LRU); pinned sheds count toward the budget but never evict.
+Pin a shed with `p` from ShedCursor — it renders with `◉ <name>`
 next to its command. `u` unpins.
 
-Each block's top-right border carries a clickable `[×]` button — left
-click on it to delete that block (kills the running command first if
-it's still in flight). Same effect as pressing `x` with the block
+Each shed's top-right border carries a clickable `[×]` button — left
+click on it to delete that shed (kills the running command first if
+it's still in flight). Same effect as pressing `x` with the shed
 selected, and equally undoable via `Ctrl-Z`. Mouse capture is enabled
 automatically and toggled off during fullscreen handover so the child
 program owns the terminal.
 
 ### Pipelines
 
-A pipeline is an ordered list of filters applied to a block's captured
+A pipeline is an ordered list of filters applied to a shed's captured
 stdout. Filters fall into four classes:
 
 - **Parsers** turn raw bytes into structured rows: `from-lines`,
@@ -112,24 +112,24 @@ filter. Captures are bounded (16 MB) so re-running the pipeline is cheap.
 
 ### Focus model
 
-Each block renders as a bordered box; the box title carries the
-identifier (`%5` or `@name` for pinned blocks) plus a state glyph. A
+Each shed renders as a bordered box; the box title carries the
+identifier (`%5` or `@name` for pinned sheds) plus a state glyph. A
 single "scratch" box at the bottom is the place to type a new command —
 it's always present and takes the next id.
 
-- **BlockCursor** — navigate blocks (`↑↓`); the scratch sits one slot
-  past the last real block. Compact view: id/name + glyph + output. To
-  reveal the command and the pipeline, press `e` to enter EditBlock.
+- **ShedCursor** — navigate sheds (`↑↓`); the scratch sits one slot
+  past the last real shed. Compact view: id/name + glyph + output. To
+  reveal the command and the pipeline, press `e` to enter EditShed.
   Press `v` to open the fullscreen pager. Press `/` to jump to the
   prompt and start typing.
-- **EditBlock** — pipeline-edit mode for the cursor block. The argv is
+- **EditShed** — pipeline-edit mode for the cursor shed. The argv is
   shown on the first line and each filter on its own indented line;
   `←→` navigates between the command and the filters; `f`/Enter opens
   the form editor for the active slot; `i` inserts, `d` drops, `<>`
-  reorder. `Esc` returns to BlockCursor.
+  reorder. `Esc` returns to ShedCursor.
 - **Prompt** — typing in the scratch box. `Enter` runs (and the new
-  block appears in place of the scratch; a fresh scratch is drawn for
-  the next command). `Esc` returns to BlockCursor on the last block.
+  shed appears in place of the scratch; a fresh scratch is drawn for
+  the next command). `Esc` returns to ShedCursor on the last shed.
   `↑↓` walk persistent history.
 - **FilterEdit** — schema-aware form for the active filter, with live
   preview at the top.
@@ -137,7 +137,7 @@ it's always present and takes the next id.
 ### Concurrency
 
 Commands run in tokio tasks; the TUI never freezes. Multiple commands can
-run side-by-side. Each block carries a status glyph:
+run side-by-side. Each shed carries a status glyph:
 
 | glyph | meaning |
 |------:|---------|
@@ -160,14 +160,14 @@ render cleanly. Programs that try to take over the screen get
 
 Output streams in: each chunk the reader pulls off the PTY is sent
 through an mpsc channel that the event loop drains every tick and
-mirrors onto the block's `capture` while the command is still running.
+mirrors onto the shed's `capture` while the command is still running.
 The pipeline re-applies on every render, so `from-lines | where …`
 shows partial rows accumulate in real time. The final `Capture` (with
 exit code + finished timestamp) replaces the partial one when the
-reader task completes. While a block is `Running`, its inline preview
+reader task completes. While a shed is `Running`, its inline preview
 *tails* the output (most recent rows at the bottom, with `… N more
 rows` pinned to the top) so the latest activity is always visible.
-Once the block reaches `Done`, the preview reverts to the standard
+Once the shed reaches `Done`, the preview reverts to the standard
 head-with-`… N more` style.
 
 ### Builtins
@@ -191,42 +191,42 @@ need real shell semantics.
 
 ### Pinned references (`@name`)
 
-A pinned block (`p` to pin) gets a name. Type `@name` at the prompt and
-shed creates a new block whose capture is a *snapshot* of `@name`'s
+A pinned shed (`p` to pin) gets a name. Type `@name` at the prompt and
+shed creates a new shed whose capture is a *snapshot* of `@name`'s
 current pipeline output:
 
 - structured output (rows from a parser) is rendered as pretty JSON, so
-  the snapshot block typically starts with `from-json`
+  the snapshot shed typically starts with `from-json`
 - raw bytes are passed through unchanged
 
 The snapshot is taken at create time. It does *not* re-evaluate when the
-source changes — to refresh, focus the snapshot block and press `Space`
+source changes — to refresh, focus the snapshot shed and press `Space`
 (re-run in place re-snapshots from the source's current state). If the
-source is gone or has no capture, the snapshot block lands in `Failed`
+source is gone or has no capture, the snapshot shed lands in `Failed`
 state with a message saying so.
 
-**Dependency auto-run.** If you run a snapshot block (`Space` or typing
+**Dependency auto-run.** If you run a snapshot shed (`Space` or typing
 `@name`) and the source itself hasn't run yet, shed walks the chain and
 runs the prereqs first, in dep order. A flash message tells you what's
 about to happen (`running 2 deps first, then %5`). If a prereq fails, the
 rest of the chain is dropped rather than running against a stale source.
 Cycles (`@a` pinned as `a`) terminate via cycle-detection.
 
-`@name` blocks save and load through notebooks like any other block (the
+`@name` sheds save and load through notebooks like any other shed (the
 argv is just `@name`); on re-open they're `Idle` and re-snapshot when
 you run them.
 
-### Block notes (pre / post text)
+### Shed notes (pre / post text)
 
-Each block can carry two free-form text notes — `pre_text` shown above
-the block, `post_text` shown below. Use them for section headers,
+Each shed can carry two free-form text notes — `pre_text` shown above
+the shed, `post_text` shown below. Use them for section headers,
 running commentary, observations about the output, or anything else you
 want to preserve alongside the command.
 
 | Key | Action |
 |-----|--------|
-| `n` | edit the pre-note (above the block) |
-| `N` | edit the post-note (below the block) |
+| `n` | edit the pre-note (above the shed) |
+| `N` | edit the post-note (below the shed) |
 
 In the editor: type to insert at the cursor, `Enter` for newline,
 `Backspace` / `Delete`, `←→ ↑↓ Home End` to navigate, `Ctrl-S` to save,
@@ -239,12 +239,12 @@ notebooks alongside argv, name, and pipeline.
 ### Aliases
 
 A *global* alias is a saved `(argv, pipeline)` pair addressed by name.
-Type the name at the prompt and shed materialises a fresh block with
+Type the name at the prompt and shed materialises a fresh shed with
 that argv and pipeline pre-filled, then drops you into in-place command
 edit so you can append args before running:
 
 ```
-list           ↵    →   block %N appears with argv `ls -lat`,
+list           ↵    →   shed %N appears with argv `ls -lat`,
                          cmd-edit bar shows  `ls -lat ` (cursor at end)
 list /etc      ✗         (alias lookup is single-token only)
 ```
@@ -254,8 +254,8 @@ Use `bash -c 'ls'` if you need to bypass.
 
 | How                      | Action |
 |--------------------------|--------|
-| `A` (in BlockCursor)     | save the cursor block as an alias (input bar `alias name:`). If the name already exists, a `[y]es / [n]o` prompt appears before overwriting. |
-| type `<name>` at prompt  | invoke alias — creates an Idle block, opens cmd-edit pre-filled with `argv ` (trailing space) so you can append args + Enter. |
+| `A` (in ShedCursor)     | save the cursor shed as an alias (input bar `alias name:`). If the name already exists, a `[y]es / [n]o` prompt appears before overwriting. |
+| type `<name>` at prompt  | invoke alias — creates an Idle shed, opens cmd-edit pre-filled with `argv ` (trailing space) so you can append args + Enter. |
 | `/aliases` at prompt     | open the manage view: `↑↓` navigate, `x` (or `d`) delete, `Esc` / `q` back. |
 
 Storage is `$XDG_CONFIG_HOME/shed/aliases.json` (fallback
@@ -268,17 +268,17 @@ needed, then `A` again with the same name and confirm overwrite.
 ### Undo / redo
 
 `Ctrl-Z` and `Ctrl-Y` step backwards and forwards through every
-*structural* change you've made: adding a block, deleting a block,
+*structural* change you've made: adding a shed, deleting a shed,
 pinning / unpinning, editing the command, adding / dropping / reordering
-filters, editing pre / post notes, saving a block as an alias. The
+filters, editing pre / post notes, saving a shed as an alias. The
 history is in-memory only (not persisted across sessions) and capped at
 50 entries.
 
 Captures and run-state are preserved across an undo/redo round-trip:
-adding a filter, undoing, and redoing won't reset your block to Idle —
+adding a filter, undoing, and redoing won't reset your shed to Idle —
 the output you've already produced stays put. The one exception is
-undoing the *creation* of a block: the block disappears (and so does
-its capture) until you redo. Resurrecting a deleted block via undo
+undoing the *creation* of a shed: the shed disappears (and so does
+its capture) until you redo. Resurrecting a deleted shed via undo
 brings back its argv / pipeline / notes, but its capture comes back as
 whatever the snapshot held (no fresh run is triggered).
 
@@ -290,7 +290,7 @@ re-run's output, save before re-running and reload.
 ### Tab completion
 
 Available at the Prompt and inside the in-place command editor (the bar
-that appears after `e` → `f` on a block's command). Tab cycles forward
+that appears after `e` → `f` on a shed's command). Tab cycles forward
 through matches; Shift-Tab cycles backward. There's no popup list — the
 input itself is rewritten to the next candidate. Any non-Tab keystroke
 ends the cycle.
@@ -301,7 +301,7 @@ decides what to complete:
 | Token shape | Source |
 |-------------|--------|
 | `$FOO`      | environment variable names |
-| `@name`     | pinned block names |
+| `@name`     | pinned shed names |
 | `/cmd` (Prompt only, first token) | slash commands (`/aliases`) |
 | first token, otherwise | commands on `$PATH` ∪ saved aliases ∪ shell builtins (`cd`, `export`, `unset`, `exit`) |
 | second token onward, or any path-shaped token (`./`, `../`, `/...`, `~/`) | [carapace](https://carapace.sh/) if installed and it returns matches for the command (e.g. `git checkout <Tab>` → branch names, `kubectl --<Tab>` → flag names); otherwise filesystem paths (directories get a trailing `/`; hidden entries appear only when the prefix starts with `.`) |
@@ -316,7 +316,7 @@ input is left untouched.
 Every single-line input bar in shed (the main prompt, in-place command
 editor, pin / rerun / write / alias-name / save / open paths, pager
 search) supports readline-style editing. The cursor is rendered inline
-as an inverted block; arrow keys move it; characters insert at the
+as an inverted shed; arrow keys move it; characters insert at the
 cursor; Backspace / Delete remove around it.
 
 | Key | Action |
@@ -351,12 +351,12 @@ recipe, not a frozen view.
 | Open a notebook on launch | `shed PATH.json` (the file is created if it doesn't exist; it just binds the save target) |
 | Save                   | `Ctrl-S` — saves to the bound path; if none, opens an input bar to pick one |
 | Save as / open another | `Ctrl-O` — input bar to load a different notebook (replaces the current session) |
-| Run a loaded block     | move the cursor onto it (`Esc`, `↑↓`) and press `Space` (or `x`). Loaded blocks start in `Idle` state with a hollow `○` glyph; running them swaps the capture in place. |
+| Run a loaded shed     | move the cursor onto it (`Esc`, `↑↓`) and press `Space` (or `x`). Loaded sheds start in `Idle` state with a hollow `○` glyph; running them swaps the capture in place. |
 | Quit with unsaved work | `Ctrl-D` shows `unsaved changes — save before quitting? [y]es [n]o [c]ancel` instead of quitting straight away |
 
-Block re-runs and pipeline edits set a *dirty* flag. Save clears it;
+Shed re-runs and pipeline edits set a *dirty* flag. Save clears it;
 quitting while dirty triggers the confirmation prompt. `Ctrl-S` from
-anywhere (Prompt, BlockCursor, even mid-FilterEdit) writes the current
+anywhere (Prompt, ShedCursor, even mid-FilterEdit) writes the current
 session out.
 
 ### Fullscreen handover
@@ -364,7 +364,7 @@ session out.
 For interactive programs (`top`, `vim`, `less`, `man`, `tmux`, `ssh`,
 `tig`, `ranger`, `fzf`, …), shed temporarily yields the entire terminal:
 tears down its TUI, runs the child with inherited stdio, restores. The
-block records the exit code with no captured output (`(no captured
+shed records the exit code with no captured output (`(no captured
 output)`).
 
 Detection has three paths, in order:
@@ -375,7 +375,7 @@ Detection has three paths, in order:
 - **Auto-detect at runtime** — the PTY reader watches each chunk for
   alt-screen-enter sequences (`\x1b[?1049h` and the older
   `\x1b[?47h` / `\x1b[?1047h`). If it sees one mid-capture, it kills
-  the child, signals the TUI, and the same block is retried with
+  the child, signals the TUI, and the same shed is retried with
   inherited stdio. A flash message confirms: `%N switched to
   fullscreen mode`. Means programs not on the blacklist (`htop` aliases,
   custom TUIs, …) Just Work after the first attempt.
@@ -430,8 +430,8 @@ so you don't lose data without noticing.
 | Left / Right    | move one char |
 | Delete          | delete the char under the cursor |
 | `!cmd`    | force fullscreen handover (typed prefix) |
-| `@name`   | snapshot the output of pinned block `@name` into a new block (see Pinned references) |
-| Esc       | focus newest block |
+| `@name`   | snapshot the output of pinned shed `@name` into a new shed (see Pinned references) |
+| Esc       | focus newest shed |
 | Ctrl-D    | quit (or prompt if unsaved) |
 | Ctrl-C    | quit (no running selection) |
 | Ctrl-P    | open the command palette |
@@ -439,53 +439,53 @@ so you don't lose data without noticing.
 | Ctrl-O    | open notebook (replaces the current session) |
 | Ctrl-Z / Ctrl-Y | undo / redo the most recent structural change (see Undo / redo) |
 
-### BlockCursor
+### ShedCursor
 
-The compact, default focus. Each block renders as a bordered box with
+The compact, default focus. Each shed renders as a bordered box with
 just `id/name + glyph + output`; the command and pipeline stay hidden
-until you press `e` to enter EditBlock. Pressing `↓` past the last real
-block *selects* the scratch box (still in BlockCursor, rendered in
-cyan); `↑` walks back to the last block, and Enter / Space / `e`
+until you press `e` to enter EditShed. Pressing `↓` past the last real
+shed *selects* the scratch box (still in ShedCursor, rendered in
+cyan); `↑` walks back to the last shed, and Enter / Space / `e`
 activates the scratch for typing (focus shifts to Prompt, rendered in
 green).
 
 | Key       | Action |
 |-----------|--------|
-| `↑↓`      | navigate between blocks; `↓` past the last block selects the scratch box (still BlockCursor); `↑` from the scratch returns to the last block. |
-| `e`       | enter EditBlock — reveals the command and each filter on its own line so you can navigate / edit them. On the scratch box, `e` activates the prompt for typing. |
-| `v`       | view the selected block in the fullscreen pager. |
+| `↑↓`      | navigate between sheds; `↓` past the last shed selects the scratch box (still ShedCursor); `↑` from the scratch returns to the last shed. |
+| `e`       | enter EditShed — reveals the command and each filter on its own line so you can navigate / edit them. On the scratch box, `e` activates the prompt for typing. |
+| `v`       | view the selected shed in the fullscreen pager. |
 | `/`       | jump to the scratch (Prompt) with `/` typed for slash commands like `/aliases`. |
 | Enter     | on the scratch box, activate the prompt for typing. |
-| Space     | run the selected block in place (re-spawns its argv, replaces the capture). On the scratch box, activate the prompt. For `@name` snapshot blocks this re-snapshots from the source. |
-| `x`       | delete the selected block from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
-| `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
-| `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render their box title as `@name` and never evict on capture-budget pressure. Empty name unpins. |
-| `u`       | unpin the selected block (clear its name) |
-| `r`       | open a rerun input bar pre-filled with the block's argv (shlex-quoted). Edit and Enter to spawn a new block with the edited command and the same pipeline copied over; Esc cancels. The original block is unchanged. |
-| `n` / `N` | edit the block's pre-note / post-note (multi-line text rendered above / below the block, persisted to the notebook) |
-| `A`       | save the block as a global alias (input bar; overwrites prompt for confirmation) |
+| Space     | run the selected shed in place (re-spawns its argv, replaces the capture). On the scratch box, activate the prompt. For `@name` snapshot sheds this re-snapshots from the source. |
+| `x`       | delete the selected shed from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
+| `w`       | write the shed's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
+| `p`       | pin the selected shed under a name (input bar pre-fills with the existing name if any). Pinned sheds render their box title as `@name` and never evict on capture-budget pressure. Empty name unpins. |
+| `u`       | unpin the selected shed (clear its name) |
+| `r`       | open a rerun input bar pre-filled with the shed's argv (shlex-quoted). Edit and Enter to spawn a new shed with the edited command and the same pipeline copied over; Esc cancels. The original shed is unchanged. |
+| `n` / `N` | edit the shed's pre-note / post-note (multi-line text rendered above / below the shed, persisted to the notebook) |
+| `A`       | save the shed as a global alias (input bar; overwrites prompt for confirmation) |
 | Ctrl-C    | cancel a running command (kills the child) |
 | Ctrl-S    | save notebook |
 | Ctrl-O    | open notebook |
 | Esc       | back to prompt |
 | Ctrl-D    | quit (or prompt if unsaved) |
 
-### EditBlock
+### EditShed
 
-Entered by pressing `e` on a block. The block's command appears on the
+Entered by pressing `e` on a shed. The shed's command appears on the
 first line; each filter on its own indented `│ filter` row below it.
-Block-level actions (run, delete, pin, etc.) live one focus up — `Esc`
-returns to BlockCursor for those.
+Shed-level actions (run, delete, pin, etc.) live one focus up — `Esc`
+returns to ShedCursor for those.
 
 | Key       | Action |
 |-----------|--------|
 | `↑↓`      | navigate vertically through the command, each filter, and the `+ add` slot. `↑` at the first filter steps onto the command (highlighted in magenta); `↓` from the command returns to the filter list. `←→` are aliases for muscle memory. |
-| `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the block; if the block is pinned, every block whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
+| `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the shed; if the shed is pinned, every shed whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
 | Tab / Shift-Tab | (in-place command editor only) cycle through completions for the token at the end of the line (see Tab completion). |
 | `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
 | `d`       | drop the filter at cursor (or last if on add slot) |
-| Esc       | back to BlockCursor |
+| Esc       | back to ShedCursor |
 
 ### FilterEdit
 
@@ -499,15 +499,15 @@ returns to BlockCursor for those.
 | `a`                  | (on SortKeys / where-clause) append a new row |
 | `x` / Backspace      | (on SortKeys / where-clause) remove the active row (min 1) |
 | Enter                | apply — commits the in-progress filter to the pipeline |
-| Esc                  | cancel — restores the saved filter, returns to BlockCursor |
+| Esc                  | cancel — restores the saved filter, returns to ShedCursor |
 
 ### Palette (command palette)
 
 Opened from any focus by **Ctrl-P**. A fuzzy-search list of every named
-action shed supports — quit, focus newest block, open env editor, pin /
-unpin / expand / write / rerun the selected block, open the filter
-form, etc. Actions whose preconditions aren't met (e.g. "Pin block"
-when no block is selected) are filtered out, so the list never offers
+action shed supports — quit, focus newest shed, open env editor, pin /
+unpin / expand / write / rerun the selected shed, open the filter
+form, etc. Actions whose preconditions aren't met (e.g. "Pin shed"
+when no shed is selected) are filtered out, so the list never offers
 something it can't do.
 
 | Key      | Action |
@@ -536,9 +536,9 @@ commands immediately.
 | Esc                 | exit the input mode you're in (filter / edit / add); a second Esc / `q` leaves the editor |
 | Ctrl-D              | quit shed |
 
-### BlockExpand (pager)
+### ShedExpand (pager)
 
-Entered via `e` from BlockCursor. The selected block's full pipeline
+Entered via `e` from ShedCursor. The selected shed's full pipeline
 output fills the screen.
 
 | Key                 | Action |
@@ -553,8 +553,8 @@ output fills the screen.
 | Esc (in /-mode)     | cancel; revert scroll to anchor; clear query |
 | `n` / `N`           | jump to next / previous match (wraps; always forward / backward regardless of how the search was initiated) |
 | `i`                 | toggle case-insensitive matching (re-runs the active search) |
-| Esc                 | clear active search; or, if no search, back to BlockCursor |
-| `q`                 | back to BlockCursor (always) |
+| Esc                 | clear active search; or, if no search, back to ShedCursor |
+| `q`                 | back to ShedCursor (always) |
 | Ctrl-D              | quit |
 
 Search is **regex** (Rust `regex` crate). Default is case-sensitive; `i` toggles case-insensitivity (header shows `(i)` next to the query, achieved by prefixing the pattern with `(?i)`). The header shows `/<query>  (N matches)` while a query is active. Matched **substrings** within each line render with reversed video, leaving the rest of the line's ANSI styling intact. While typing, an invalid regex shows `(invalid regex)` next to the input bar but doesn't break typing — once it parses again, the search resumes.
@@ -569,7 +569,7 @@ shed/
 │   │   ├── value.rs    Value enum
 │   │   ├── capture.rs  Capture struct
 │   │   ├── filter.rs   FilterSpec, Predicate, Filter trait, apply_with_notes
-│   │   ├── block.rs    Block, BlockId, BlockState (incl. Idle for loaded notebooks)
+│   │   ├── shed.rs    Shed, ShedId, ShedState (incl. Idle for loaded notebooks)
 │   │   ├── notebook.rs Notebook save/load (JSON, structure-only)
 │   │   ├── aliases.rs  Cross-session named (argv, pipeline) saves
 │   │   └── session.rs  Session with LRU eviction
@@ -609,7 +609,7 @@ shed/
   so the loss is visible.
 - **Capture is bounded.** Default 16 MB per command; once full, the cap
   is held but the child keeps running (we drain the rest to /dev/null
-  so the pipe doesn't block).
+  so the pipe doesn't shed).
 - **PTY merges stdout/stderr.** That's an unavoidable PTY tradeoff. If
   separate streams matter for a workflow, `bash -c 'cmd 2>file'` is the
   workaround.
@@ -628,10 +628,10 @@ Known gaps and likely next steps, in rough priority order:
   cargo-style progress bars; tools that update several lines via
   cursor up still produce stacked output.
 - Saved/named pipelines as reusable computations
-- Standalone note entries between blocks (today notes attach as
-  pre / post text on a specific command block — fine for commentary
+- Standalone note entries between sheds (today notes attach as
+  pre / post text on a specific command shed — fine for commentary
   alongside a command but not for prose-only sections)
-- Scrollback within long block previews (sub-block scroll without
+- Scrollback within long shed previews (sub-shed scroll without
   entering the pager)
 
 ## License

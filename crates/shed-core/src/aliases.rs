@@ -1,7 +1,7 @@
 //! Global, cross-session command aliases.
 //!
 //! An alias is a `(name, argv, pipeline)` triple. Type the name at the
-//! shed prompt and a new block materialises with the saved argv and
+//! shed prompt and a new shed materialises with the saved argv and
 //! pipeline already filled in — useful for "I always want `ls -lat |
 //! from-fields | sort-by` formatted as a table" scenarios.
 //!

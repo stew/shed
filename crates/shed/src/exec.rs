@@ -50,7 +50,7 @@ pub type ExecHandle = JoinHandle<Result<CaptureOutcome, ExecError>>;
 /// Receiver yielded from [`spawn_command`] alongside the join handle.
 /// Each PTY read that contributes bytes to the eventual capture also
 /// sends those bytes through this channel, so the TUI can stream the
-/// output into the block's `capture` while the command is still
+/// output into the shed's `capture` while the command is still
 /// running. The sender side is closed when the reader task ends; the
 /// receiver becomes `Disconnected` after that.
 pub type ChunkReceiver = mpsc::UnboundedReceiver<Bytes>;
@@ -61,7 +61,7 @@ pub type ChunkReceiver = mpsc::UnboundedReceiver<Bytes>;
 /// child exited. `NeededFullscreen` means the reader spotted an alt-screen
 /// enter sequence (`\x1b[?1049h` and friends) in the byte stream, killed
 /// the PTY child, and is signaling the TUI to retry as a fullscreen
-/// handover. The TUI keeps the original block's id, swaps in inherited
+/// handover. The TUI keeps the original shed's id, swaps in inherited
 /// stdio, and runs the program with full terminal control.
 #[derive(Debug)]
 pub enum CaptureOutcome {
@@ -87,7 +87,7 @@ pub fn contains_alt_screen(haystack: &[u8]) -> bool {
 ///   (await it to get the final [`CaptureOutcome`]);
 /// - a [`Killer`] that terminates the child while the task is still reading;
 /// - a [`ChunkReceiver`] that yields each captured chunk in flight, so the
-///   TUI can stream output into the block while the command runs.
+///   TUI can stream output into the shed while the command runs.
 ///
 /// The killer is delivered via a oneshot once the child has actually
 /// been spawned, so this fn is async (typically completes within
@@ -212,7 +212,7 @@ fn run_blocking(
             &chunk[..remaining]
         };
         if !kept.is_empty() {
-            // Receiver gone (TUI dropped the block / shut down) — keep
+            // Receiver gone (TUI dropped the shed / shut down) — keep
             // reading anyway so the local `buf` and exit code stay
             // consistent, just stop streaming.
             let _ = chunk_tx.send(Bytes::copy_from_slice(kept));

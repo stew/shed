@@ -7,7 +7,7 @@
 //! ## Modules
 //!
 //! - [`tui`] — ratatui-based TUI: focus model, filter form, event loop,
-//!   block rendering. Calls into `shed_core` for data-model state and
+//!   shed rendering. Calls into `shed_core` for data-model state and
 //!   filter execution; into [`exec`] for spawning commands; into [`ansi`]
 //!   for rendering captured output.
 //! - [`exec`] — PTY-based command execution via `portable-pty`. Returns a

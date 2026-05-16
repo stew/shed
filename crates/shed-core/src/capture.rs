@@ -4,7 +4,7 @@ use std::time::Instant;
 /// A snapshot of a command's output.
 ///
 /// Captures are produced by the binary crate's PTY-based exec module and
-/// stored on a [`Block`](crate::Block). When the capture's bytes are fed
+/// stored on a [`Shed`](crate::Shed). When the capture's bytes are fed
 /// into a [`FilterSpec`](crate::FilterSpec) pipeline, parsers strip the
 /// terminal escape sequences before structuring the data, so filters work
 /// uniformly whether the capture came from a pipe or a PTY.
@@ -14,7 +14,7 @@ use std::time::Instant;
 /// If a command's output exceeds the byte cap configured at spawn time, the
 /// capture buffer stops accepting new bytes (`truncated = true`) but the
 /// child process keeps running — the binary's reader drains the rest to
-/// `/dev/null` so the child doesn't block on a full pipe.
+/// `/dev/null` so the child doesn't shed on a full pipe.
 ///
 /// # PTY note
 ///

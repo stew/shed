@@ -1,17 +1,17 @@
-//! Notebook persistence: save and load a session's blocks as JSON.
+//! Notebook persistence: save and load a session's sheds as JSON.
 //!
 //! A notebook is the durable form of a [`Session`]: an ordered list of
 //! commands plus the retroactive pipeline the user built around each one.
 //! Captures, exit codes, and timestamps are *not* persisted — re-opening
-//! a notebook gives you idle blocks ready to be re-run, not a frozen view
+//! a notebook gives you idle sheds ready to be re-run, not a frozen view
 //! of past output.
 //!
 //! Round-trip is asymmetric on purpose:
 //!
 //! - [`Notebook::from_session`] snapshots argv + name + pipeline for every
-//!   block currently in the session.
-//! - [`Notebook::apply_to_session`] inserts each entry as a fresh block in
-//!   [`BlockState::Idle`]. The user runs them via the TUI's run-in-place
+//!   shed currently in the session.
+//! - [`Notebook::apply_to_session`] inserts each entry as a fresh shed in
+//!   [`ShedState::Idle`]. The user runs them via the TUI's run-in-place
 //!   action.
 //!
 //! On-disk format is pretty-printed JSON with a `version` field so the
@@ -24,7 +24,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::block::BlockState;
+use crate::shed::ShedState;
 use crate::filter::FilterSpec;
 use crate::session::Session;
 
@@ -70,11 +70,11 @@ pub enum NotebookError {
 }
 
 impl Notebook {
-    /// Snapshot every block in the session. Block order in the notebook
-    /// matches block id order (oldest first).
+    /// Snapshot every shed in the session. Shed order in the notebook
+    /// matches shed id order (oldest first).
     pub fn from_session(session: &Session) -> Self {
         let entries = session
-            .blocks()
+            .sheds()
             .map(|b| NotebookEntry::Command {
                 argv: b.argv.clone(),
                 name: b.name.clone(),
@@ -89,7 +89,7 @@ impl Notebook {
         }
     }
 
-    /// Append every entry as a fresh block in [`BlockState::Idle`]. The
+    /// Append every entry as a fresh shed in [`ShedState::Idle`]. The
     /// session is not cleared first; callers wanting a clean load should
     /// pass a fresh [`Session`].
     pub fn apply_to_session(&self, session: &mut Session) {
@@ -101,12 +101,12 @@ impl Notebook {
                 pre_text,
                 post_text,
             } = entry;
-            let id = session.add_block(argv.clone());
-            session.set_state(id, BlockState::Idle);
-            if let Some(block) = session.block_mut(id) {
-                block.pipeline = pipeline.clone();
-                block.pre_text = pre_text.clone();
-                block.post_text = post_text.clone();
+            let id = session.add_shed(argv.clone());
+            session.set_state(id, ShedState::Idle);
+            if let Some(shed) = session.shed_mut(id) {
+                shed.pipeline = pipeline.clone();
+                shed.pre_text = pre_text.clone();
+                shed.post_text = post_text.clone();
             }
             if let Some(n) = name {
                 session.pin(id, n.clone());
@@ -142,8 +142,8 @@ mod tests {
     #[test]
     fn round_trips_argv_pipeline_and_name() {
         let mut s = Session::new();
-        let a = s.add_block(vec!["ls".into(), "-l".into()]);
-        s.block_mut(a).unwrap().pipeline = vec![
+        let a = s.add_shed(vec!["ls".into(), "-l".into()]);
+        s.shed_mut(a).unwrap().pipeline = vec![
             FilterSpec::FromFields,
             FilterSpec::Where {
                 predicate: Predicate::Compare {
@@ -160,7 +160,7 @@ mod tests {
             },
         ];
         s.pin(a, "biggies".into());
-        let _ = s.add_block(vec!["uptime".into()]);
+        let _ = s.add_shed(vec!["uptime".into()]);
 
         let nb = Notebook::from_session(&s);
         let json = serde_json::to_string(&nb).unwrap();
@@ -169,22 +169,22 @@ mod tests {
         let mut s2 = Session::new();
         nb2.apply_to_session(&mut s2);
 
-        let blocks: Vec<_> = s2.blocks().collect();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].argv, vec!["ls", "-l"]);
-        assert_eq!(blocks[0].name.as_deref(), Some("biggies"));
-        assert_eq!(blocks[0].pipeline.len(), 3);
-        assert!(matches!(blocks[0].state, BlockState::Idle));
-        assert_eq!(blocks[1].argv, vec!["uptime"]);
-        assert!(blocks[1].name.is_none());
-        assert!(blocks[1].pipeline.is_empty());
+        let sheds: Vec<_> = s2.sheds().collect();
+        assert_eq!(sheds.len(), 2);
+        assert_eq!(sheds[0].argv, vec!["ls", "-l"]);
+        assert_eq!(sheds[0].name.as_deref(), Some("biggies"));
+        assert_eq!(sheds[0].pipeline.len(), 3);
+        assert!(matches!(sheds[0].state, ShedState::Idle));
+        assert_eq!(sheds[1].argv, vec!["uptime"]);
+        assert!(sheds[1].name.is_none());
+        assert!(sheds[1].pipeline.is_empty());
     }
 
     #[test]
     fn round_trips_pre_and_post_text() {
         let mut s = Session::new();
-        let id = s.add_block(vec!["ls".into()]);
-        if let Some(b) = s.block_mut(id) {
+        let id = s.add_shed(vec!["ls".into()]);
+        if let Some(b) = s.shed_mut(id) {
             b.pre_text = Some("## Section\nthis lists things".into());
             b.post_text = Some("output looked normal".into());
         }
@@ -196,9 +196,9 @@ mod tests {
         let mut s2 = Session::new();
         nb2.apply_to_session(&mut s2);
 
-        let blocks: Vec<_> = s2.blocks().collect();
-        assert_eq!(blocks[0].pre_text.as_deref(), Some("## Section\nthis lists things"));
-        assert_eq!(blocks[0].post_text.as_deref(), Some("output looked normal"));
+        let sheds: Vec<_> = s2.sheds().collect();
+        assert_eq!(sheds[0].pre_text.as_deref(), Some("## Section\nthis lists things"));
+        assert_eq!(sheds[0].post_text.as_deref(), Some("output looked normal"));
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("shed-test-notebook-{}.json", std::process::id()));
         let mut s = Session::new();
-        s.add_block(vec!["echo".into(), "hi".into()]);
+        s.add_shed(vec!["echo".into(), "hi".into()]);
         let nb = Notebook::from_session(&s);
         nb.save(&path).unwrap();
 

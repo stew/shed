@@ -8,19 +8,19 @@
 //! | Focus         | Purpose                                          |
 //! |---------------|--------------------------------------------------|
 //! | `Prompt`      | type commands; Enter spawns                      |
-//! | `BlockCursor` | navigate blocks (↑↓), filters within (←→), edit |
+//! | `ShedCursor` | navigate sheds (↑↓), filters within (←→), edit |
 //! | `FilterEdit`  | schema-aware form for the active filter          |
-//! | `BlockExpand` | fullscreen pager for the selected block          |
+//! | `ShedExpand` | fullscreen pager for the selected shed          |
 //!
-//! Focus transitions: `Esc` from `Prompt` enters `BlockCursor` on the
-//! newest block; `Esc` from `BlockCursor` returns to `Prompt`; `f`/Enter
-//! on a block enters `FilterEdit`; `Esc` from `FilterEdit` cancels.
+//! Focus transitions: `Esc` from `Prompt` enters `ShedCursor` on the
+//! newest shed; `Esc` from `ShedCursor` returns to `Prompt`; `f`/Enter
+//! on a shed enters `FilterEdit`; `Esc` from `FilterEdit` cancels.
 //!
 //! # Concurrency
 //!
 //! Commands run as tokio `spawn_blocking` tasks (`portable-pty`'s API is
 //! sync). The event loop polls completed tasks via
-//! [`reap_completed`] each iteration and updates the corresponding block.
+//! [`reap_completed`] each iteration and updates the corresponding shed.
 //! The TUI never freezes during long-running commands; multiple commands
 //! coexist with their own ⏵/●/⚠ glyphs.
 //!
@@ -58,7 +58,7 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Alias, AliasFile, Block, BlockId, BlockState, Capture, CompareOp, Filter, FilterSpec,
+    Alias, AliasFile, Shed, ShedId, ShedState, Capture, CompareOp, Filter, FilterSpec,
     Notebook, PipelineValue, Predicate, Session, SortDirection, SortKey, Value, apply_with_notes,
 };
 use tokio::task::JoinHandle;
@@ -78,8 +78,8 @@ struct ClickRegion {
 
 #[derive(Debug, Clone, Copy)]
 enum ClickAction {
-    /// Click on the `×` button on a block — delete the block.
-    DeleteBlock(BlockId),
+    /// Click on the `×` button on a shed — delete the shed.
+    DeleteBlock(ShedId),
 }
 
 struct RunningCommand {
@@ -88,8 +88,8 @@ struct RunningCommand {
     /// Receiver of streaming output chunks from the reader task. Drained
     /// each tick by [`drain_streams`] into `stream_buf`.
     chunks: exec::ChunkReceiver,
-    /// Accumulated bytes for the in-flight block. Mirrored into
-    /// `block.capture.stdout` (as a `Bytes` copy) every time new chunks
+    /// Accumulated bytes for the in-flight shed. Mirrored into
+    /// `shed.capture.stdout` (as a `Bytes` copy) every time new chunks
     /// arrive, so the renderer sees streaming output. Dropped on reap;
     /// the final [`Capture`] from `handle.await` replaces it.
     stream_buf: BytesMut,
@@ -98,14 +98,14 @@ struct RunningCommand {
 #[derive(Debug, Clone)]
 struct HandoverRequest {
     argv: Vec<String>,
-    /// If `Some`, reuse this block's id (for auto-handover after
+    /// If `Some`, reuse this shed's id (for auto-handover after
     /// alt-screen detection); if `None`, allocate a new one (for
     /// user-initiated handover via blacklist or `!` prefix).
-    reuse_block: Option<BlockId>,
+    reuse_shed: Option<ShedId>,
 }
 
 /// Re-run a command with an edited argv but inherit the original
-/// block's pipeline. Created in BlockCursor by `r`; consumed at the
+/// shed's pipeline. Created in ShedCursor by `r`; consumed at the
 /// top of app_loop so we can spawn from an async context.
 #[derive(Debug, Clone)]
 struct RerunRequest {
@@ -145,15 +145,15 @@ const MAX_UNDO_DEPTH: usize = 50;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Prompt,
-    BlockCursor,
-    /// Pipeline-edit mode for the cursor block. Reveals the command and
+    ShedCursor,
+    /// Pipeline-edit mode for the cursor shed. Reveals the command and
     /// each filter on its own line with ←→ navigation; `f`/Enter opens
-    /// the form editor for the active slot. `Esc` returns to BlockCursor.
-    /// Block-level actions (run, delete, pin, etc.) live in BlockCursor;
-    /// EditBlock is purely for pipeline mutation.
-    EditBlock,
+    /// the form editor for the active slot. `Esc` returns to ShedCursor.
+    /// Shed-level actions (run, delete, pin, etc.) live in ShedCursor;
+    /// EditShed is purely for pipeline mutation.
+    EditShed,
     FilterEdit,
-    BlockExpand,
+    ShedExpand,
     EnvEdit,
     Palette,
     NoteEdit,
@@ -173,24 +173,24 @@ enum NotePosition {
     Post,
 }
 
-/// Multi-line text buffer state for editing a block's pre or post note.
+/// Multi-line text buffer state for editing a shed's pre or post note.
 /// Cursor is a char index into `buffer`. Up/down navigation isn't
 /// supported in v0; horizontal nav + backspace/delete cover most short
 /// notes.
 #[derive(Debug, Clone)]
 struct NoteEditState {
-    block_id: BlockId,
+    shed_id: ShedId,
     position: NotePosition,
     buffer: Vec<char>,
     cursor: usize,
 }
 
 impl NoteEditState {
-    fn new(block_id: BlockId, position: NotePosition, initial: Option<&str>) -> Self {
+    fn new(shed_id: ShedId, position: NotePosition, initial: Option<&str>) -> Self {
         let buffer: Vec<char> = initial.map(|s| s.chars().collect()).unwrap_or_default();
         let cursor = buffer.len();
         Self {
-            block_id,
+            shed_id,
             position,
             buffer,
             cursor,
@@ -218,8 +218,8 @@ impl PaletteState {
 }
 
 /// One entry in the command palette. `enabled` decides whether the action
-/// shows up at all in the current app state (e.g., "Pin block" only makes
-/// sense when a block is selected); `handler` mutates `App` to perform
+/// shows up at all in the current app state (e.g., "Pin shed" only makes
+/// sense when a shed is selected); `handler` mutates `App` to perform
 /// the action — typically by setting focus / state for downstream
 /// handling, since most actions mirror existing keybindings.
 struct Action {
@@ -233,18 +233,18 @@ fn always_enabled(_: &App) -> bool {
     true
 }
 
-fn any_blocks_exist(app: &App) -> bool {
-    app.session.blocks().next().is_some()
+fn any_sheds_exist(app: &App) -> bool {
+    app.session.sheds().next().is_some()
 }
 
-fn block_selected(app: &App) -> bool {
+fn shed_selected(app: &App) -> bool {
     app.session.cursor().is_some()
 }
 
-fn block_with_capture(app: &App) -> bool {
+fn shed_with_capture(app: &App) -> bool {
     app.session
         .cursor()
-        .and_then(|id| app.session.block(id))
+        .and_then(|id| app.session.shed(id))
         .map(|b| b.capture.is_some())
         .unwrap_or(false)
 }
@@ -268,14 +268,14 @@ const ACTIONS: &[Action] = &[
         },
     },
     Action {
-        name: "Focus newest block",
-        description: "Move the cursor to the most recent block",
-        enabled: any_blocks_exist,
+        name: "Focus newest shed",
+        description: "Move the cursor to the most recent shed",
+        enabled: any_sheds_exist,
         handler: |app| {
-            if let Some(id) = app.newest_block_id() {
+            if let Some(id) = app.newest_shed_id() {
                 app.session.set_cursor(Some(id));
                 app.reset_pipeline_cursor();
-                app.focus = Focus::BlockCursor;
+                app.focus = Focus::ShedCursor;
             }
         },
     },
@@ -290,8 +290,8 @@ const ACTIONS: &[Action] = &[
     },
     Action {
         name: "Add filter",
-        description: "Add a filter to the selected block",
-        enabled: block_with_capture,
+        description: "Add a filter to the selected shed",
+        enabled: shed_with_capture,
         handler: |app| {
             open_filter_edit(app);
         },
@@ -299,7 +299,7 @@ const ACTIONS: &[Action] = &[
     Action {
         name: "Insert filter",
         description: "Insert a filter before the cursor's filter",
-        enabled: block_with_capture,
+        enabled: shed_with_capture,
         handler: |app| {
             open_filter_insert(app);
         },
@@ -307,135 +307,135 @@ const ACTIONS: &[Action] = &[
     Action {
         name: "Drop filter",
         description: "Remove the filter at the pipeline cursor",
-        enabled: block_with_capture,
+        enabled: shed_with_capture,
         handler: |app| {
-            app.focus = Focus::EditBlock;
+            app.focus = Focus::EditShed;
             drop_filter_at_cursor(app);
         },
     },
     Action {
-        name: "Edit block (pipeline)",
+        name: "Edit shed (pipeline)",
         description: "Reveal the command + filters and navigate them",
-        enabled: block_selected,
+        enabled: shed_selected,
         handler: |app| {
-            enter_edit_block(app);
+            enter_edit_shed(app);
         },
     },
     Action {
-        name: "View block (pager)",
-        description: "Open the selected block in the fullscreen pager",
-        enabled: block_selected,
+        name: "View shed (pager)",
+        description: "Open the selected shed in the fullscreen pager",
+        enabled: shed_selected,
         handler: |app| {
             app.expand_scroll = 0;
-            app.focus = Focus::BlockExpand;
+            app.focus = Focus::ShedExpand;
         },
     },
     Action {
-        name: "Write block to file",
+        name: "Write shed to file",
         description: "Save filtered output (.csv, .tsv, .json, or plain)",
-        enabled: block_selected,
+        enabled: shed_selected,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
             app.write_input_mode = true;
             app.write_input.clear();
             app.write_cursor = 0;
         },
     },
     Action {
-        name: "Pin block",
-        description: "Open name input for the selected block",
-        enabled: block_selected,
+        name: "Pin shed",
+        description: "Open name input for the selected shed",
+        enabled: shed_selected,
         handler: |app| {
             if let Some(id) = app.session.cursor() {
                 let existing = app
                     .session
-                    .block(id)
+                    .shed(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
                 app.pin_cursor = existing.len();
                 app.pin_input = existing;
                 app.pin_input_mode = true;
-                app.focus = Focus::BlockCursor;
+                app.focus = Focus::ShedCursor;
             }
         },
     },
     Action {
-        name: "Unpin block",
-        description: "Clear the selected block's name",
-        enabled: block_selected,
+        name: "Unpin shed",
+        description: "Clear the selected shed's name",
+        enabled: shed_selected,
         handler: |app| {
             if let Some(id) = app.session.cursor() {
                 app.session.unpin(id);
             }
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
         },
     },
     Action {
         name: "Edit command in place",
-        description: "Edit the selected block's argv; re-runs it and any pinned-name dependents",
-        enabled: block_selected,
+        description: "Edit the selected shed's argv; re-runs it and any pinned-name dependents",
+        enabled: shed_selected,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
             open_cmd_edit(app);
         },
     },
     Action {
         name: "Rerun command",
-        description: "Re-run the block's command (edited) with the same pipeline",
-        enabled: block_selected,
+        description: "Re-run the shed's command (edited) with the same pipeline",
+        enabled: shed_selected,
         handler: |app| {
             if let Some(id) = app.session.cursor() {
-                if let Some(block) = app.session.block(id) {
-                    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
-                        .unwrap_or_else(|_| block.argv.join(" "));
+                if let Some(shed) = app.session.shed(id) {
+                    let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
+                        .unwrap_or_else(|_| shed.argv.join(" "));
                     app.rerun_cursor = joined.len();
                     app.rerun_input = joined;
                     app.rerun_input_mode = true;
                     app.rerun_source_id = Some(id);
                 }
             }
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
         },
     },
     Action {
         name: "Cancel running command",
-        description: "Kill the selected block's child process",
-        enabled: block_selected,
+        description: "Kill the selected shed's child process",
+        enabled: shed_selected,
         handler: |app| {
             let _ = cancel_at_cursor(app);
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
         },
     },
     Action {
-        name: "Run block in place",
-        description: "Re-spawn the selected block's command, replacing its capture",
-        enabled: block_selected,
+        name: "Run shed in place",
+        description: "Re-spawn the selected shed's command, replacing its capture",
+        enabled: shed_selected,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
-            run_cursor_block_in_place(app);
+            app.focus = Focus::ShedCursor;
+            run_cursor_shed_in_place(app);
         },
     },
     Action {
-        name: "Delete block",
-        description: "Remove the selected block from the session",
-        enabled: block_selected,
+        name: "Delete shed",
+        description: "Remove the selected shed from the session",
+        enabled: shed_selected,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
-            delete_block_at_cursor(app);
+            app.focus = Focus::ShedCursor;
+            delete_shed_at_cursor(app);
         },
     },
     Action {
         name: "Edit pre-note",
-        description: "Edit the note rendered above the selected block",
-        enabled: block_selected,
+        description: "Edit the note rendered above the selected shed",
+        enabled: shed_selected,
         handler: |app| {
             open_note_edit(app, NotePosition::Pre);
         },
     },
     Action {
         name: "Edit post-note",
-        description: "Edit the note rendered below the selected block",
-        enabled: block_selected,
+        description: "Edit the note rendered below the selected shed",
+        enabled: shed_selected,
         handler: |app| {
             open_note_edit(app, NotePosition::Post);
         },
@@ -457,11 +457,11 @@ const ACTIONS: &[Action] = &[
         },
     },
     Action {
-        name: "Save block as alias",
-        description: "Save the selected block's argv + pipeline as a global alias",
-        enabled: block_selected,
+        name: "Save shed as alias",
+        description: "Save the selected shed's argv + pipeline as a global alias",
+        enabled: shed_selected,
         handler: |app| {
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
             open_alias_save(app);
         },
     },
@@ -923,7 +923,7 @@ enum EditMode {
 }
 
 struct FilterEditState {
-    block_id: BlockId,
+    shed_id: ShedId,
     kind: FilterKind,
     where_clauses: Vec<WhereClause>,
     where_active_clause: usize,
@@ -946,10 +946,10 @@ struct FilterEditState {
 }
 
 impl FilterEditState {
-    fn empty(block_id: BlockId, available_columns: Vec<String>, mode: EditMode) -> Self {
+    fn empty(shed_id: ShedId, available_columns: Vec<String>, mode: EditMode) -> Self {
         let column_selections = vec![false; available_columns.len()];
         Self {
-            block_id,
+            shed_id,
             kind: FilterKind::FromLines,
             where_clauses: vec![WhereClause::default_for(&available_columns)],
             where_active_clause: 0,
@@ -976,9 +976,9 @@ impl FilterEditState {
         }
     }
 
-    fn for_add(block: &Block) -> Self {
-        let available_columns = compute_schema_at(block, block.pipeline.len());
-        let mut state = Self::empty(block.id, available_columns, EditMode::Add);
+    fn for_add(shed: &Shed) -> Self {
+        let available_columns = compute_schema_at(shed, shed.pipeline.len());
+        let mut state = Self::empty(shed.id, available_columns, EditMode::Add);
         state.kind = if state.available_columns.is_empty() {
             FilterKind::FromLines
         } else {
@@ -987,9 +987,9 @@ impl FilterEditState {
         state
     }
 
-    fn for_insert(block: &Block, index: usize) -> Self {
-        let available_columns = compute_schema_at(block, index);
-        let mut state = Self::empty(block.id, available_columns, EditMode::Insert(index));
+    fn for_insert(shed: &Shed, index: usize) -> Self {
+        let available_columns = compute_schema_at(shed, index);
+        let mut state = Self::empty(shed.id, available_columns, EditMode::Insert(index));
         state.kind = if state.available_columns.is_empty() {
             FilterKind::FromLines
         } else {
@@ -998,10 +998,10 @@ impl FilterEditState {
         state
     }
 
-    fn for_edit(block: &Block, index: usize) -> Self {
-        let available_columns = compute_schema_at(block, index);
-        let mut state = Self::empty(block.id, available_columns, EditMode::Edit(index));
-        match block.pipeline.get(index) {
+    fn for_edit(shed: &Shed, index: usize) -> Self {
+        let available_columns = compute_schema_at(shed, index);
+        let mut state = Self::empty(shed.id, available_columns, EditMode::Edit(index));
+        match shed.pipeline.get(index) {
             Some(FilterSpec::FromLines) => state.kind = FilterKind::FromLines,
             Some(FilterSpec::FromFields) => state.kind = FilterKind::FromFields,
             Some(FilterSpec::FromCsv { delim, has_header }) => {
@@ -1393,12 +1393,12 @@ impl FilterEditState {
     }
 }
 
-fn compute_schema_at(block: &Block, before_index: usize) -> Vec<String> {
-    let Some(capture) = &block.capture else {
+fn compute_schema_at(shed: &Shed, before_index: usize) -> Vec<String> {
+    let Some(capture) = &shed.capture else {
         return Vec::new();
     };
     let mut value = PipelineValue::Bytes(capture.stdout.clone());
-    for filter in block.pipeline.iter().take(before_index) {
+    for filter in shed.pipeline.iter().take(before_index) {
         match filter.apply(value) {
             Ok(v) => value = v,
             Err(_) => return Vec::new(),
@@ -1437,9 +1437,9 @@ struct App {
     rerun_input_mode: bool,
     rerun_input: String,
     rerun_cursor: usize,
-    rerun_source_id: Option<BlockId>,
+    rerun_source_id: Option<ShedId>,
     pending_rerun: Option<RerunRequest>,
-    /// True when the BlockCursor's "filter cursor" has been pulled left
+    /// True when the ShedCursor's "filter cursor" has been pulled left
     /// past the first filter onto the command itself. Visually highlights
     /// the argv span; Enter opens the in-place command editor.
     command_focused: bool,
@@ -1464,14 +1464,14 @@ struct App {
     search_case_insensitive: bool,
     flash: Option<String>,
     quit: bool,
-    running: HashMap<BlockId, RunningCommand>,
+    running: HashMap<ShedId, RunningCommand>,
     pending_handover: Option<HandoverRequest>,
     /// Path the notebook is bound to (set by `--open`, by Ctrl-O, or by
     /// the first Ctrl-S that prompted for a path). Subsequent Ctrl-S
     /// saves silently to this path.
     notebook_path: Option<PathBuf>,
     /// Cross-session aliases: typing the alias name at the prompt
-    /// materialises a block with the saved argv + pipeline. Loaded once
+    /// materialises a shed with the saved argv + pipeline. Loaded once
     /// from `aliases_path` on startup, rewritten on every change.
     aliases: AliasFile,
     aliases_path: Option<PathBuf>,
@@ -1483,18 +1483,18 @@ struct App {
     alias_overwrite: Option<Alias>,
     /// Manage view state (Focus::AliasManage). `None` outside the view.
     alias_manage: Option<AliasManageState>,
-    /// `true` when the session has unsaved changes. Set whenever a block
+    /// `true` when the session has unsaved changes. Set whenever a shed
     /// is added, edited, pinned/unpinned, re-run, or its pipeline mutated.
     /// Cleared on save/load.
     dirty: bool,
-    /// Queue of blocks to run in sequence (head first). Built by walking
-    /// `@-ref` deps so a snapshot block runs its source before itself.
+    /// Queue of sheds to run in sequence (head first). Built by walking
+    /// `@-ref` deps so a snapshot shed runs its source before itself.
     /// The event loop kicks off one at a time and gates on terminal state.
-    pending_run_chain: VecDeque<BlockId>,
-    /// Block currently being processed by the run-in-place machinery.
+    pending_run_chain: VecDeque<ShedId>,
+    /// Shed currently being processed by the run-in-place machinery.
     /// While `Some`, the next chain item won't start. Cleared once the
-    /// block reaches a terminal state.
-    chain_in_flight: Option<BlockId>,
+    /// shed reaches a terminal state.
+    chain_in_flight: Option<ShedId>,
     /// Snapshots taken before each structural mutation. Bounded; oldest
     /// drops first when full. Captures are shared via `bytes::Bytes`
     /// refcounting so the memory cost is roughly one BTreeMap clone per
@@ -1623,23 +1623,23 @@ impl App {
         self.dirty = true;
     }
 
-    fn newest_block_id(&self) -> Option<BlockId> {
-        self.session.blocks().last().map(|b| b.id)
+    fn newest_shed_id(&self) -> Option<ShedId> {
+        self.session.sheds().last().map(|b| b.id)
     }
 
-    fn block_ids_in_order(&self) -> Vec<BlockId> {
-        self.session.blocks().map(|b| b.id).collect()
+    fn shed_ids_in_order(&self) -> Vec<ShedId> {
+        self.session.sheds().map(|b| b.id).collect()
     }
 
     fn move_cursor(&mut self, delta: i32) {
-        let ids = self.block_ids_in_order();
+        let ids = self.shed_ids_in_order();
         if ids.is_empty() {
             return;
         }
         match self.session.cursor() {
             None => {
                 // Scratch box is "selected" — `↑` walks back to the
-                // last real block; `↓` is a no-op (already at end).
+                // last real shed; `↓` is a no-op (already at end).
                 if delta < 0 {
                     self.session.set_cursor(ids.last().copied());
                     self.reset_pipeline_cursor();
@@ -1651,8 +1651,8 @@ impl App {
                 };
                 let target = i as i32 + delta;
                 if target >= ids.len() as i32 {
-                    // `↓` past the last real block parks on the
-                    // scratch box but *stays in BlockCursor*, so `↑`
+                    // `↓` past the last real shed parks on the
+                    // scratch box but *stays in ShedCursor*, so `↑`
                     // walks back instead of jumping into prompt
                     // history. To start typing the user activates
                     // the scratch box via Enter / Space / `e`.
@@ -1672,15 +1672,15 @@ impl App {
         self.pipeline_cursor = self
             .session
             .cursor()
-            .and_then(|id| self.session.block(id))
+            .and_then(|id| self.session.shed(id))
             .map(|b| b.pipeline.len())
             .unwrap_or(0);
     }
 
-    fn cursor_block_pipeline_len(&self) -> Option<usize> {
+    fn cursor_shed_pipeline_len(&self) -> Option<usize> {
         self.session
             .cursor()
-            .and_then(|id| self.session.block(id))
+            .and_then(|id| self.session.shed(id))
             .map(|b| b.pipeline.len())
     }
 }
@@ -1694,7 +1694,7 @@ pub async fn run(notebook: Option<PathBuf>) -> io::Result<()> {
 
 /// Initialise ratatui *and* enable mouse capture. Mirrors
 /// `ratatui::init()` but also turns on crossterm mouse events so
-/// clicks on per-block `×` buttons (and any future click targets) are
+/// clicks on per-shed `×` buttons (and any future click targets) are
 /// delivered to the event loop. Best-effort: if the terminal doesn't
 /// support mouse capture, `execute!` silently fails and we still
 /// return a usable TUI.
@@ -1763,7 +1763,7 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
     if req.force_fullscreen || needs_fullscreen(&req.argv) {
         app.pending_handover = Some(HandoverRequest {
             argv: req.argv,
-            reuse_block: None,
+            reuse_shed: None,
         });
         return;
     }
@@ -1791,10 +1791,10 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
     }
 
     app.savepoint();
-    let id = app.session.add_block(req.argv.clone());
+    let id = app.session.add_shed(req.argv.clone());
     if !req.pipeline.is_empty() {
-        if let Some(block) = app.session.block_mut(id) {
-            block.pipeline = req.pipeline;
+        if let Some(shed) = app.session.shed_mut(id) {
+            shed.pipeline = req.pipeline;
         }
     }
     match exec::spawn_command(req.argv, CAPTURE_CAP).await {
@@ -1810,13 +1810,13 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
             );
         }
         Err(e) => {
-            app.session.set_state(id, BlockState::Failed(e.to_string()));
+            app.session.set_state(id, ShedState::Failed(e.to_string()));
         }
     }
 }
 
 /// True if `argv` is a single token starting with `@` — shed's syntax for
-/// "snapshot the output of pinned block @name". The bare prefix `@`
+/// "snapshot the output of pinned shed @name". The bare prefix `@`
 /// (length 1) is rejected as nameless.
 fn is_pinned_ref(argv: &[String]) -> bool {
     argv.len() == 1 && argv[0].len() > 1 && argv[0].starts_with('@')
@@ -1824,10 +1824,10 @@ fn is_pinned_ref(argv: &[String]) -> bool {
 
 /// `Done`/`Failed`/`Snapshotted` are terminal — the run-chain machinery
 /// uses this to decide when to advance. `Idle` and `Running` are not.
-fn is_terminal_state(state: &BlockState) -> bool {
+fn is_terminal_state(state: &ShedState) -> bool {
     matches!(
         state,
-        BlockState::Done(_) | BlockState::Failed(_) | BlockState::Snapshotted
+        ShedState::Done(_) | ShedState::Failed(_) | ShedState::Snapshotted
     )
 }
 
@@ -1836,20 +1836,20 @@ fn is_terminal_state(state: &BlockState) -> bool {
 /// either runs them first or simply waits on them. `Done`/`Failed`
 /// sources are not re-run — the snapshot will use the existing capture
 /// or fail with a clear error. Cycles are guarded via `visited`.
-fn build_run_chain(session: &Session, target: BlockId, visited: &mut HashSet<BlockId>) -> Vec<BlockId> {
+fn build_run_chain(session: &Session, target: ShedId, visited: &mut HashSet<ShedId>) -> Vec<ShedId> {
     if !visited.insert(target) {
         return Vec::new();
     }
     let mut chain = Vec::new();
-    let block = match session.block(target) {
+    let shed = match session.shed(target) {
         Some(b) => b,
         None => return chain,
     };
-    if is_pinned_ref(&block.argv) {
-        let name = &block.argv[0][1..];
+    if is_pinned_ref(&shed.argv) {
+        let name = &shed.argv[0][1..];
         if let Some(src_id) = session.lookup_by_name(name) {
-            if let Some(src) = session.block(src_id) {
-                if matches!(src.state, BlockState::Idle | BlockState::Running) {
+            if let Some(src) = session.shed(src_id) {
+                if matches!(src.state, ShedState::Idle | ShedState::Running) {
                     let mut sub = build_run_chain(session, src_id, visited);
                     chain.append(&mut sub);
                 }
@@ -1860,25 +1860,25 @@ fn build_run_chain(session: &Session, target: BlockId, visited: &mut HashSet<Blo
     chain
 }
 
-/// Walk *downward* from `source` to find every block whose argv is
+/// Walk *downward* from `source` to find every shed whose argv is
 /// `@<source's name>` (recursively, so dependents-of-dependents are
 /// included). Output is in BFS order so a downstream rebuild runs
 /// closest first. Source must be pinned for the search to find anything.
 fn collect_dependents_recursive(
     session: &Session,
-    source: BlockId,
-    out: &mut Vec<BlockId>,
-    visited: &mut HashSet<BlockId>,
+    source: ShedId,
+    out: &mut Vec<ShedId>,
+    visited: &mut HashSet<ShedId>,
 ) {
     if !visited.insert(source) {
         return;
     }
-    let Some(name) = session.block(source).and_then(|b| b.name.clone()) else {
+    let Some(name) = session.shed(source).and_then(|b| b.name.clone()) else {
         return;
     };
     let target = format!("@{name}");
-    let direct: Vec<BlockId> = session
-        .blocks()
+    let direct: Vec<ShedId> = session
+        .sheds()
         .filter(|b| b.argv.len() == 1 && b.argv[0] == target)
         .map(|b| b.id)
         .collect();
@@ -1896,20 +1896,20 @@ fn collect_dependents_recursive(
 /// dependents of `target` after `target` itself completes. Used by the
 /// in-place command editor: changing a source's argv makes any snapshot
 /// of it stale, so dependents need a refresh too.
-fn queue_edit_chain(app: &mut App, target: BlockId) {
-    let mut chain: Vec<BlockId> = Vec::new();
+fn queue_edit_chain(app: &mut App, target: ShedId) {
+    let mut chain: Vec<ShedId> = Vec::new();
     let mut visited = HashSet::new();
     chain.extend(build_run_chain(&app.session, target, &mut visited));
 
-    let mut down_visited: HashSet<BlockId> = HashSet::new();
-    let mut downward: Vec<BlockId> = Vec::new();
+    let mut down_visited: HashSet<ShedId> = HashSet::new();
+    let mut downward: Vec<ShedId> = Vec::new();
     collect_dependents_recursive(&app.session, target, &mut downward, &mut down_visited);
     chain.extend(downward);
 
     let n = chain.len();
     if n > 1 {
         let dependents = n - 1;
-        let plural = if dependents == 1 { "block" } else { "blocks" };
+        let plural = if dependents == 1 { "shed" } else { "sheds" };
         app.flash = Some(format!(
             "re-running %{} and {dependents} dependent {plural}",
             target.0
@@ -1925,23 +1925,23 @@ fn queue_edit_chain(app: &mut App, target: BlockId) {
 
 fn open_cmd_edit(app: &mut App) {
     let Some(id) = app.session.cursor() else {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     };
-    let Some(block) = app.session.block(id) else { return };
-    if block.argv.is_empty() {
+    let Some(shed) = app.session.shed(id) else { return };
+    if shed.argv.is_empty() {
         app.flash = Some("nothing to edit".into());
         return;
     }
-    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
-        .unwrap_or_else(|_| block.argv.join(" "));
+    let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
+        .unwrap_or_else(|_| shed.argv.join(" "));
     app.cmd_edit_cursor = joined.len();
     app.cmd_edit_input = joined;
     app.cmd_edit_input_mode = true;
 }
 
-/// Apply the edited command to the cursor block in place, then queue
-/// the block plus any pinned-name dependents for re-run.
+/// Apply the edited command to the cursor shed in place, then queue
+/// the shed plus any pinned-name dependents for re-run.
 fn commit_cmd_edit(app: &mut App) {
     let input = std::mem::take(&mut app.cmd_edit_input);
     app.cmd_edit_input_mode = false;
@@ -1959,18 +1959,18 @@ fn commit_cmd_edit(app: &mut App) {
         return;
     }
     let Some(id) = app.session.cursor() else { return };
-    if app.session.block(id).is_none() {
+    if app.session.shed(id).is_none() {
         return;
     }
     app.savepoint();
-    if let Some(block) = app.session.block_mut(id) {
-        block.argv = argv;
+    if let Some(shed) = app.session.shed_mut(id) {
+        shed.argv = argv;
     }
     app.command_focused = false;
     queue_edit_chain(app, id);
 }
 
-fn queue_run_chain(app: &mut App, target: BlockId) {
+fn queue_run_chain(app: &mut App, target: ShedId) {
     let mut visited = HashSet::new();
     let chain = build_run_chain(&app.session, target, &mut visited);
     let n = chain.len();
@@ -1986,24 +1986,24 @@ fn queue_run_chain(app: &mut App, target: BlockId) {
     }
 }
 
-/// Called after `reap_completed` each tick: if the in-flight block is
+/// Called after `reap_completed` each tick: if the in-flight shed is
 /// now terminal, clear the slot. If it failed, abort the rest of the
 /// chain since dependents would just see a stale or missing source.
 fn advance_run_chain(app: &mut App) {
     let Some(id) = app.chain_in_flight else { return };
-    let state = app.session.block(id).map(|b| b.state.clone());
+    let state = app.session.shed(id).map(|b| b.state.clone());
     let terminal = match &state {
         Some(s) => is_terminal_state(s),
-        None => true, // block was deleted mid-chain
+        None => true, // shed was deleted mid-chain
     };
     if !terminal {
         return;
     }
-    let failed = matches!(state, Some(BlockState::Failed(_)));
+    let failed = matches!(state, Some(ShedState::Failed(_)));
     if failed && !app.pending_run_chain.is_empty() {
         let n = app.pending_run_chain.len();
         app.pending_run_chain.clear();
-        let plural = if n == 1 { "block" } else { "blocks" };
+        let plural = if n == 1 { "shed" } else { "sheds" };
         app.flash = Some(format!("skipped {n} dependent {plural} — prereq failed"));
     }
     app.chain_in_flight = None;
@@ -2012,20 +2012,20 @@ fn advance_run_chain(app: &mut App) {
 /// Apply `name`'s pipeline to its current capture and serialize the
 /// result to bytes — JSON-pretty for structured values, raw passthrough
 /// for byte streams. Errors describe what went wrong so the caller can
-/// route them into a `Failed` block state.
+/// route them into a `Failed` shed state.
 fn snapshot_pinned(session: &Session, name: &str) -> Result<Vec<u8>, String> {
     let id = session
         .lookup_by_name(name)
-        .ok_or_else(|| format!("no pinned block named @{name}"))?;
-    let block = session
-        .block(id)
+        .ok_or_else(|| format!("no pinned shed named @{name}"))?;
+    let shed = session
+        .shed(id)
         .ok_or_else(|| format!("@{name} missing from session"))?;
-    let capture = block
+    let capture = shed
         .capture
         .as_ref()
         .ok_or_else(|| format!("@{name} has no captured output yet"))?;
 
-    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return Err(format!("@{name} pipeline error: {e}")),
     };
@@ -2045,8 +2045,8 @@ fn snapshot_pinned(session: &Session, name: &str) -> Result<Vec<u8>, String> {
 
 /// Run `snapshot_pinned` and write the result onto `id` as a synthetic
 /// capture. Used both at create time (typing `@name`) and on re-run
-/// (Space on a snapshot block).
-fn populate_snapshot(app: &mut App, id: BlockId, name: &str) {
+/// (Space on a snapshot shed).
+fn populate_snapshot(app: &mut App, id: ShedId, name: &str) {
     let started_at = Instant::now();
     match snapshot_pinned(&app.session, name) {
         Ok(bytes) => {
@@ -2060,47 +2060,47 @@ fn populate_snapshot(app: &mut App, id: BlockId, name: &str) {
                 snapshotted: true,
             };
             app.session.set_capture(id, capture);
-            app.session.set_state(id, BlockState::Done(0));
+            app.session.set_state(id, ShedState::Done(0));
         }
         Err(e) => {
-            if let Some(b) = app.session.block_mut(id) {
+            if let Some(b) = app.session.shed_mut(id) {
                 b.capture = None;
             }
-            app.session.set_state(id, BlockState::Failed(e));
+            app.session.set_state(id, ShedState::Failed(e));
         }
     }
 }
 
-/// Append a new snapshot block referencing pinned `@name` and queue it
+/// Append a new snapshot shed referencing pinned `@name` and queue it
 /// (along with any deps) on the run chain. The actual snapshot runs from
 /// `perform_run_in_place` so the source's pipeline output is fresh.
 fn spawn_pinned_snapshot(app: &mut App, name: &str) {
     app.savepoint();
     let argv = vec![format!("@{name}")];
-    let id = app.session.add_block(argv);
-    app.session.set_state(id, BlockState::Idle);
+    let id = app.session.add_shed(argv);
+    app.session.set_state(id, ShedState::Idle);
     queue_run_chain(app, id);
 }
 
-/// Remove the cursor block from the session. Kills any running child
-/// for that id, advances the cursor to the next surviving block (or the
+/// Remove the cursor shed from the session. Kills any running child
+/// for that id, advances the cursor to the next surviving shed (or the
 /// previous one if there is no next), or returns to the prompt if the
 /// session is now empty.
-fn delete_block_at_cursor(app: &mut App) {
+fn delete_shed_at_cursor(app: &mut App) {
     let Some(id) = app.session.cursor() else {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     };
-    delete_block(app, id);
+    delete_shed(app, id);
 }
 
-/// Remove a specific block by id. Kills its running command (if any),
+/// Remove a specific shed by id. Kills its running command (if any),
 /// pulls it from the run chain, and removes it from the session. If
-/// the deleted block was under the cursor, advance the cursor to its
+/// the deleted shed was under the cursor, advance the cursor to its
 /// next sibling (or previous, or return to prompt if the session is
 /// now empty); otherwise leave the cursor alone.
-fn delete_block(app: &mut App, id: BlockId) {
-    if app.session.block(id).is_none() {
+fn delete_shed(app: &mut App, id: ShedId) {
+    if app.session.shed(id).is_none() {
         return;
     }
     app.savepoint();
@@ -2113,14 +2113,14 @@ fn delete_block(app: &mut App, id: BlockId) {
         app.chain_in_flight = None;
     }
     let was_cursor = app.session.cursor() == Some(id);
-    let ids = app.block_ids_in_order();
+    let ids = app.shed_ids_in_order();
     let next_cursor = ids
         .iter()
         .position(|x| *x == id)
         .and_then(|i| ids.get(i + 1).copied().or_else(|| {
             if i == 0 { None } else { ids.get(i - 1).copied() }
         }));
-    let removed = app.session.remove_block(id);
+    let removed = app.session.remove_shed(id);
     if removed.is_none() {
         return;
     }
@@ -2135,12 +2135,12 @@ fn delete_block(app: &mut App, id: BlockId) {
     app.flash = Some(format!("deleted %{}", id.0));
 }
 
-/// Queue a re-spawn of the cursor's block argv along with any unrun
-/// `@-ref` dependencies, so deps run first. Idempotent: if the block is
+/// Queue a re-spawn of the cursor's shed argv along with any unrun
+/// `@-ref` dependencies, so deps run first. Idempotent: if the shed is
 /// already running or already queued, this flashes a message instead.
-fn run_cursor_block_in_place(app: &mut App) {
+fn run_cursor_shed_in_place(app: &mut App) {
     let Some(id) = app.session.cursor() else {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     };
     if app.running.contains_key(&id) {
@@ -2154,15 +2154,15 @@ fn run_cursor_block_in_place(app: &mut App) {
     queue_run_chain(app, id);
 }
 
-async fn perform_run_in_place(app: &mut App, id: BlockId) {
-    // The chain machinery may queue an already-running block (e.g. when a
+async fn perform_run_in_place(app: &mut App, id: ShedId) {
+    // The chain machinery may queue an already-running shed (e.g. when a
     // user requests a snapshot of @logs while @logs is running) — that's a
     // wait, not a re-spawn. Bail without touching capture or state.
     if app.running.contains_key(&id) {
         return;
     }
-    let Some(block) = app.session.block(id) else { return };
-    let argv = block.argv.clone();
+    let Some(shed) = app.session.shed(id) else { return };
+    let argv = shed.argv.clone();
     if argv.is_empty() {
         return;
     }
@@ -2174,8 +2174,8 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
     }
 
     // Builtins: dispatch through their existing handlers so cd/export/unset
-    // can take effect on shed's own state. They allocate fresh blocks rather
-    // than reusing the cursor block, matching prompt-spawn semantics.
+    // can take effect on shed's own state. They allocate fresh sheds rather
+    // than reusing the cursor shed, matching prompt-spawn semantics.
     match argv[0].as_str() {
         "cd" => {
             run_cd_builtin(app, &argv);
@@ -2199,14 +2199,14 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
     if needs_fullscreen(&argv) {
         app.pending_handover = Some(HandoverRequest {
             argv,
-            reuse_block: Some(id),
+            reuse_shed: Some(id),
         });
         return;
     }
 
-    if let Some(b) = app.session.block_mut(id) {
+    if let Some(b) = app.session.shed_mut(id) {
         b.capture = None;
-        b.state = BlockState::Running;
+        b.state = ShedState::Running;
     }
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer, chunks)) => {
@@ -2221,7 +2221,7 @@ async fn perform_run_in_place(app: &mut App, id: BlockId) {
             );
         }
         Err(e) => {
-            app.session.set_state(id, BlockState::Failed(e.to_string()));
+            app.session.set_state(id, ShedState::Failed(e.to_string()));
         }
     }
 }
@@ -2233,11 +2233,11 @@ async fn perform_handover(
 ) -> io::Result<()> {
     leave_tui();
 
-    let id = match req.reuse_block {
+    let id = match req.reuse_shed {
         Some(existing) => existing,
         None => {
             app.savepoint();
-            app.session.add_block(req.argv.clone())
+            app.session.add_shed(req.argv.clone())
         }
     };
     let status_result = tokio::process::Command::new(&req.argv[0])
@@ -2250,14 +2250,14 @@ async fn perform_handover(
     match status_result {
         Ok(status) => {
             app.session
-                .set_state(id, BlockState::Done(status.code().unwrap_or(-1)));
+                .set_state(id, ShedState::Done(status.code().unwrap_or(-1)));
         }
         Err(e) => {
             app.session
-                .set_state(id, BlockState::Failed(format!("spawn: {e}")));
+                .set_state(id, ShedState::Failed(format!("spawn: {e}")));
         }
     }
-    if req.reuse_block.is_some() {
+    if req.reuse_shed.is_some() {
         app.flash = Some(format!("%{} switched to fullscreen mode", id.0));
     }
     Ok(())
@@ -2265,13 +2265,13 @@ async fn perform_handover(
 
 /// Pull every pending stream chunk from each running command into its
 /// `stream_buf`, and mirror the (possibly grown) buffer onto the
-/// block's `capture.stdout` so the renderer sees streaming output.
+/// shed's `capture.stdout` so the renderer sees streaming output.
 ///
-/// While streaming, the block's capture has `exit_code: None` and
+/// While streaming, the shed's capture has `exit_code: None` and
 /// `finished_at: None` — those land when [`reap_completed`] replaces
 /// the partial capture with the final one from the reader task.
 fn drain_streams(app: &mut App) {
-    let ids: Vec<BlockId> = app.running.keys().copied().collect();
+    let ids: Vec<ShedId> = app.running.keys().copied().collect();
     for id in ids {
         let Some(cmd) = app.running.get_mut(&id) else {
             continue;
@@ -2285,13 +2285,13 @@ fn drain_streams(app: &mut App) {
             continue;
         }
         // Snapshot the running buffer as a fresh Bytes and mirror onto
-        // the block. Cost is O(N) per snapshot; render frequency caps
+        // the shed. Cost is O(N) per snapshot; render frequency caps
         // total work, and this is the simplest way to keep the
-        // renderer (which reads `block.capture`) unchanged.
+        // renderer (which reads `shed.capture`) unchanged.
         let snapshot = Bytes::copy_from_slice(&cmd.stream_buf);
         let started_at = app
             .session
-            .block(id)
+            .shed(id)
             .and_then(|b| b.capture.as_ref().map(|c| c.started_at))
             .unwrap_or_else(Instant::now);
         let partial = Capture {
@@ -2308,7 +2308,7 @@ fn drain_streams(app: &mut App) {
 }
 
 async fn reap_completed(app: &mut App) {
-    let finished_ids: Vec<BlockId> = app
+    let finished_ids: Vec<ShedId> = app
         .running
         .iter()
         .filter(|(_, c)| c.handle.is_finished())
@@ -2322,32 +2322,32 @@ async fn reap_completed(app: &mut App) {
             Ok(Ok(CaptureOutcome::Captured(capture))) => {
                 let exit = capture.exit_code.unwrap_or(-1);
                 app.session.set_capture(id, capture);
-                app.session.set_state(id, BlockState::Done(exit));
+                app.session.set_state(id, ShedState::Done(exit));
             }
             Ok(Ok(CaptureOutcome::NeededFullscreen)) => {
                 let argv = app
                     .session
-                    .block(id)
+                    .shed(id)
                     .map(|b| b.argv.clone())
                     .unwrap_or_default();
                 if argv.is_empty() {
                     app.session.set_state(
                         id,
-                        BlockState::Failed("alt-screen detected, argv missing".into()),
+                        ShedState::Failed("alt-screen detected, argv missing".into()),
                     );
                 } else {
                     app.pending_handover = Some(HandoverRequest {
                         argv,
-                        reuse_block: Some(id),
+                        reuse_shed: Some(id),
                     });
                 }
             }
             Ok(Err(e)) => {
-                app.session.set_state(id, BlockState::Failed(e.to_string()));
+                app.session.set_state(id, ShedState::Failed(e.to_string()));
             }
             Err(e) => {
                 app.session
-                    .set_state(id, BlockState::Failed(format!("task error: {e}")));
+                    .set_state(id, ShedState::Failed(format!("task error: {e}")));
             }
         }
         app.session.evict_to_fit();
@@ -2382,7 +2382,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             KeyCode::Char('c') => {
-                if app.focus == Focus::BlockCursor && cancel_at_cursor(app) {
+                if app.focus == Focus::ShedCursor && cancel_at_cursor(app) {
                     return;
                 }
                 request_quit(app);
@@ -2413,10 +2413,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
     }
     match app.focus {
         Focus::Prompt => handle_prompt_key(app, key).await,
-        Focus::BlockCursor => handle_cursor_key(app, key),
-        Focus::EditBlock => handle_edit_block_key(app, key),
+        Focus::ShedCursor => handle_cursor_key(app, key),
+        Focus::EditShed => handle_edit_shed_key(app, key),
         Focus::FilterEdit => handle_filter_edit_key(app, key),
-        Focus::BlockExpand => handle_block_expand_key(app, key),
+        Focus::ShedExpand => handle_shed_expand_key(app, key),
         Focus::EnvEdit => handle_env_edit_key(app, key),
         Focus::Palette => handle_palette_key(app, key),
         Focus::NoteEdit => handle_note_edit_key(app, key),
@@ -2426,10 +2426,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
 
 /// Pop the latest savepoint and restore it as the active session. The
 /// previous current session is pushed onto the redo stack so the user
-/// can roll forward again. Captures and run-state of any blocks that
+/// can roll forward again. Captures and run-state of any sheds that
 /// exist in both versions are *preserved* — undo only reverts the
 /// structural fields (argv, name, pipeline, pre/post-text, cursor) so
-/// you don't lose freshly produced output. Blocks that the snapshot
+/// you don't lose freshly produced output. Sheds that the snapshot
 /// resurrects come back with whatever capture they had at snapshot time.
 fn undo(app: &mut App) {
     let Some(prev) = app.undo_stack.pop() else {
@@ -2457,17 +2457,17 @@ fn redo(app: &mut App) {
 
 /// Replace `app.session` with `snap`, then patch live runtime state
 /// (capture, run-state, last_touched) from the previous current onto
-/// any block whose id survives in the restored session. Finishes by
-/// sanitizing app-level state that may now reference vanished blocks.
+/// any shed whose id survives in the restored session. Finishes by
+/// sanitizing app-level state that may now reference vanished sheds.
 fn apply_snapshot(app: &mut App, snap: Session) {
     let prev = std::mem::replace(&mut app.session, snap);
-    let ids: Vec<BlockId> = app.session.blocks().map(|b| b.id).collect();
+    let ids: Vec<ShedId> = app.session.sheds().map(|b| b.id).collect();
     for id in ids {
-        if let Some(prev_block) = prev.block(id) {
-            let cap = prev_block.capture.clone();
-            let st = prev_block.state.clone();
-            let lt = prev_block.last_touched;
-            if let Some(restored) = app.session.block_mut(id) {
+        if let Some(prev_shed) = prev.shed(id) {
+            let cap = prev_shed.capture.clone();
+            let st = prev_shed.state.clone();
+            let lt = prev_shed.last_touched;
+            if let Some(restored) = app.session.shed_mut(id) {
                 restored.capture = cap;
                 restored.state = st;
                 restored.last_touched = lt;
@@ -2477,22 +2477,22 @@ fn apply_snapshot(app: &mut App, snap: Session) {
     sanitize_after_restore(app);
 }
 
-/// Drop app-level references to blocks that may not exist after a
+/// Drop app-level references to sheds that may not exist after a
 /// snapshot restore: pending run-chain entries, the in-flight chain
-/// slot, the cursor, child processes whose blocks vanished. Also
-/// rebases `pipeline_cursor` on the (possibly new) cursor block.
+/// slot, the cursor, child processes whose sheds vanished. Also
+/// rebases `pipeline_cursor` on the (possibly new) cursor shed.
 fn sanitize_after_restore(app: &mut App) {
     if let Some(id) = app.session.cursor() {
-        if app.session.block(id).is_none() {
-            app.session.set_cursor(app.newest_block_id());
+        if app.session.shed(id).is_none() {
+            app.session.set_cursor(app.newest_shed_id());
         }
     }
     app.command_focused = false;
     app.reset_pipeline_cursor();
     app.pending_run_chain.clear();
     app.chain_in_flight = None;
-    let session_ids: HashSet<BlockId> = app.session.blocks().map(|b| b.id).collect();
-    let orphans: Vec<BlockId> = app
+    let session_ids: HashSet<ShedId> = app.session.sheds().map(|b| b.id).collect();
+    let orphans: Vec<ShedId> = app
         .running
         .keys()
         .copied()
@@ -2556,7 +2556,7 @@ fn load_from_path(app: &mut App, path: &std::path::Path) {
     match Notebook::load(path) {
         Ok(nb) => {
             // Replace the session entirely. Cancel any running children
-            // first so we don't leak handles when their blocks vanish.
+            // first so we don't leak handles when their sheds vanish.
             for (_, mut cmd) in app.running.drain() {
                 let _ = cmd.killer.kill();
                 cmd.handle.abort();
@@ -2567,17 +2567,17 @@ fn load_from_path(app: &mut App, path: &std::path::Path) {
             nb.apply_to_session(&mut app.session);
             app.notebook_path = Some(path.to_path_buf());
             app.dirty = false;
-            app.session.set_cursor(app.newest_block_id());
+            app.session.set_cursor(app.newest_shed_id());
             app.reset_pipeline_cursor();
-            // Refocus on the loaded blocks if any exist; otherwise stay
+            // Refocus on the loaded sheds if any exist; otherwise stay
             // on the prompt.
             app.focus = if app.session.cursor().is_some() {
-                Focus::BlockCursor
+                Focus::ShedCursor
             } else {
                 Focus::Prompt
             };
-            let n = app.session.blocks().count();
-            app.flash = Some(format!("loaded {n} block(s) from {}", path.display()));
+            let n = app.session.sheds().count();
+            app.flash = Some(format!("loaded {n} shed(s) from {}", path.display()));
         }
         Err(e) => {
             app.flash = Some(format!("open failed: {e}"));
@@ -2999,8 +2999,8 @@ fn render_input_bar(
     Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray))
 }
 
-/// Render `text` with the cursor visualised as an inverted block.
-/// `accent` is the colour the cursor block uses for its background;
+/// Render `text` with the cursor visualised as an inverted shed.
+/// `accent` is the colour the cursor shed uses for its background;
 /// the text under it renders in black.
 fn input_spans_with_cursor(text: &str, cursor: usize, accent: Color) -> Vec<Span<'static>> {
     let cursor = cursor.min(text.len());
@@ -3035,7 +3035,7 @@ fn cancel_at_cursor(app: &mut App) -> bool {
     let _ = cmd.killer.kill();
     cmd.handle.abort();
     app.session
-        .set_state(id, BlockState::Failed("cancelled".into()));
+        .set_state(id, ShedState::Failed("cancelled".into()));
     app.flash = Some(format!("cancelled %{}", id.0));
     true
 }
@@ -3049,7 +3049,7 @@ fn cancel_at_cursor(app: &mut App) -> bool {
 //
 // Completion source by token shape (in order):
 //   $...   env var names
-//   @...   pinned block names  (only when the token starts with @)
+//   @...   pinned shed names  (only when the token starts with @)
 //   /...   slash commands       (Prompt focus, argv0 only)
 //   .../...    path completion  (anywhere with a path-shape)
 //   <argv0>    commands ∪ aliases ∪ builtins
@@ -3128,7 +3128,7 @@ fn env_completions(token: &str) -> Vec<String> {
 fn pinned_completions(session: &Session, token: &str) -> Vec<String> {
     let prefix = &token[1..]; // strip @
     let mut names: Vec<String> = session
-        .blocks()
+        .sheds()
         .filter_map(|b| b.name.clone())
         .filter(|n| n.starts_with(prefix))
         .collect();
@@ -3348,7 +3348,7 @@ fn path_or_carapace_completions(base: &str, token: &str) -> Vec<String> {
 fn current_input_state(app: &App) -> Option<(String, usize)> {
     match app.focus {
         Focus::Prompt => Some((app.prompt.clone(), app.prompt_cursor)),
-        Focus::EditBlock if app.cmd_edit_input_mode => {
+        Focus::EditShed if app.cmd_edit_input_mode => {
             Some((app.cmd_edit_input.clone(), app.cmd_edit_cursor))
         }
         _ => None,
@@ -3361,7 +3361,7 @@ fn set_current_input(app: &mut App, text: String, cursor: usize) {
             app.prompt = text;
             app.prompt_cursor = cursor;
         }
-        Focus::EditBlock if app.cmd_edit_input_mode => {
+        Focus::EditShed if app.cmd_edit_input_mode => {
             app.cmd_edit_input = text;
             app.cmd_edit_cursor = cursor;
         }
@@ -3433,7 +3433,7 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
     };
     app.flash = None;
     match action {
-        ClickAction::DeleteBlock(id) => delete_block(app, id),
+        ClickAction::DeleteBlock(id) => delete_shed(app, id),
     }
 }
 
@@ -3452,12 +3452,12 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             return;
         }
         KeyCode::Esc => {
-            if let Some(id) = app.newest_block_id() {
+            if let Some(id) = app.newest_shed_id() {
                 app.session.set_cursor(Some(id));
                 app.reset_pipeline_cursor();
-                app.focus = Focus::BlockCursor;
+                app.focus = Focus::ShedCursor;
             } else {
-                app.flash = Some("no blocks yet".into());
+                app.flash = Some("no sheds yet".into());
             }
             return;
         }
@@ -3666,9 +3666,9 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    // Scratch box selected (BlockCursor focus, cursor == None): only
+    // Scratch box selected (ShedCursor focus, cursor == None): only
     // ↑↓, Esc, and the explicit "start typing" keys do anything —
-    // everything else (delete, pin, etc.) needs a real block.
+    // everything else (delete, pin, etc.) needs a real shed.
     let on_scratch = app.session.cursor().is_none();
     if on_scratch {
         match key.code {
@@ -3692,12 +3692,12 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Up => app.move_cursor(-1),
         KeyCode::Down => app.move_cursor(1),
-        KeyCode::Char(' ') => run_cursor_block_in_place(app),
-        KeyCode::Char('x') => delete_block_at_cursor(app),
+        KeyCode::Char(' ') => run_cursor_shed_in_place(app),
+        KeyCode::Char('x') => delete_shed_at_cursor(app),
         KeyCode::Char('n') => open_note_edit(app, NotePosition::Pre),
         KeyCode::Char('N') => open_note_edit(app, NotePosition::Post),
         KeyCode::Char('A') => open_alias_save(app),
-        KeyCode::Char('e') => enter_edit_block(app),
+        KeyCode::Char('e') => enter_edit_shed(app),
         KeyCode::Char('/') => {
             app.focus = Focus::Prompt;
             app.session.set_cursor(None);
@@ -3710,7 +3710,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('v') => {
             if app.session.cursor().is_some() {
                 app.expand_scroll = 0;
-                app.focus = Focus::BlockExpand;
+                app.focus = Focus::ShedExpand;
             }
         }
         KeyCode::Char('w') => {
@@ -3724,7 +3724,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             if let Some(id) = app.session.cursor() {
                 let existing = app
                     .session
-                    .block(id)
+                    .shed(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
                 app.pin_cursor = existing.len();
@@ -3734,7 +3734,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('u') => {
             if let Some(id) = app.session.cursor() {
-                let was_named = app.session.block(id).and_then(|b| b.name.clone());
+                let was_named = app.session.shed(id).and_then(|b| b.name.clone());
                 if was_named.is_some() {
                     app.savepoint();
                 }
@@ -3747,9 +3747,9 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('r') => {
             if let Some(id) = app.session.cursor() {
-                if let Some(block) = app.session.block(id) {
-                    let joined = shlex::try_join(block.argv.iter().map(String::as_str))
-                        .unwrap_or_else(|_| block.argv.join(" "));
+                if let Some(shed) = app.session.shed(id) {
+                    let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
+                        .unwrap_or_else(|_| shed.argv.join(" "));
                     app.rerun_cursor = joined.len();
                     app.rerun_input = joined;
                     app.rerun_input_mode = true;
@@ -3761,19 +3761,19 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn enter_edit_block(app: &mut App) {
+fn enter_edit_shed(app: &mut App) {
     if app.session.cursor().is_none() {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     }
-    app.focus = Focus::EditBlock;
+    app.focus = Focus::EditShed;
     app.reset_pipeline_cursor();
 }
 
-/// EditBlock owns pipeline navigation and mutation; block-level actions
-/// (run, delete, pin, etc.) live one focus up in BlockCursor. Esc returns
-/// to BlockCursor.
-fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
+/// EditShed owns pipeline navigation and mutation; shed-level actions
+/// (run, delete, pin, etc.) live one focus up in ShedCursor. Esc returns
+/// to ShedCursor.
+fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
     if app.cmd_edit_input_mode {
         let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
         if !is_tab {
@@ -3803,7 +3803,7 @@ fn handle_edit_block_key(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Esc => {
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
             app.command_focused = false;
         }
         // Filters render vertically, so ↑↓ does the navigation that
@@ -3847,7 +3847,7 @@ fn commit_rerun(app: &mut App) {
         return;
     }
     let pipeline: Vec<FilterSpec> = source_id
-        .and_then(|id| app.session.block(id))
+        .and_then(|id| app.session.shed(id))
         .map(|b| b.pipeline.clone())
         .unwrap_or_default();
     app.pending_rerun = Some(RerunRequest {
@@ -3875,7 +3875,7 @@ fn commit_pin(app: &mut App) {
     if !app.session.pin(id, name.clone()) {
         // Restore: pop the savepoint we just pushed since nothing changed.
         app.undo_stack.pop();
-        app.flash = Some(format!("pin failed: unknown block %{}", id.0));
+        app.flash = Some(format!("pin failed: unknown shed %{}", id.0));
         return;
     }
 
@@ -3932,13 +3932,13 @@ fn commit_write(app: &mut App) {
         return;
     }
     let Some(id) = app.session.cursor() else { return };
-    let Some(block) = app.session.block(id) else { return };
+    let Some(shed) = app.session.shed(id) else { return };
 
     let format = WriteFormat::from_path(path);
     let bytes = match format {
-        WriteFormat::Plain => render_plain_bytes(block),
-        WriteFormat::Csv(delim) => render_csv_bytes(block, delim),
-        WriteFormat::Json => render_json_bytes(block),
+        WriteFormat::Plain => render_plain_bytes(shed),
+        WriteFormat::Csv(delim) => render_csv_bytes(shed, delim),
+        WriteFormat::Json => render_json_bytes(shed),
     };
 
     let len = bytes.len();
@@ -3958,8 +3958,8 @@ fn commit_write(app: &mut App) {
     }
 }
 
-fn render_plain_bytes(block: &Block) -> Vec<u8> {
-    let lines = compute_block_lines(block);
+fn render_plain_bytes(shed: &Shed) -> Vec<u8> {
+    let lines = compute_shed_lines(shed);
     let mut text = String::new();
     for line in &lines {
         text.push_str(&line_text(line));
@@ -3968,18 +3968,18 @@ fn render_plain_bytes(block: &Block) -> Vec<u8> {
     text.into_bytes()
 }
 
-fn render_csv_bytes(block: &Block, delim: u8) -> Vec<u8> {
-    let Some(capture) = block.capture.as_ref() else {
+fn render_csv_bytes(shed: &Shed, delim: u8) -> Vec<u8> {
+    let Some(capture) = shed.capture.as_ref() else {
         return Vec::new();
     };
-    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
     let items = match value {
         PipelineValue::Structured(Value::List(items)) => items,
         // Bytes / non-list structured: fall back to plain.
-        _ => return render_plain_bytes(block),
+        _ => return render_plain_bytes(shed),
     };
 
     let mut out = Vec::new();
@@ -4018,11 +4018,11 @@ fn render_csv_bytes(block: &Block, delim: u8) -> Vec<u8> {
     out
 }
 
-fn render_json_bytes(block: &Block) -> Vec<u8> {
-    let Some(capture) = block.capture.as_ref() else {
+fn render_json_bytes(shed: &Shed) -> Vec<u8> {
+    let Some(capture) = shed.capture.as_ref() else {
         return Vec::new();
     };
-    let value = match apply_pipeline(&capture.stdout, &block.pipeline) {
+    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
@@ -4079,7 +4079,7 @@ fn value_to_field_string(v: &Value) -> String {
     }
 }
 
-fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
+fn handle_shed_expand_key(app: &mut App, key: KeyEvent) {
     if app.search_input_mode {
         match handle_text_input(&mut app.search_input, &mut app.search_cursor, &key) {
             InputOutcome::Cancel => {
@@ -4107,13 +4107,13 @@ fn handle_block_expand_key(app: &mut App, key: KeyEvent) {
                 app.search_query.clear();
             } else {
                 app.expand_scroll = 0;
-                app.focus = Focus::BlockCursor;
+                app.focus = Focus::ShedCursor;
             }
         }
         KeyCode::Char('q') => {
             app.search_query.clear();
             app.expand_scroll = 0;
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
         }
         KeyCode::Char('/') => {
             app.search_input_mode = true;
@@ -4175,8 +4175,8 @@ fn update_search(app: &mut App) {
         return;
     };
     let Some(id) = app.session.cursor() else { return };
-    let Some(block) = app.session.block(id) else { return };
-    let lines = compute_block_lines(block);
+    let Some(shed) = app.session.shed(id) else { return };
+    let lines = compute_shed_lines(shed);
     let matches = find_matches_regex(&lines, &regex);
     if matches.is_empty() {
         return;
@@ -4208,8 +4208,8 @@ fn jump_to_search(app: &mut App, forward: bool) {
         return;
     };
     let Some(id) = app.session.cursor() else { return };
-    let Some(block) = app.session.block(id) else { return };
-    let lines = compute_block_lines(block);
+    let Some(shed) = app.session.shed(id) else { return };
+    let lines = compute_shed_lines(shed);
     let matches = find_matches_regex(&lines, &regex);
     if matches.is_empty() {
         app.flash = Some(format!("no matches for '{}'", app.search_query));
@@ -4233,9 +4233,9 @@ fn jump_to_search(app: &mut App, forward: bool) {
     app.expand_scroll = next;
 }
 
-fn compute_block_lines(block: &Block) -> Vec<Line<'static>> {
-    match block.capture.as_ref() {
-        Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
+fn compute_shed_lines(shed: &Shed) -> Vec<Line<'static>> {
+    match shed.capture.as_ref() {
+        Some(capture) => match apply_pipeline(&capture.stdout, &shed.pipeline) {
             Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
@@ -4328,7 +4328,7 @@ fn highlight_matches_in_line(line: Line<'static>, regex: &regex::Regex) -> Line<
 }
 
 fn move_filter_cursor(app: &mut App, delta: i32) {
-    let Some(len) = app.cursor_block_pipeline_len() else {
+    let Some(len) = app.cursor_shed_pipeline_len() else {
         return;
     };
     // Pulling left at filter index 0 jumps onto the command itself; the
@@ -4351,19 +4351,19 @@ fn move_filter_cursor(app: &mut App, delta: i32) {
 
 fn open_filter_edit(app: &mut App) {
     let Some(id) = app.session.cursor() else { return };
-    let Some(block) = app.session.block(id) else { return };
-    if block.capture.is_none() {
-        let msg = match block.state {
-            BlockState::Running => "still running — no capture yet",
+    let Some(shed) = app.session.shed(id) else { return };
+    if shed.capture.is_none() {
+        let msg = match shed.state {
+            ShedState::Running => "still running — no capture yet",
             _ => "no captured output to filter",
         };
         app.flash = Some(msg.into());
         return;
     }
-    let state = if app.pipeline_cursor < block.pipeline.len() {
-        FilterEditState::for_edit(block, app.pipeline_cursor)
+    let state = if app.pipeline_cursor < shed.pipeline.len() {
+        FilterEditState::for_edit(shed, app.pipeline_cursor)
     } else {
-        FilterEditState::for_add(block)
+        FilterEditState::for_add(shed)
     };
     app.filter_edit = Some(state);
     app.focus = Focus::FilterEdit;
@@ -4371,20 +4371,20 @@ fn open_filter_edit(app: &mut App) {
 
 fn open_filter_insert(app: &mut App) {
     let Some(id) = app.session.cursor() else { return };
-    let Some(block) = app.session.block(id) else { return };
-    if block.capture.is_none() {
-        let msg = match block.state {
-            BlockState::Running => "still running — no capture yet",
+    let Some(shed) = app.session.shed(id) else { return };
+    if shed.capture.is_none() {
+        let msg = match shed.state {
+            ShedState::Running => "still running — no capture yet",
             _ => "no captured output to filter",
         };
         app.flash = Some(msg.into());
         return;
     }
     // On the `+ add` slot, `i` is functionally the same as `f`.
-    let state = if app.pipeline_cursor < block.pipeline.len() {
-        FilterEditState::for_insert(block, app.pipeline_cursor)
+    let state = if app.pipeline_cursor < shed.pipeline.len() {
+        FilterEditState::for_insert(shed, app.pipeline_cursor)
     } else {
-        FilterEditState::for_add(block)
+        FilterEditState::for_add(shed)
     };
     app.filter_edit = Some(state);
     app.focus = Focus::FilterEdit;
@@ -4398,7 +4398,7 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.filter_edit = None;
-            app.focus = Focus::BlockCursor;
+            app.focus = Focus::ShedCursor;
         }
         KeyCode::Tab => state.cycle_field(1),
         KeyCode::BackTab => state.cycle_field(-1),
@@ -4704,34 +4704,34 @@ fn apply_filter_edit(app: &mut App) {
         app.flash = Some("pick a column first".into());
         return;
     };
-    let id = state.block_id;
+    let id = state.shed_id;
     let mode = state.mode;
-    if app.session.block(id).is_none() {
+    if app.session.shed(id).is_none() {
         app.filter_edit = None;
-        app.focus = Focus::BlockCursor;
+        app.focus = Focus::ShedCursor;
         return;
     }
     app.savepoint();
-    if let Some(block) = app.session.block_mut(id) {
+    if let Some(shed) = app.session.shed_mut(id) {
         match mode {
-            EditMode::Add => block.pipeline.push(spec),
-            EditMode::Edit(i) if i < block.pipeline.len() => block.pipeline[i] = spec,
-            EditMode::Edit(_) => block.pipeline.push(spec),
+            EditMode::Add => shed.pipeline.push(spec),
+            EditMode::Edit(i) if i < shed.pipeline.len() => shed.pipeline[i] = spec,
+            EditMode::Edit(_) => shed.pipeline.push(spec),
             EditMode::Insert(i) => {
-                let pos = i.min(block.pipeline.len());
-                block.pipeline.insert(pos, spec);
+                let pos = i.min(shed.pipeline.len());
+                shed.pipeline.insert(pos, spec);
             }
         }
     }
     app.filter_edit = None;
-    app.focus = Focus::EditBlock;
+    app.focus = Focus::EditShed;
     app.reset_pipeline_cursor();
 }
 
 fn move_filter_in_pipeline(app: &mut App, delta: i32) {
     let Some(id) = app.session.cursor() else { return };
     let pos = app.pipeline_cursor;
-    let len = match app.session.block(id) {
+    let len = match app.session.shed(id) {
         Some(b) => b.pipeline.len(),
         None => return,
     };
@@ -4744,8 +4744,8 @@ fn move_filter_in_pipeline(app: &mut App, delta: i32) {
     }
     let new_pos = new_pos_signed as usize;
     app.savepoint();
-    if let Some(block) = app.session.block_mut(id) {
-        block.pipeline.swap(pos, new_pos);
+    if let Some(shed) = app.session.shed_mut(id) {
+        shed.pipeline.swap(pos, new_pos);
     }
     app.pipeline_cursor = new_pos;
 }
@@ -4755,7 +4755,7 @@ fn drop_filter_at_cursor(app: &mut App) {
     let cursor = app.pipeline_cursor;
     let pipeline_empty = app
         .session
-        .block(id)
+        .shed(id)
         .map(|b| b.pipeline.is_empty())
         .unwrap_or(true);
     if pipeline_empty {
@@ -4763,12 +4763,12 @@ fn drop_filter_at_cursor(app: &mut App) {
         return;
     }
     app.savepoint();
-    let dropped = if let Some(block) = app.session.block_mut(id) {
-        if cursor < block.pipeline.len() {
-            block.pipeline.remove(cursor);
+    let dropped = if let Some(shed) = app.session.shed_mut(id) {
+        if cursor < shed.pipeline.len() {
+            shed.pipeline.remove(cursor);
             true
         } else {
-            block.pipeline.pop();
+            shed.pipeline.pop();
             true
         }
     } else {
@@ -4781,7 +4781,7 @@ fn drop_filter_at_cursor(app: &mut App) {
     }
     let new_len = app
         .session
-        .block(id)
+        .shed(id)
         .map(|b| b.pipeline.len())
         .unwrap_or(0);
     if app.pipeline_cursor > new_len {
@@ -4838,7 +4838,7 @@ async fn spawn_prompt(app: &mut App) {
     app.prompt_cursor = 0;
 
     // Aliases shadow real binaries: a single-token input matching a
-    // saved alias materialises a block with that alias's argv + pipeline
+    // saved alias materialises a shed with that alias's argv + pipeline
     // and drops the user into in-place command edit so they can append
     // args before running. Multi-token inputs bypass the lookup.
     if !force_fullscreen && argv.len() == 1 {
@@ -4851,7 +4851,7 @@ async fn spawn_prompt(app: &mut App) {
     if force_fullscreen || needs_fullscreen(&argv) {
         app.pending_handover = Some(HandoverRequest {
             argv,
-            reuse_block: None,
+            reuse_shed: None,
         });
         return;
     }
@@ -4883,7 +4883,7 @@ async fn spawn_prompt(app: &mut App) {
     }
 
     app.savepoint();
-    let id = app.session.add_block(argv.clone());
+    let id = app.session.add_shed(argv.clone());
     match exec::spawn_command(argv, CAPTURE_CAP).await {
         Ok((handle, killer, chunks)) => {
             app.running.insert(
@@ -4898,7 +4898,7 @@ async fn spawn_prompt(app: &mut App) {
         }
         Err(e) => {
             app.session
-                .set_state(id, BlockState::Failed(e.to_string()));
+                .set_state(id, ShedState::Failed(e.to_string()));
         }
     }
 }
@@ -4911,7 +4911,7 @@ async fn spawn_prompt(app: &mut App) {
 /// $OLDPWD env, to avoid the unsafe-set_var dance).
 fn run_cd_builtin(app: &mut App, argv: &[String]) {
     app.savepoint();
-    let id = app.session.add_block(argv.to_vec());
+    let id = app.session.add_shed(argv.to_vec());
     let prev_cwd = std::env::current_dir().ok();
 
     let target: Result<PathBuf, String> = match argv.get(1).map(String::as_str) {
@@ -4930,12 +4930,12 @@ fn run_cd_builtin(app: &mut App, argv: &[String]) {
     match result {
         Ok(new_path) => {
             app.last_cwd = prev_cwd;
-            app.session.set_state(id, BlockState::Done(0));
+            app.session.set_state(id, ShedState::Done(0));
             app.flash = Some(format!("cd → {}", new_path.display()));
         }
         Err(e) => {
             app.session
-                .set_state(id, BlockState::Failed(format!("cd: {e}")));
+                .set_state(id, ShedState::Failed(format!("cd: {e}")));
         }
     }
 }
@@ -4944,14 +4944,14 @@ fn run_exit_builtin(app: &mut App) {
     app.quit = true;
 }
 
-/// Open the note editor for the cursor block at `position`. Pre-fills
+/// Open the note editor for the cursor shed at `position`. Pre-fills
 /// the buffer with any existing note text.
 fn open_note_edit(app: &mut App, position: NotePosition) {
     let Some(id) = app.session.cursor() else {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     };
-    let initial = app.session.block(id).and_then(|b| match position {
+    let initial = app.session.shed(id).and_then(|b| match position {
         NotePosition::Pre => b.pre_text.as_deref(),
         NotePosition::Post => b.post_text.as_deref(),
     });
@@ -4959,34 +4959,34 @@ fn open_note_edit(app: &mut App, position: NotePosition) {
     app.focus = Focus::NoteEdit;
 }
 
-/// Commit the note buffer onto the target block and exit NoteEdit. An
+/// Commit the note buffer onto the target shed and exit NoteEdit. An
 /// empty buffer clears the note (sets the field to `None`).
 fn commit_note_edit(app: &mut App) {
     let Some(state) = app.note_edit.take() else {
-        app.focus = Focus::BlockCursor;
+        app.focus = Focus::ShedCursor;
         return;
     };
     let text = state.buffer_string();
     let new_value = if text.is_empty() { None } else { Some(text) };
-    let prev_value = app.session.block(state.block_id).and_then(|b| match state.position {
+    let prev_value = app.session.shed(state.shed_id).and_then(|b| match state.position {
         NotePosition::Pre => b.pre_text.clone(),
         NotePosition::Post => b.post_text.clone(),
     });
     if prev_value != new_value {
         app.savepoint();
-        if let Some(block) = app.session.block_mut(state.block_id) {
+        if let Some(shed) = app.session.shed_mut(state.shed_id) {
             match state.position {
-                NotePosition::Pre => block.pre_text = new_value,
-                NotePosition::Post => block.post_text = new_value,
+                NotePosition::Pre => shed.pre_text = new_value,
+                NotePosition::Post => shed.post_text = new_value,
             }
         }
     }
-    app.focus = Focus::BlockCursor;
+    app.focus = Focus::ShedCursor;
 }
 
 fn cancel_note_edit(app: &mut App) {
     app.note_edit = None;
-    app.focus = Focus::BlockCursor;
+    app.focus = Focus::ShedCursor;
 }
 
 fn handle_note_edit_key(app: &mut App, key: KeyEvent) {
@@ -5004,7 +5004,7 @@ fn handle_note_edit_key(app: &mut App, key: KeyEvent) {
         }
     }
     let Some(state) = app.note_edit.as_mut() else {
-        app.focus = Focus::BlockCursor;
+        app.focus = Focus::ShedCursor;
         return;
     };
     match key.code {
@@ -5239,11 +5239,11 @@ fn commit_env_input(app: &mut App) {
 /// export distinction since every var we hold is automatically inherited.
 fn run_export_builtin(app: &mut App, argv: &[String]) {
     app.savepoint();
-    let id = app.session.add_block(argv.to_vec());
+    let id = app.session.add_shed(argv.to_vec());
     if argv.len() < 2 {
         app.session.set_state(
             id,
-            BlockState::Failed("export: usage: export KEY=VALUE [...]".into()),
+            ShedState::Failed("export: usage: export KEY=VALUE [...]".into()),
         );
         return;
     }
@@ -5265,23 +5265,23 @@ fn run_export_builtin(app: &mut App, argv: &[String]) {
         }
     }
     if errors.is_empty() {
-        app.session.set_state(id, BlockState::Done(0));
+        app.session.set_state(id, ShedState::Done(0));
         if !set.is_empty() {
             app.flash = Some(format!("export {}", set.join(", ")));
         }
     } else {
         app.session
-            .set_state(id, BlockState::Failed(format!("export: {}", errors.join("; "))));
+            .set_state(id, ShedState::Failed(format!("export: {}", errors.join("; "))));
     }
 }
 
 fn run_unset_builtin(app: &mut App, argv: &[String]) {
     app.savepoint();
-    let id = app.session.add_block(argv.to_vec());
+    let id = app.session.add_shed(argv.to_vec());
     if argv.len() < 2 {
         app.session.set_state(
             id,
-            BlockState::Failed("unset: usage: unset NAME [NAME ...]".into()),
+            ShedState::Failed("unset: usage: unset NAME [NAME ...]".into()),
         );
         return;
     }
@@ -5291,7 +5291,7 @@ fn run_unset_builtin(app: &mut App, argv: &[String]) {
             std::env::remove_var(name);
         }
     }
-    app.session.set_state(id, BlockState::Done(0));
+    app.session.set_state(id, ShedState::Done(0));
     app.flash = Some(format!("unset {}", argv[1..].join(", ")));
 }
 
@@ -5311,7 +5311,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
-        Focus::BlockExpand => draw_block_expand(f, app),
+        Focus::ShedExpand => draw_shed_expand(f, app),
         Focus::EnvEdit => draw_env_edit(f, app),
         Focus::Palette => draw_palette(f, app),
         Focus::NoteEdit => draw_note_edit(f, app),
@@ -5359,7 +5359,7 @@ fn draw_alias_manage(f: &mut Frame, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if app.aliases.aliases.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no aliases — press A on a block to save one)",
+            "  (no aliases — press A on a shed to save one)",
             dim,
         )));
     } else {
@@ -5457,7 +5457,7 @@ fn handle_alias_manage_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Validation for alias names: non-empty, no whitespace, doesn't start
-/// with `@` (reserved for pinned-block snapshots), doesn't start with
+/// with `@` (reserved for pinned-shed snapshots), doesn't start with
 /// `/` (reserved for slash commands like `/aliases`), doesn't start
 /// with `!` (reserved for force-fullscreen). Returns the trimmed name
 /// or an error message.
@@ -5475,24 +5475,24 @@ fn validate_alias_name(raw: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// Capture the cursor block as an Alias — argv + pipeline copied. Used
+/// Capture the cursor shed as an Alias — argv + pipeline copied. Used
 /// by `A` and the palette action.
 fn build_alias_from_cursor(app: &App, name: String) -> Option<Alias> {
     let id = app.session.cursor()?;
-    let block = app.session.block(id)?;
-    if block.argv.is_empty() {
+    let shed = app.session.shed(id)?;
+    if shed.argv.is_empty() {
         return None;
     }
     Some(Alias {
         name,
-        argv: block.argv.clone(),
-        pipeline: block.pipeline.clone(),
+        argv: shed.argv.clone(),
+        pipeline: shed.pipeline.clone(),
     })
 }
 
 fn open_alias_save(app: &mut App) {
     if app.session.cursor().is_none() {
-        app.flash = Some("no block selected".into());
+        app.flash = Some("no shed selected".into());
         return;
     }
     app.alias_name_input.clear();
@@ -5537,19 +5537,19 @@ fn confirm_alias_overwrite(app: &mut App, accept: bool) {
     }
 }
 
-/// Materialise an alias as a fresh Idle block and drop the user into
+/// Materialise an alias as a fresh Idle shed and drop the user into
 /// in-place command edit so they can append args before running.
 fn spawn_alias(app: &mut App, alias: &Alias) {
     app.savepoint();
-    let id = app.session.add_block(alias.argv.clone());
-    if let Some(block) = app.session.block_mut(id) {
-        block.pipeline = alias.pipeline.clone();
+    let id = app.session.add_shed(alias.argv.clone());
+    if let Some(shed) = app.session.shed_mut(id) {
+        shed.pipeline = alias.pipeline.clone();
     }
-    app.session.set_state(id, BlockState::Idle);
+    app.session.set_state(id, ShedState::Idle);
     app.session.set_cursor(Some(id));
     app.reset_pipeline_cursor();
     app.command_focused = true;
-    app.focus = Focus::BlockCursor;
+    app.focus = Focus::ShedCursor;
 
     let joined = shlex::try_join(alias.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| alias.argv.join(" "));
@@ -5573,8 +5573,8 @@ fn draw_note_edit(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let title = match state.position {
-        NotePosition::Pre => format!("note before %{}", state.block_id.0),
-        NotePosition::Post => format!("note after %{}", state.block_id.0),
+        NotePosition::Pre => format!("note before %{}", state.shed_id.0),
+        NotePosition::Post => format!("note after %{}", state.shed_id.0),
     };
     draw_header(f, chunks[0], &title);
 
@@ -5655,7 +5655,7 @@ fn draw_palette(f: &mut Frame, app: &App) {
     draw_header(f, chunks[0], "command palette");
 
     // Input bar with bottom border separator.
-    let input_block = TuiBlock::default()
+    let input_box = TuiBlock::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::DarkGray));
     let input_widget = Paragraph::new(Line::from(vec![
@@ -5669,7 +5669,7 @@ fn draw_palette(f: &mut Frame, app: &App) {
         Span::raw(state.input.clone()),
         Span::styled("▏", Style::default().fg(Color::Cyan)),
     ]))
-    .block(input_block);
+    .block(input_box);
     f.render_widget(input_widget, chunks[1]);
 
     // Filtered list.
@@ -5832,11 +5832,11 @@ fn draw_env_edit(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_block_expand(f: &mut Frame, app: &App) {
+fn draw_shed_expand(f: &mut Frame, app: &App) {
     let Some(id) = app.session.cursor() else {
         return;
     };
-    let Some(block) = app.session.block(id) else {
+    let Some(shed) = app.session.shed(id) else {
         return;
     };
 
@@ -5850,8 +5850,8 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
         .split(f.area());
 
     // Compute the full pipeline output (no row cap) and the lines to render.
-    let all_lines: Vec<Line<'static>> = match block.capture.as_ref() {
-        Some(capture) => match apply_pipeline(&capture.stdout, &block.pipeline) {
+    let all_lines: Vec<Line<'static>> = match shed.capture.as_ref() {
+        Some(capture) => match apply_pipeline(&capture.stdout, &shed.pipeline) {
             Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
@@ -5869,12 +5869,12 @@ fn draw_block_expand(f: &mut Frame, app: &App) {
     let visible_end = (scroll + visible).min(total);
 
     let mut title = if total == 0 {
-        format!("inspect  %{}  {}", block.id.0, block.argv.join(" "))
+        format!("inspect  %{}  {}", shed.id.0, shed.argv.join(" "))
     } else {
         format!(
             "inspect  %{}  {}    lines {}-{} of {}",
-            block.id.0,
-            block.argv.join(" "),
+            shed.id.0,
+            shed.argv.join(" "),
             scroll + 1,
             visible_end,
             total,
@@ -5929,7 +5929,7 @@ fn draw_repl(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
         .map(|p| collapse_home_in_path(&p))
         .unwrap_or_else(|| "?".into());
     draw_header(f, chunks[0], &cwd);
-    draw_blocks(f, chunks[1], app, regions);
+    draw_sheds(f, chunks[1], app, regions);
     draw_status(f, chunks[2], app);
 }
 
@@ -5948,13 +5948,13 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
     let Some(state) = app.filter_edit.as_ref() else {
         return;
     };
-    let Some(block) = app.session.block(state.block_id) else {
+    let Some(shed) = app.session.shed(state.shed_id) else {
         return;
     };
 
     let stack_rows = match state.mode {
-        EditMode::Add | EditMode::Insert(_) => block.pipeline.len() + 1,
-        EditMode::Edit(_) => block.pipeline.len(),
+        EditMode::Add | EditMode::Insert(_) => shed.pipeline.len() + 1,
+        EditMode::Edit(_) => shed.pipeline.len(),
     };
     let stack_height = stack_rows.max(1) as u16 + 2;
     let form_height = state.form_lines() + 2;
@@ -5970,27 +5970,27 @@ fn draw_filter_edit(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let outcome = hypothetical_outcome(block, state);
+    let outcome = hypothetical_outcome(shed, state);
     let drops: Vec<usize> = outcome
         .as_ref()
         .and_then(|r| r.as_ref().ok())
         .map(|(_, d)| d.clone())
         .unwrap_or_default();
 
-    let title = format!("editing  %{}  {}", block.id.0, block.argv.join(" "));
+    let title = format!("editing  %{}  {}", shed.id.0, shed.argv.join(" "));
     draw_header(f, chunks[0], &title);
     draw_preview_pane(f, chunks[1], &outcome);
-    draw_stack_pane(f, chunks[2], block, state, &drops);
+    draw_stack_pane(f, chunks[2], shed, state, &drops);
     draw_form_pane(f, chunks[3], state);
     draw_status(f, chunks[4], app);
 }
 
 fn hypothetical_outcome(
-    block: &Block,
+    shed: &Shed,
     state: &FilterEditState,
 ) -> Option<Result<(PipelineValue, Vec<usize>), String>> {
-    let capture = block.capture.as_ref()?;
-    let mut hypothetical: Vec<FilterSpec> = block.pipeline.clone();
+    let capture = shed.capture.as_ref()?;
+    let mut hypothetical: Vec<FilterSpec> = shed.pipeline.clone();
     match (state.mode, state.build_filter()) {
         (EditMode::Add, Some(spec)) => hypothetical.push(spec),
         (EditMode::Edit(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
@@ -6020,23 +6020,23 @@ fn draw_header(f: &mut Frame, area: Rect, title: &str) {
     f.render_widget(header, area);
 }
 
-fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
+fn draw_sheds(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
     let cursor_id = app.session.cursor();
-    let cursor_visible = matches!(app.focus, Focus::BlockCursor | Focus::EditBlock);
-    let blocks: Vec<&shed_core::Block> = app.session.blocks().collect();
+    let cursor_visible = matches!(app.focus, Focus::ShedCursor | Focus::EditShed);
+    let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
 
-    // Render each block's interior content + record selection state.
-    let mut renders: Vec<(Vec<Line<'static>>, bool, bool)> = Vec::with_capacity(blocks.len());
-    for block in &blocks {
-        let selected = cursor_visible && cursor_id == Some(block.id);
-        let editing = selected && app.focus == Focus::EditBlock;
+    // Render each shed's interior content + record selection state.
+    let mut renders: Vec<(Vec<Line<'static>>, bool, bool)> = Vec::with_capacity(sheds.len());
+    for shed in &sheds {
+        let selected = cursor_visible && cursor_id == Some(shed.id);
+        let editing = selected && app.focus == Focus::EditShed;
         let pipeline_cursor = if editing {
             Some(app.pipeline_cursor)
         } else {
             None
         };
         let command_focused = editing && app.command_focused;
-        let lines = render_block(block, selected, editing, pipeline_cursor, command_focused);
+        let lines = render_shed(shed, selected, editing, pipeline_cursor, command_focused);
         renders.push((lines, selected, editing));
     }
 
@@ -6047,12 +6047,12 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegi
         .collect();
 
     // Scratch box at the end: 3 lines (border + 1 content row + border).
-    // Reserve its height up front so block top-clipping accounts for it.
+    // Reserve its height up front so shed top-clipping accounts for it.
     let scratch_height: u16 = 3;
     let avail = area.height.saturating_sub(scratch_height);
 
-    // Top-clip oldest blocks if total exceeds available height — newest
-    // blocks always stay visible. Walk from end backwards, accumulating.
+    // Top-clip oldest sheds if total exceeds available height — newest
+    // sheds always stay visible. Walk from end backwards, accumulating.
     let mut total: u16 = 0;
     let mut start = renders.len();
     for i in (0..renders.len()).rev() {
@@ -6078,10 +6078,10 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegi
         .split(area);
 
     for (i, (lines, selected, editing)) in visible.iter().enumerate() {
-        draw_one_block(
+        draw_one_shed(
             f,
             rects[i],
-            blocks[start + i],
+            sheds[start + i],
             lines,
             *selected,
             *editing,
@@ -6093,17 +6093,17 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegi
 }
 
 /// Render the always-present "scratch" / prompt box at the end of the
-/// block list. When focus is `Prompt`, the buffer is rendered inside the
+/// shed list. When focus is `Prompt`, the buffer is rendered inside the
 /// box with a cursor; otherwise the box shows a hint inviting the user to
 /// press `/` (or scroll down) to start typing.
 fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     let active = app.focus == Focus::Prompt;
     // "Selected" means the scratch box has been navigated to via ↓ from
-    // BlockCursor but the user hasn't activated it yet (cyan, matching
-    // the BlockCursor selection look on real blocks). Distinct from
+    // ShedCursor but the user hasn't activated it yet (cyan, matching
+    // the ShedCursor selection look on real sheds). Distinct from
     // active (green) so it's clear what mode keystrokes go to.
     let selected = !active
-        && app.focus == Focus::BlockCursor
+        && app.focus == Focus::ShedCursor
         && app.session.cursor().is_none();
 
     let title_style = if active {
@@ -6121,7 +6121,7 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD)
     };
-    let next_id = app.session.blocks().last().map(|b| b.id.0 + 1).unwrap_or(1);
+    let next_id = app.session.sheds().last().map(|b| b.id.0 + 1).unwrap_or(1);
     let title = Line::from(vec![
         Span::styled(format!(" %{next_id} "), title_style),
         Span::raw("  new "),
@@ -6172,22 +6172,22 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(para, inner);
 }
 
-/// Render one bordered block. The box title carries the id (`%5`) or
+/// Render one bordered shed. The box title carries the id (`%5`) or
 /// pinned name (`@list`) plus the run-state glyph; the body is the
 /// caller-supplied content (output, notes, edit details, etc.).
-fn draw_one_block(
+fn draw_one_shed(
     f: &mut Frame,
     area: Rect,
-    block: &shed_core::Block,
+    shed: &shed_core::Shed,
     lines: &[Line<'static>],
     selected: bool,
     editing: bool,
     regions: &mut Vec<ClickRegion>,
 ) {
-    let pinned = block.name.is_some();
-    let id_text = match &block.name {
+    let pinned = shed.name.is_some();
+    let id_text = match &shed.name {
         Some(name) => format!(" @{name} "),
-        None => format!(" %{} ", block.id.0),
+        None => format!(" %{} ", shed.id.0),
     };
     let id_style = match (selected, pinned) {
         (true, true) => Style::default()
@@ -6205,13 +6205,13 @@ fn draw_one_block(
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     };
-    let glyph = match &block.state {
-        BlockState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
-        BlockState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
-        BlockState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
-        BlockState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
-        BlockState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
-        BlockState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+    let glyph = match &shed.state {
+        ShedState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
+        ShedState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
+        ShedState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
+        ShedState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+        ShedState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
+        ShedState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
     };
     let title = Line::from(vec![
         Span::styled(id_text, id_style),
@@ -6242,7 +6242,7 @@ fn draw_one_block(
     f.render_widget(para, inner);
 
     // Clickable `×` on the top-right border. Three cells (` × `) so
-    // the hit-target is forgiving; only render when the block is wide
+    // the hit-target is forgiving; only render when the shed is wide
     // enough that it can't collide with the title (left side).
     let close_width: u16 = 3;
     let min_room: u16 = 6; // corner + 1 padding + title room + close + corner
@@ -6263,13 +6263,13 @@ fn draw_one_block(
                 width: close_width,
                 height: 1,
             },
-            action: ClickAction::DeleteBlock(block.id),
+            action: ClickAction::DeleteBlock(shed.id),
         });
     }
 }
 
-fn render_block(
-    block: &Block,
+fn render_shed(
+    shed: &Shed,
     selected: bool,
     editing: bool,
     pipeline_cursor: Option<usize>,
@@ -6277,28 +6277,28 @@ fn render_block(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    if let Some(text) = block.pre_text.as_deref() {
+    if let Some(text) = shed.pre_text.as_deref() {
         lines.extend(render_note_lines(text));
     }
 
     // Compute pipeline outcome up-front so we can show inline drop counts.
-    let pipeline_outcome = block
+    let pipeline_outcome = shed
         .capture
         .as_ref()
-        .map(|c| apply_pipeline(&c.stdout, &block.pipeline));
+        .map(|c| apply_pipeline(&c.stdout, &shed.pipeline));
     let drops: Vec<usize> = pipeline_outcome
         .as_ref()
         .and_then(|r| r.as_ref().ok())
         .map(|(_, d)| d.clone())
-        .unwrap_or_else(|| vec![0; block.pipeline.len()]);
+        .unwrap_or_else(|| vec![0; shed.pipeline.len()]);
 
-    // Show the command + each pipeline filter only in EditBlock focus.
-    // BlockCursor stays compact — output only — so the list is scannable.
+    // Show the command + each pipeline filter only in EditShed focus.
+    // ShedCursor stays compact — output only — so the list is scannable.
     if editing {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                block.argv.join(" "),
+                shed.argv.join(" "),
                 if command_focused {
                     Style::default()
                         .fg(Color::Black)
@@ -6323,7 +6323,7 @@ fn render_block(
         let warn = Style::default().fg(Color::Yellow);
         let indent = "   ";
 
-        for (i, f) in block.pipeline.iter().enumerate() {
+        for (i, f) in shed.pipeline.iter().enumerate() {
             let style = if effective_cursor == Some(i) {
                 highlight
             } else {
@@ -6341,7 +6341,7 @@ fn render_block(
             lines.push(Line::from(spans));
         }
         if effective_cursor.is_some() {
-            let style = if effective_cursor == Some(block.pipeline.len()) {
+            let style = if effective_cursor == Some(shed.pipeline.len()) {
                 highlight
             } else {
                 dim
@@ -6354,17 +6354,17 @@ fn render_block(
         }
     }
 
-    // Running blocks tail their preview: the most recent rows are
+    // Running sheds tail their preview: the most recent rows are
     // visible at the bottom, with "N more" pinned at the top. Finished
-    // blocks keep the existing head behaviour.
-    let tail = matches!(block.state, BlockState::Running);
+    // sheds keep the existing head behaviour.
+    let tail = matches!(shed.state, ShedState::Running);
     match pipeline_outcome {
         Some(Ok((value, _))) => lines.extend(render_pipeline_value(value, tail)),
         Some(Err(e)) => lines.extend(filter_error_lines(&e)),
         None => {}
     }
 
-    if let Some(capture) = &block.capture {
+    if let Some(capture) = &shed.capture {
         if capture.truncated {
             lines.push(Line::from(Span::styled(
                 " ✂ output truncated",
@@ -6379,7 +6379,7 @@ fn render_block(
                 )));
             }
         }
-    } else if let BlockState::Done(code) = &block.state {
+    } else if let ShedState::Done(code) = &shed.state {
         let mut spans = vec![Span::styled(
             " (no captured output)",
             Style::default().fg(Color::DarkGray),
@@ -6392,13 +6392,13 @@ fn render_block(
         }
         lines.push(Line::from(spans));
     }
-    if let BlockState::Failed(msg) = &block.state {
+    if let ShedState::Failed(msg) = &shed.state {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(msg.clone(), Style::default().fg(Color::Red)),
         ]));
     }
-    if matches!(block.state, BlockState::Idle) && selected {
+    if matches!(shed.state, ShedState::Idle) && selected {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -6419,7 +6419,7 @@ fn render_block(
         ]));
     }
 
-    if let Some(text) = block.post_text.as_deref() {
+    if let Some(text) = shed.post_text.as_deref() {
         lines.extend(render_note_lines(text));
     }
 
@@ -6794,7 +6794,7 @@ fn draw_preview_pane(
     area: Rect,
     outcome: &Option<Result<(PipelineValue, Vec<usize>), String>>,
 ) {
-    let block_widget = TuiBlock::default()
+    let pane = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Line::from(vec![
@@ -6802,8 +6802,8 @@ fn draw_preview_pane(
             Span::styled("preview", Style::default().fg(Color::Cyan)),
             Span::raw(" "),
         ]));
-    let inner = block_widget.inner(area);
-    f.render_widget(block_widget, area);
+    let inner = pane.inner(area);
+    f.render_widget(pane, area);
 
     let max_rows = inner.height.saturating_sub(2) as usize;
     let max = max_rows.max(3);
@@ -6822,11 +6822,11 @@ fn draw_preview_pane(
 fn draw_stack_pane(
     f: &mut Frame,
     area: Rect,
-    block: &Block,
+    shed: &Shed,
     state: &FilterEditState,
     drops: &[usize],
 ) {
-    let block_widget = TuiBlock::default()
+    let shed_widget = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Line::from(vec![
@@ -6834,8 +6834,8 @@ fn draw_stack_pane(
             Span::styled("pipeline", Style::default().fg(Color::Cyan)),
             Span::raw(" "),
         ]));
-    let inner = block_widget.inner(area);
-    f.render_widget(block_widget, area);
+    let inner = shed_widget.inner(area);
+    f.render_widget(shed_widget, area);
 
     let active_label = match state.build_filter() {
         Some(spec) => describe_filter(&spec),
@@ -6849,7 +6849,7 @@ fn draw_stack_pane(
 
     let warn = Style::default().fg(Color::Yellow);
     let mut lines: Vec<Line> = Vec::new();
-    for (i, spec) in block.pipeline.iter().enumerate() {
+    for (i, spec) in shed.pipeline.iter().enumerate() {
         // Insert mode: emit the in-progress row before the existing
         // filter at the insert index. The hypothetical pipeline has the
         // new filter at index i, so drops[i] reports the new filter's
@@ -6905,13 +6905,13 @@ fn draw_stack_pane(
     if state.mode == EditMode::Add {
         let mut spans = vec![
             Span::styled(
-                format!("  {} ", circled(block.pipeline.len() + 1)),
+                format!("  {} ", circled(shed.pipeline.len() + 1)),
                 edit_style,
             ),
             Span::styled(active_label, edit_style),
             Span::styled("  ← editing", dim),
         ];
-        let n = drops.get(block.pipeline.len()).copied().unwrap_or(0);
+        let n = drops.get(shed.pipeline.len()).copied().unwrap_or(0);
         if n > 0 {
             spans.push(Span::styled(
                 format!("  ⓘ -{n} (type mismatch)"),
@@ -6935,7 +6935,7 @@ fn circled(n: usize) -> String {
 
 fn draw_form_pane(f: &mut Frame, area: Rect, state: &FilterEditState) {
     let title = state.kind.name().to_string();
-    let block_widget = TuiBlock::default()
+    let shed_widget = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Line::from(vec![
@@ -6943,8 +6943,8 @@ fn draw_form_pane(f: &mut Frame, area: Rect, state: &FilterEditState) {
             Span::styled(title, Style::default().fg(Color::Magenta)),
             Span::raw(" "),
         ]));
-    let inner = block_widget.inner(area);
-    f.render_widget(block_widget, area);
+    let inner = shed_widget.inner(area);
+    f.render_widget(shed_widget, area);
 
     let mut lines: Vec<Line> = Vec::new();
     for field in state.fields() {
@@ -7498,11 +7498,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Ctrl-P", "palette"),
             ("Ctrl-S/O", "save/open"),
             ("Ctrl-Z/Y", "undo/redo"),
-            ("Esc", "focus block"),
+            ("Esc", "focus shed"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::BlockCursor => vec![
-            ("↑↓", "blocks"),
+        Focus::ShedCursor => vec![
+            ("↑↓", "sheds"),
             ("e", "edit"),
             ("v", "view"),
             ("Space", "run"),
@@ -7519,12 +7519,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Esc", "prompt"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::EditBlock if app.command_focused => vec![
+        Focus::EditShed if app.command_focused => vec![
             ("↓", "filters"),
             ("f / Enter", "edit cmd"),
             ("Esc", "back"),
         ],
-        Focus::EditBlock => vec![
+        Focus::EditShed => vec![
             ("↑↓", "cmd / filters"),
             ("f / Enter", "edit"),
             ("i", "insert"),
@@ -7540,7 +7540,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 .unwrap_or(FormField::Kind);
             filter_edit_field_hints(field)
         }
-        Focus::BlockExpand => vec![
+        Focus::ShedExpand => vec![
             ("↑↓ / jk", "scroll"),
             ("PgUp/Dn", "page"),
             ("g/G", "top/bot"),
@@ -7604,9 +7604,9 @@ mod tests {
     use shed_core::Capture;
     use std::time::Instant;
 
-    fn block_with_stdout(bytes: &[u8]) -> Block {
-        Block {
-            id: BlockId(1),
+    fn shed_with_stdout(bytes: &[u8]) -> Shed {
+        Shed {
+            id: ShedId(1),
             name: None,
             argv: vec!["test".into()],
             capture: Some(Capture {
@@ -7619,7 +7619,7 @@ mod tests {
                 snapshotted: false,
             }),
             pipeline: Vec::new(),
-            state: BlockState::Done(0),
+            state: ShedState::Done(0),
             last_touched: Instant::now(),
             pre_text: None,
             post_text: None,
@@ -7628,54 +7628,54 @@ mod tests {
 
     #[test]
     fn schema_empty_for_bytes_input() {
-        let block = block_with_stdout(b"a\nb\nc\n");
-        assert!(compute_schema_at(&block, 0).is_empty());
+        let shed = shed_with_stdout(b"a\nb\nc\n");
+        assert!(compute_schema_at(&shed, 0).is_empty());
     }
 
     #[test]
     fn schema_has_line_after_from_lines() {
-        let mut block = block_with_stdout(b"a\nb\nc\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        assert_eq!(compute_schema_at(&block, 1), vec!["line".to_string()]);
+        let mut shed = shed_with_stdout(b"a\nb\nc\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        assert_eq!(compute_schema_at(&shed, 1), vec!["line".to_string()]);
     }
 
     #[test]
     fn schema_at_index_uses_filters_before_only() {
-        let mut block = block_with_stdout(b"a\nb\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Where {
+        let mut shed = shed_with_stdout(b"a\nb\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Where {
             predicate: Predicate::Matches {
                 column: "line".into(),
                 pattern: "a".into(),
             },
         });
         // Schema BEFORE the where filter — only from-lines applied.
-        assert_eq!(compute_schema_at(&block, 1), vec!["line".to_string()]);
+        assert_eq!(compute_schema_at(&shed, 1), vec!["line".to_string()]);
         // Schema BEFORE from-lines — bytes, no schema.
-        assert!(compute_schema_at(&block, 0).is_empty());
+        assert!(compute_schema_at(&shed, 0).is_empty());
     }
 
     #[test]
     fn filter_edit_state_picks_parser_when_input_is_bytes() {
-        let block = block_with_stdout(b"a\nb\nc\n");
-        let state = FilterEditState::for_add(&block);
+        let shed = shed_with_stdout(b"a\nb\nc\n");
+        let state = FilterEditState::for_add(&shed);
         assert_eq!(state.kind, FilterKind::FromLines);
         assert_eq!(state.mode, EditMode::Add);
     }
 
     #[test]
     fn filter_edit_state_picks_where_when_schema_available() {
-        let mut block = block_with_stdout(b"a\nb\nc\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a\nb\nc\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let state = FilterEditState::for_add(&shed);
         assert_eq!(state.kind, FilterKind::Where);
         assert_eq!(state.available_columns, vec!["line".to_string()]);
     }
 
     #[test]
     fn build_filter_for_where_requires_column() {
-        let block = block_with_stdout(b"a\n");
-        let mut state = FilterEditState::for_add(&block);
+        let shed = shed_with_stdout(b"a\n");
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Where;
         assert!(state.build_filter().is_none());
     }
@@ -7850,12 +7850,12 @@ mod tests {
     fn palette_matches_filter_by_word_substrings() {
         let mut app = App::new();
         app.history.clear();
-        // No cursor, no blocks — only always-enabled actions and "any
-        // blocks" actions show. Newest-block one wouldn't (no blocks).
+        // No cursor, no sheds — only always-enabled actions and "any
+        // sheds" actions show. Newest-shed one wouldn't (no sheds).
         let all = matches_for_input("", &app);
         assert!(all.iter().any(|a| a.name == "Quit shed"));
         assert!(all.iter().any(|a| a.name == "Open env editor"));
-        assert!(!all.iter().any(|a| a.name == "Focus newest block"));
+        assert!(!all.iter().any(|a| a.name == "Focus newest shed"));
 
         // Multi-word substring match.
         let env = matches_for_input("env editor", &app);
@@ -7985,9 +7985,9 @@ mod tests {
 
     #[test]
     fn cycle_kind_walks_through_all_kinds() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&shed);
         assert_eq!(state.kind, FilterKind::Where);
         // Walks once around the cycle and lands back on Where.
         for _ in 0..FilterKind::ALL.len() {
@@ -7998,9 +7998,9 @@ mod tests {
 
     #[test]
     fn build_filter_sort_by_single_key() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::SortBy;
         state.sort_keys = vec![(0, SortDirection::Desc)];
         match state.build_filter() {
@@ -8015,9 +8015,9 @@ mod tests {
 
     #[test]
     fn build_filter_sort_by_multi_key_preserves_order() {
-        let mut block = block_with_stdout(b"a b c\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b c\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::SortBy;
         state.sort_keys = vec![
             (1, SortDirection::Asc),
@@ -8039,8 +8039,8 @@ mod tests {
 
     #[test]
     fn build_filter_sort_by_empty_keys_is_none() {
-        let block = block_with_stdout(b"x\n");
-        let mut state = FilterEditState::for_add(&block);
+        let shed = shed_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::SortBy;
         state.sort_keys.clear();
         assert!(state.build_filter().is_none());
@@ -8048,9 +8048,9 @@ mod tests {
 
     #[test]
     fn build_filter_uniq_no_columns_means_full_dedupe() {
-        let mut block = block_with_stdout(b"a b\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Uniq;
         match state.build_filter() {
             Some(FilterSpec::Uniq { by }) => assert!(by.is_none()),
@@ -8065,9 +8065,9 @@ mod tests {
 
     #[test]
     fn build_filter_rename_collects_only_nonempty_rows() {
-        let mut block = block_with_stdout(b"a b c\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b c\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Rename;
         // available_columns = [_1, _2, _3]; rename_to_inputs starts as 3 empties.
         state.rename_to_inputs[0] = "file".into();
@@ -8084,9 +8084,9 @@ mod tests {
 
     #[test]
     fn build_filter_rename_empty_is_none() {
-        let mut block = block_with_stdout(b"a b\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Rename;
         // All inputs empty.
         assert!(state.build_filter().is_none());
@@ -8094,12 +8094,12 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_rename() {
-        let mut block = block_with_stdout(b"a b c\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        block.pipeline.push(FilterSpec::Rename {
+        let mut shed = shed_with_stdout(b"a b c\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        shed.pipeline.push(FilterSpec::Rename {
             pairs: vec![("_2".into(), "size".into())],
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Rename);
         assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
         assert_eq!(state.rename_to_inputs, vec!["", "size", ""]);
@@ -8107,9 +8107,9 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_multi_key_sort_by() {
-        let mut block = block_with_stdout(b"a b c\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        block.pipeline.push(FilterSpec::SortBy {
+        let mut shed = shed_with_stdout(b"a b c\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        shed.pipeline.push(FilterSpec::SortBy {
             keys: vec![
                 SortKey {
                     column: "_3".into(),
@@ -8121,7 +8121,7 @@ mod tests {
                 },
             ],
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::SortBy);
         assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
         assert_eq!(state.sort_keys.len(), 2);
@@ -8131,12 +8131,12 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_from_csv() {
-        let mut block = block_with_stdout(b"a,b\n1,2\n");
-        block.pipeline.push(FilterSpec::FromCsv {
+        let mut shed = shed_with_stdout(b"a,b\n1,2\n");
+        shed.pipeline.push(FilterSpec::FromCsv {
             delim: ';',
             has_header: false,
         });
-        let state = FilterEditState::for_edit(&block, 0);
+        let state = FilterEditState::for_edit(&shed, 0);
         assert_eq!(state.kind, FilterKind::FromCsv);
         assert_eq!(state.csv_delim, ';');
         assert!(!state.csv_has_header);
@@ -8144,19 +8144,19 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_from_regex() {
-        let mut block = block_with_stdout(b"x\n");
-        block.pipeline.push(FilterSpec::FromRegex {
+        let mut shed = shed_with_stdout(b"x\n");
+        shed.pipeline.push(FilterSpec::FromRegex {
             pattern: r"(?<k>\w+)".into(),
         });
-        let state = FilterEditState::for_edit(&block, 0);
+        let state = FilterEditState::for_edit(&shed, 0);
         assert_eq!(state.kind, FilterKind::FromRegex);
         assert_eq!(state.regex_pattern, r"(?<k>\w+)");
     }
 
     #[test]
     fn build_filter_from_regex_requires_pattern() {
-        let block = block_with_stdout(b"x\n");
-        let mut state = FilterEditState::for_add(&block);
+        let shed = shed_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::FromRegex;
         assert!(state.build_filter().is_none());
         state.regex_pattern = "abc".into();
@@ -8168,8 +8168,8 @@ mod tests {
 
     #[test]
     fn cycle_delim_walks_choices() {
-        let block = block_with_stdout(b"x\n");
-        let mut state = FilterEditState::for_add(&block);
+        let shed = shed_with_stdout(b"x\n");
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::FromCsv;
         assert_eq!(state.csv_delim, ',');
         state.cycle_delim(1);
@@ -8182,9 +8182,9 @@ mod tests {
 
     #[test]
     fn build_filter_take_requires_valid_n() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Take;
         assert!(state.build_filter().is_none());
         state.n_input = "5".into();
@@ -8198,9 +8198,9 @@ mod tests {
 
     #[test]
     fn build_filter_select_requires_at_least_one_column() {
-        let mut block = block_with_stdout(b"a b\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Select;
         assert!(state.build_filter().is_none());
         state.column_selections[0] = true;
@@ -8214,19 +8214,19 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_take() {
-        let mut block = block_with_stdout(b"a\nb\nc\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Take { n: 2 });
-        let state = FilterEditState::for_edit(&block, 1);
+        let mut shed = shed_with_stdout(b"a\nb\nc\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Take { n: 2 });
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Take);
         assert_eq!(state.n_input, "2");
     }
 
     #[test]
     fn build_filter_where_single_clause_uses_op_for_predicate_kind() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Where;
 
         state.where_clauses[0].op = WhereOp::Matches;
@@ -8261,9 +8261,9 @@ mod tests {
 
     #[test]
     fn build_filter_where_two_clauses_chains_with_combine() {
-        let mut block = block_with_stdout(b"a b\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        let mut state = FilterEditState::for_add(&block);
+        let mut shed = shed_with_stdout(b"a b\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        let mut state = FilterEditState::for_add(&shed);
         state.kind = FilterKind::Where;
         state.where_clauses = vec![
             WhereClause {
@@ -8301,8 +8301,8 @@ mod tests {
 
     #[test]
     fn for_edit_flattens_and_chain_into_clauses() {
-        let mut block = block_with_stdout(b"a b\n");
-        block.pipeline.push(FilterSpec::FromFields);
+        let mut shed = shed_with_stdout(b"a b\n");
+        shed.pipeline.push(FilterSpec::FromFields);
         let p = Predicate::And(
             Box::new(Predicate::Matches {
                 column: "_1".into(),
@@ -8320,8 +8320,8 @@ mod tests {
                 }),
             )),
         );
-        block.pipeline.push(FilterSpec::Where { predicate: p });
-        let state = FilterEditState::for_edit(&block, 1);
+        shed.pipeline.push(FilterSpec::Where { predicate: p });
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Where);
         assert_eq!(state.where_combine, WhereCombine::And);
         assert_eq!(state.where_clauses.len(), 3);
@@ -8343,16 +8343,16 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_compare_predicate() {
-        let mut block = block_with_stdout(b"1\n2\n10\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Where {
+        let mut shed = shed_with_stdout(b"1\n2\n10\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Where {
             predicate: Predicate::Compare {
                 column: "line".into(),
                 op: CompareOp::Gt,
                 value: Value::Int(5),
             },
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Where);
         assert_eq!(state.where_clauses.len(), 1);
         assert_eq!(state.where_clauses[0].op, WhereOp::Gt);
@@ -8361,27 +8361,27 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_contains_predicate() {
-        let mut block = block_with_stdout(b"hello\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Where {
+        let mut shed = shed_with_stdout(b"hello\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Where {
             predicate: Predicate::Contains {
                 column: "line".into(),
                 substring: "ell".into(),
             },
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.where_clauses[0].op, WhereOp::Contains);
         assert_eq!(state.where_clauses[0].pattern, "ell");
     }
 
     #[test]
     fn for_edit_prepopulates_select_columns() {
-        let mut block = block_with_stdout(b"a b c\n");
-        block.pipeline.push(FilterSpec::FromFields);
-        block.pipeline.push(FilterSpec::Select {
+        let mut shed = shed_with_stdout(b"a b c\n");
+        shed.pipeline.push(FilterSpec::FromFields);
+        shed.pipeline.push(FilterSpec::Select {
             columns: vec!["_1".into(), "_3".into()],
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Select);
         // available_columns at index 1 = [_1, _2, _3]; selections should mark _1 and _3
         assert_eq!(state.available_columns, vec!["_1", "_2", "_3"]);
@@ -8390,15 +8390,15 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_from_existing_where() {
-        let mut block = block_with_stdout(b"a\nb\nbb\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Where {
+        let mut shed = shed_with_stdout(b"a\nb\nbb\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Where {
             predicate: Predicate::Matches {
                 column: "line".into(),
                 pattern: "bb".into(),
             },
         });
-        let state = FilterEditState::for_edit(&block, 1);
+        let state = FilterEditState::for_edit(&shed, 1);
         assert_eq!(state.kind, FilterKind::Where);
         assert_eq!(state.mode, EditMode::Edit(1));
         assert_eq!(state.where_clauses[0].pattern, "bb");
@@ -8408,19 +8408,19 @@ mod tests {
 
     #[test]
     fn for_edit_prepopulates_from_existing_from_lines() {
-        let mut block = block_with_stdout(b"x\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        let state = FilterEditState::for_edit(&block, 0);
+        let mut shed = shed_with_stdout(b"x\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        let state = FilterEditState::for_edit(&shed, 0);
         assert_eq!(state.kind, FilterKind::FromLines);
         assert_eq!(state.mode, EditMode::Edit(0));
     }
 
     #[test]
     fn for_insert_inserts_before_existing_filter() {
-        let mut block = block_with_stdout(b"a\nb\nc\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Take { n: 5 });
-        let state = FilterEditState::for_insert(&block, 1);
+        let mut shed = shed_with_stdout(b"a\nb\nc\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Take { n: 5 });
+        let state = FilterEditState::for_insert(&shed, 1);
         assert_eq!(state.mode, EditMode::Insert(1));
         // Schema is computed BEFORE index 1, i.e. after FromLines.
         assert_eq!(state.available_columns, vec!["line".to_string()]);
@@ -8428,23 +8428,23 @@ mod tests {
 
     #[test]
     fn apply_filter_edit_insert_pushes_existing_right() {
-        let mut block = block_with_stdout(b"a\n");
-        block.pipeline.push(FilterSpec::FromLines);
-        block.pipeline.push(FilterSpec::Take { n: 5 });
+        let mut shed = shed_with_stdout(b"a\n");
+        shed.pipeline.push(FilterSpec::FromLines);
+        shed.pipeline.push(FilterSpec::Take { n: 5 });
         // Insert a `where` between FromLines and Take.
-        let mut state = FilterEditState::for_insert(&block, 1);
+        let mut state = FilterEditState::for_insert(&shed, 1);
         state.kind = FilterKind::Where;
         state.where_clauses[0].pattern = "x".into();
         // Direct pipeline mutation (mirrors apply_filter_edit's logic).
         let spec = state.build_filter().expect("buildable");
         match state.mode {
-            EditMode::Insert(i) => block.pipeline.insert(i, spec),
+            EditMode::Insert(i) => shed.pipeline.insert(i, spec),
             _ => panic!("expected Insert"),
         }
-        assert_eq!(block.pipeline.len(), 3);
-        assert!(matches!(block.pipeline[0], FilterSpec::FromLines));
-        assert!(matches!(block.pipeline[1], FilterSpec::Where { .. }));
-        assert!(matches!(block.pipeline[2], FilterSpec::Take { n: 5 }));
+        assert_eq!(shed.pipeline.len(), 3);
+        assert!(matches!(shed.pipeline[0], FilterSpec::FromLines));
+        assert!(matches!(shed.pipeline[1], FilterSpec::Where { .. }));
+        assert!(matches!(shed.pipeline[2], FilterSpec::Take { n: 5 }));
     }
 
     #[test]
@@ -8454,8 +8454,8 @@ mod tests {
 
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["echo".into(), "hi".into()]);
-        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        let id = app.session.add_shed(vec!["echo".into(), "hi".into()]);
+        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
         app.dirty = true;
         assert!(app.dirty);
 
@@ -8463,41 +8463,41 @@ mod tests {
         assert!(!app.dirty, "save clears dirty");
         assert_eq!(app.notebook_path.as_deref(), Some(path.as_path()));
 
-        // Open into a fresh app: blocks come back as Idle with the pipeline intact.
+        // Open into a fresh app: sheds come back as Idle with the pipeline intact.
         let mut other = App::new();
         other.history.clear();
         load_from_path(&mut other, &path);
         assert!(!other.dirty);
-        let blocks: Vec<_> = other.session.blocks().collect();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].argv, vec!["echo", "hi"]);
-        assert!(matches!(blocks[0].state, BlockState::Idle));
-        assert_eq!(blocks[0].pipeline.len(), 1);
+        let sheds: Vec<_> = other.session.sheds().collect();
+        assert_eq!(sheds.len(), 1);
+        assert_eq!(sheds[0].argv, vec!["echo", "hi"]);
+        assert!(matches!(sheds[0].state, ShedState::Idle));
+        assert_eq!(sheds[0].pipeline.len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn run_cursor_block_in_place_queues_pending_request() {
+    fn run_cursor_shed_in_place_queues_pending_request() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["true".into()]);
-        app.session.set_state(id, BlockState::Idle);
+        let id = app.session.add_shed(vec!["true".into()]);
+        app.session.set_state(id, ShedState::Idle);
         app.session.set_cursor(Some(id));
 
-        run_cursor_block_in_place(&mut app);
+        run_cursor_shed_in_place(&mut app);
         assert_eq!(app.pending_run_chain.front().copied(), Some(id));
     }
 
     #[test]
     fn build_run_chain_walks_at_ref_dep_first() {
         let mut s = Session::new();
-        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
-        s.set_state(src, BlockState::Idle);
+        let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(src, ShedState::Idle);
         s.pin(src, "src".into());
 
-        let dep = s.add_block(vec!["@src".into()]);
-        s.set_state(dep, BlockState::Idle);
+        let dep = s.add_shed(vec!["@src".into()]);
+        s.set_state(dep, ShedState::Idle);
 
         let mut visited = HashSet::new();
         let chain = build_run_chain(&s, dep, &mut visited);
@@ -8507,12 +8507,12 @@ mod tests {
     #[test]
     fn build_run_chain_skips_done_source() {
         let mut s = Session::new();
-        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
-        s.set_state(src, BlockState::Done(0));
+        let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(src, ShedState::Done(0));
         s.pin(src, "src".into());
 
-        let dep = s.add_block(vec!["@src".into()]);
-        s.set_state(dep, BlockState::Idle);
+        let dep = s.add_shed(vec!["@src".into()]);
+        s.set_state(dep, ShedState::Idle);
 
         let mut visited = HashSet::new();
         let chain = build_run_chain(&s, dep, &mut visited);
@@ -8523,16 +8523,16 @@ mod tests {
     #[test]
     fn build_run_chain_chains_two_levels_of_at_refs() {
         let mut s = Session::new();
-        let root = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
-        s.set_state(root, BlockState::Idle);
+        let root = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        s.set_state(root, ShedState::Idle);
         s.pin(root, "root".into());
 
-        let mid = s.add_block(vec!["@root".into()]);
-        s.set_state(mid, BlockState::Idle);
+        let mid = s.add_shed(vec!["@root".into()]);
+        s.set_state(mid, ShedState::Idle);
         s.pin(mid, "mid".into());
 
-        let leaf = s.add_block(vec!["@mid".into()]);
-        s.set_state(leaf, BlockState::Idle);
+        let leaf = s.add_shed(vec!["@mid".into()]);
+        s.set_state(leaf, ShedState::Idle);
 
         let mut visited = HashSet::new();
         let chain = build_run_chain(&s, leaf, &mut visited);
@@ -8542,8 +8542,8 @@ mod tests {
     #[test]
     fn build_run_chain_handles_self_cycle() {
         let mut s = Session::new();
-        let id = s.add_block(vec!["@loop".into()]);
-        s.set_state(id, BlockState::Idle);
+        let id = s.add_shed(vec!["@loop".into()]);
+        s.set_state(id, ShedState::Idle);
         s.pin(id, "loop".into());
 
         let mut visited = HashSet::new();
@@ -8555,9 +8555,9 @@ mod tests {
     fn advance_run_chain_aborts_dependents_when_prereq_fails() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["false".into()]);
-        let b = app.session.add_block(vec!["true".into()]);
-        app.session.set_state(a, BlockState::Failed("boom".into()));
+        let a = app.session.add_shed(vec!["false".into()]);
+        let b = app.session.add_shed(vec!["true".into()]);
+        app.session.set_state(a, ShedState::Failed("boom".into()));
         app.chain_in_flight = Some(a);
         app.pending_run_chain.push_back(b);
 
@@ -8579,7 +8579,7 @@ mod tests {
     #[test]
     fn snapshot_pinned_renders_structured_as_json() {
         let mut s = Session::new();
-        let src = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         s.set_capture(src, Capture {
             stdout: Bytes::from_static(b"1\n2\n3\n"),
             stderr: Bytes::new(),
@@ -8589,7 +8589,7 @@ mod tests {
             truncated: false,
             snapshotted: false,
         });
-        s.block_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
+        s.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
         s.pin(src, "nums".into());
 
         let bytes = snapshot_pinned(&s, "nums").expect("snapshot");
@@ -8604,7 +8604,7 @@ mod tests {
     #[test]
     fn snapshot_pinned_passes_raw_bytes_through_when_unparsed() {
         let mut s = Session::new();
-        let src = s.add_block(vec!["echo".into(), "hi".into()]);
+        let src = s.add_shed(vec!["echo".into(), "hi".into()]);
         s.set_capture(src, Capture {
             stdout: Bytes::from_static(b"hello\n"),
             stderr: Bytes::new(),
@@ -8628,37 +8628,37 @@ mod tests {
     }
 
     #[test]
-    fn delete_block_at_cursor_removes_and_advances() {
+    fn delete_shed_at_cursor_removes_and_advances() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
-        let b = app.session.add_block(vec!["b".into()]);
-        let c = app.session.add_block(vec!["c".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        let c = app.session.add_shed(vec!["c".into()]);
         app.session.set_cursor(Some(b));
-        delete_block_at_cursor(&mut app);
-        assert!(app.session.block(b).is_none());
+        delete_shed_at_cursor(&mut app);
+        assert!(app.session.shed(b).is_none());
         // Cursor advances to next sibling (c).
         assert_eq!(app.session.cursor(), Some(c));
         assert!(app.dirty);
         // Sanity: a still exists.
-        assert!(app.session.block(a).is_some());
+        assert!(app.session.shed(a).is_some());
     }
 
     #[test]
-    fn delete_last_block_returns_to_prompt_focus() {
+    fn delete_last_shed_returns_to_prompt_focus() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
         app.session.set_cursor(Some(a));
-        app.focus = Focus::BlockCursor;
-        delete_block_at_cursor(&mut app);
+        app.focus = Focus::ShedCursor;
+        delete_shed_at_cursor(&mut app);
         assert!(app.session.cursor().is_none());
         assert_eq!(app.focus, Focus::Prompt);
     }
 
     #[test]
     fn note_edit_inserts_chars_and_newlines_at_cursor() {
-        let mut state = NoteEditState::new(BlockId(1), NotePosition::Pre, None);
+        let mut state = NoteEditState::new(ShedId(1), NotePosition::Pre, None);
         // Synthesize key events through handle_note_edit_key by running it
         // via a minimal app shim. Easier to test the helpers directly.
         for c in "abc".chars() {
@@ -8675,7 +8675,7 @@ mod tests {
 
     #[test]
     fn note_edit_vertical_move_preserves_column() {
-        let mut state = NoteEditState::new(BlockId(1), NotePosition::Pre, Some("abcdef\nghij\nkl"));
+        let mut state = NoteEditState::new(ShedId(1), NotePosition::Pre, Some("abcdef\nghij\nkl"));
         // Cursor on second line at column 4 (right after "ghij").
         state.cursor = 11;
         // Up: should go to column 4 of "abcdef" → index 4.
@@ -8690,10 +8690,10 @@ mod tests {
     }
 
     #[test]
-    fn commit_note_edit_writes_to_block_and_marks_dirty() {
+    fn commit_note_edit_writes_to_shed_and_marks_dirty() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["echo".into()]);
+        let id = app.session.add_shed(vec!["echo".into()]);
         app.session.set_cursor(Some(id));
         open_note_edit(&mut app, NotePosition::Pre);
         let st = app.note_edit.as_mut().expect("opened");
@@ -8704,10 +8704,10 @@ mod tests {
         // Reset dirty so we can confirm commit flips it.
         app.dirty = false;
         commit_note_edit(&mut app);
-        let block = app.session.block(id).unwrap();
-        assert_eq!(block.pre_text.as_deref(), Some("hello"));
+        let shed = app.session.shed(id).unwrap();
+        assert_eq!(shed.pre_text.as_deref(), Some("hello"));
         assert!(app.dirty);
-        assert_eq!(app.focus, Focus::BlockCursor);
+        assert_eq!(app.focus, Focus::ShedCursor);
         assert!(app.note_edit.is_none());
     }
 
@@ -8715,8 +8715,8 @@ mod tests {
     fn empty_note_buffer_clears_existing_text() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["echo".into()]);
-        if let Some(b) = app.session.block_mut(id) {
+        let id = app.session.add_shed(vec!["echo".into()]);
+        if let Some(b) = app.session.shed_mut(id) {
             b.pre_text = Some("old text".into());
         }
         app.session.set_cursor(Some(id));
@@ -8727,7 +8727,7 @@ mod tests {
             st.cursor = 0;
         }
         commit_note_edit(&mut app);
-        assert!(app.session.block(id).unwrap().pre_text.is_none());
+        assert!(app.session.shed(id).unwrap().pre_text.is_none());
     }
 
     #[test]
@@ -8735,7 +8735,7 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
-        let _ = app.session.add_block(vec!["a".into()]);
+        let _ = app.session.add_shed(vec!["a".into()]);
         // Pretend a previous redo path exists.
         app.redo_stack.push(app.session.clone());
         app.savepoint();
@@ -8749,7 +8749,7 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
-        let id = app.session.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        let id = app.session.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         app.session.set_capture(id, Capture {
             stdout: Bytes::from_static(b"1\n2\n3\n"),
             stderr: Bytes::new(),
@@ -8763,34 +8763,34 @@ mod tests {
 
         // Simulate adding a filter via savepoint + mutation.
         app.savepoint();
-        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
 
-        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 1);
+        assert_eq!(app.session.shed(id).unwrap().pipeline.len(), 1);
 
         undo(&mut app);
-        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 0);
+        assert_eq!(app.session.shed(id).unwrap().pipeline.len(), 0);
         // Capture preserved on undo (not lost when reverting structure).
-        assert!(app.session.block(id).unwrap().capture.is_some());
+        assert!(app.session.shed(id).unwrap().capture.is_some());
 
         redo(&mut app);
-        assert_eq!(app.session.block(id).unwrap().pipeline.len(), 1);
-        assert!(app.session.block(id).unwrap().capture.is_some());
+        assert_eq!(app.session.shed(id).unwrap().pipeline.len(), 1);
+        assert!(app.session.shed(id).unwrap().capture.is_some());
     }
 
     #[test]
-    fn undo_resurrects_a_deleted_block() {
+    fn undo_resurrects_a_deleted_shed() {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
-        let id = app.session.add_block(vec!["echo".into(), "hi".into()]);
+        let id = app.session.add_shed(vec!["echo".into(), "hi".into()]);
         app.session.set_cursor(Some(id));
 
         app.savepoint();
-        app.session.remove_block(id);
-        assert!(app.session.block(id).is_none());
+        app.session.remove_shed(id);
+        assert!(app.session.shed(id).is_none());
 
         undo(&mut app);
-        let resurrected = app.session.block(id).expect("block restored");
+        let resurrected = app.session.shed(id).expect("shed restored");
         assert_eq!(resurrected.argv, vec!["echo", "hi"]);
     }
 
@@ -8818,8 +8818,8 @@ mod tests {
     fn move_filter_cursor_jumps_left_to_command() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["ls".into()]);
-        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
         app.session.set_cursor(Some(id));
         app.pipeline_cursor = 0;
         app.command_focused = false;
@@ -8837,16 +8837,16 @@ mod tests {
     #[test]
     fn collect_dependents_finds_recursive_at_refs() {
         let mut s = Session::new();
-        let root = s.add_block(vec!["seq".into(), "1".into(), "3".into()]);
+        let root = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         s.pin(root, "root".into());
 
-        let a = s.add_block(vec!["@root".into()]);
+        let a = s.add_shed(vec!["@root".into()]);
         s.pin(a, "a".into());
 
-        let b = s.add_block(vec!["@a".into()]);
+        let b = s.add_shed(vec!["@a".into()]);
 
         // Unrelated:
-        let _other = s.add_block(vec!["echo".into()]);
+        let _other = s.add_shed(vec!["echo".into()]);
 
         let mut out = Vec::new();
         let mut visited = HashSet::new();
@@ -8858,12 +8858,12 @@ mod tests {
     fn commit_cmd_edit_updates_argv_and_queues_self_plus_dependents() {
         let mut app = App::new();
         app.history.clear();
-        let src = app.session.add_block(vec!["seq".into(), "1".into(), "3".into()]);
-        app.session.set_state(src, BlockState::Done(0));
+        let src = app.session.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        app.session.set_state(src, ShedState::Done(0));
         app.session.pin(src, "src".into());
 
-        let dep = app.session.add_block(vec!["@src".into()]);
-        app.session.set_state(dep, BlockState::Done(0));
+        let dep = app.session.add_shed(vec!["@src".into()]);
+        app.session.set_state(dep, ShedState::Done(0));
 
         app.session.set_cursor(Some(src));
         app.cmd_edit_input = "seq 1 5".into();
@@ -8872,7 +8872,7 @@ mod tests {
 
         assert!(!app.cmd_edit_input_mode);
         assert_eq!(
-            app.session.block(src).unwrap().argv,
+            app.session.shed(src).unwrap().argv,
             vec!["seq", "1", "5"]
         );
         // Both source (re-run) and dependent (re-snapshot) queued.
@@ -8884,13 +8884,13 @@ mod tests {
     fn commit_cmd_edit_rejects_unmatched_quote() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["echo".into()]);
+        let id = app.session.add_shed(vec!["echo".into()]);
         app.session.set_cursor(Some(id));
         app.cmd_edit_input = r#"echo "unclosed"#.into();
         app.cmd_edit_input_mode = true;
         commit_cmd_edit(&mut app);
         // argv unchanged, flash set, mode cleared.
-        assert_eq!(app.session.block(id).unwrap().argv, vec!["echo"]);
+        assert_eq!(app.session.shed(id).unwrap().argv, vec!["echo"]);
         assert!(app.flash.as_deref().unwrap_or("").contains("unmatched"));
     }
 
@@ -8911,8 +8911,8 @@ mod tests {
     fn build_alias_from_cursor_copies_argv_and_pipeline() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["ls".into(), "-lat".into()]);
-        app.session.block_mut(id).unwrap().pipeline.push(FilterSpec::FromFields);
+        let id = app.session.add_shed(vec!["ls".into(), "-lat".into()]);
+        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromFields);
         app.session.set_cursor(Some(id));
 
         let alias = build_alias_from_cursor(&app, "list".into()).expect("built");
@@ -8927,7 +8927,7 @@ mod tests {
         app.history.clear();
         // Avoid actually writing to the user's real config dir.
         app.aliases_path = None;
-        let id = app.session.add_block(vec!["ls".into()]);
+        let id = app.session.add_shed(vec!["ls".into()]);
         app.session.set_cursor(Some(id));
         app.alias_name_input = "list".into();
         app.alias_name_input_mode = true;
@@ -8943,7 +8943,7 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
-        let id = app.session.add_block(vec!["ls".into()]);
+        let id = app.session.add_shed(vec!["ls".into()]);
         app.session.set_cursor(Some(id));
         app.aliases.upsert(Alias {
             name: "list".into(),
@@ -8983,7 +8983,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_alias_creates_idle_block_and_opens_cmd_edit() {
+    fn spawn_alias_creates_idle_shed_and_opens_cmd_edit() {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
@@ -8994,10 +8994,10 @@ mod tests {
         };
         spawn_alias(&mut app, &alias);
         let id = app.session.cursor().expect("cursor set");
-        let block = app.session.block(id).unwrap();
-        assert_eq!(block.argv, vec!["ls", "-lat"]);
-        assert_eq!(block.pipeline.len(), 1);
-        assert!(matches!(block.state, BlockState::Idle));
+        let shed = app.session.shed(id).unwrap();
+        assert_eq!(shed.argv, vec!["ls", "-lat"]);
+        assert_eq!(shed.pipeline.len(), 1);
+        assert!(matches!(shed.state, ShedState::Idle));
         assert!(app.command_focused);
         assert!(app.cmd_edit_input_mode);
         // Pre-fill ends with a trailing space for easy arg appending.
@@ -9006,13 +9006,13 @@ mod tests {
     }
 
     #[test]
-    fn run_cursor_block_in_place_queues_when_no_running_entry() {
+    fn run_cursor_shed_in_place_queues_when_no_running_entry() {
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["sleep".into(), "5".into()]);
+        let id = app.session.add_shed(vec!["sleep".into(), "5".into()]);
         app.session.set_cursor(Some(id));
         // No RunningCommand entry → queues normally.
-        run_cursor_block_in_place(&mut app);
+        run_cursor_shed_in_place(&mut app);
         assert_eq!(app.pending_run_chain.front().copied(), Some(id));
     }
 
@@ -9055,7 +9055,7 @@ mod tests {
         );
         // / outside Prompt at argv0 → path (cmd-edit can be /usr/bin/foo)
         assert_eq!(
-            classify_completion(Focus::EditBlock, "", "/usr"),
+            classify_completion(Focus::EditShed, "", "/usr"),
             CompletionContext::Path
         );
         // ./ at argv0 → path
@@ -9078,9 +9078,9 @@ mod tests {
     #[test]
     fn pinned_completions_filters_by_prefix() {
         let mut s = Session::new();
-        let a = s.add_block(vec!["a".into()]);
-        let b = s.add_block(vec!["b".into()]);
-        let c = s.add_block(vec!["c".into()]);
+        let a = s.add_shed(vec!["a".into()]);
+        let b = s.add_shed(vec!["b".into()]);
+        let c = s.add_shed(vec!["c".into()]);
         s.pin(a, "logs".into());
         s.pin(b, "long".into());
         s.pin(c, "other".into());
@@ -9135,8 +9135,8 @@ mod tests {
     #[test]
     fn cycle_completion_advances_and_wraps() {
         let mut s = Session::new();
-        let a = s.add_block(vec!["a".into()]);
-        let b = s.add_block(vec!["b".into()]);
+        let a = s.add_shed(vec!["a".into()]);
+        let b = s.add_shed(vec!["b".into()]);
         s.pin(a, "alpha".into());
         s.pin(b, "alphabet".into());
         let mut app = App::new();
@@ -9343,50 +9343,50 @@ mod tests {
     // === scratch box navigation ===
 
     #[test]
-    fn down_past_last_block_parks_on_scratch_in_block_cursor() {
+    fn down_past_last_shed_parks_on_scratch_in_shed_cursor() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
-        let _ = app.session.add_block(vec!["b".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
+        let _ = app.session.add_shed(vec!["b".into()]);
         app.session.set_cursor(Some(a));
-        app.focus = Focus::BlockCursor;
+        app.focus = Focus::ShedCursor;
         app.move_cursor(1); // onto b
         app.move_cursor(1); // off the end — scratch box
         assert_eq!(app.session.cursor(), None, "cursor cleared");
-        assert_eq!(app.focus, Focus::BlockCursor, "focus stays on cursor");
+        assert_eq!(app.focus, Focus::ShedCursor, "focus stays on cursor");
     }
 
     #[test]
-    fn up_from_scratch_returns_to_last_block() {
+    fn up_from_scratch_returns_to_last_shed() {
         let mut app = App::new();
         app.history.clear();
-        let _ = app.session.add_block(vec!["a".into()]);
-        let b = app.session.add_block(vec!["b".into()]);
-        app.focus = Focus::BlockCursor;
+        let _ = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        app.focus = Focus::ShedCursor;
         app.session.set_cursor(None); // simulate parked on scratch
         app.move_cursor(-1);
-        assert_eq!(app.session.cursor(), Some(b), "cursor jumps to last block");
-        assert_eq!(app.focus, Focus::BlockCursor);
+        assert_eq!(app.session.cursor(), Some(b), "cursor jumps to last shed");
+        assert_eq!(app.focus, Focus::ShedCursor);
     }
 
     #[test]
     fn down_from_scratch_is_noop() {
         let mut app = App::new();
         app.history.clear();
-        let _ = app.session.add_block(vec!["a".into()]);
-        app.focus = Focus::BlockCursor;
+        let _ = app.session.add_shed(vec!["a".into()]);
+        app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
         app.move_cursor(1);
         assert_eq!(app.session.cursor(), None);
-        assert_eq!(app.focus, Focus::BlockCursor);
+        assert_eq!(app.focus, Focus::ShedCursor);
     }
 
     #[test]
     fn enter_on_scratch_activates_prompt() {
         let mut app = App::new();
         app.history.clear();
-        let _ = app.session.add_block(vec!["a".into()]);
-        app.focus = Focus::BlockCursor;
+        let _ = app.session.add_shed(vec!["a".into()]);
+        app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
         handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Prompt);
@@ -9396,8 +9396,8 @@ mod tests {
     fn space_on_scratch_activates_prompt_without_running_anything() {
         let mut app = App::new();
         app.history.clear();
-        let _ = app.session.add_block(vec!["a".into()]);
-        app.focus = Focus::BlockCursor;
+        let _ = app.session.add_shed(vec!["a".into()]);
+        app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
         handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Prompt);
@@ -9405,11 +9405,11 @@ mod tests {
     }
 
     #[test]
-    fn e_on_scratch_activates_prompt_not_edit_block() {
+    fn e_on_scratch_activates_prompt_not_edit_shed() {
         let mut app = App::new();
         app.history.clear();
-        let _ = app.session.add_block(vec!["a".into()]);
-        app.focus = Focus::BlockCursor;
+        let _ = app.session.add_shed(vec!["a".into()]);
+        app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
         handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Prompt);
@@ -9465,37 +9465,37 @@ mod tests {
     }
 
     #[test]
-    fn delete_block_via_id_removes_block_without_moving_cursor_if_not_on_it() {
+    fn delete_shed_via_id_removes_shed_without_moving_cursor_if_not_on_it() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
-        let b = app.session.add_block(vec!["b".into()]);
-        let c = app.session.add_block(vec!["c".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        let c = app.session.add_shed(vec!["c".into()]);
         app.session.set_cursor(Some(a));
-        delete_block(&mut app, c);
-        assert!(app.session.block(c).is_none());
+        delete_shed(&mut app, c);
+        assert!(app.session.shed(c).is_none());
         assert_eq!(app.session.cursor(), Some(a), "cursor unaffected");
-        assert!(app.session.block(b).is_some());
+        assert!(app.session.shed(b).is_some());
     }
 
     #[test]
-    fn delete_block_via_id_moves_cursor_if_it_was_on_the_target() {
+    fn delete_shed_via_id_moves_cursor_if_it_was_on_the_target() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
-        let b = app.session.add_block(vec!["b".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
         app.session.set_cursor(Some(a));
-        delete_block(&mut app, a);
+        delete_shed(&mut app, a);
         assert_eq!(app.session.cursor(), Some(b), "cursor advances to next");
     }
 
     #[test]
-    fn handle_mouse_click_in_delete_region_removes_that_block() {
+    fn handle_mouse_click_in_delete_region_removes_that_shed() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
-        let b = app.session.add_block(vec!["b".into()]);
-        // Pretend the renderer placed a delete region for block b at
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        // Pretend the renderer placed a delete region for shed b at
         // (10, 5) - 3 cells wide, 1 cell tall.
         app.click_regions.push(ClickRegion {
             rect: Rect { x: 10, y: 5, width: 3, height: 1 },
@@ -9508,15 +9508,15 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         handle_mouse(&mut app, me);
-        assert!(app.session.block(b).is_none(), "block b deleted");
-        assert!(app.session.block(a).is_some(), "block a kept");
+        assert!(app.session.shed(b).is_none(), "shed b deleted");
+        assert!(app.session.shed(a).is_some(), "shed a kept");
     }
 
     #[test]
     fn handle_mouse_click_outside_regions_does_nothing() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
         app.click_regions.push(ClickRegion {
             rect: Rect { x: 10, y: 5, width: 3, height: 1 },
             action: ClickAction::DeleteBlock(a),
@@ -9528,14 +9528,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         handle_mouse(&mut app, me);
-        assert!(app.session.block(a).is_some(), "block a still present");
+        assert!(app.session.shed(a).is_some(), "shed a still present");
     }
 
     #[test]
     fn handle_mouse_ignores_non_click_events() {
         let mut app = App::new();
         app.history.clear();
-        let a = app.session.add_block(vec!["a".into()]);
+        let a = app.session.add_shed(vec!["a".into()]);
         app.click_regions.push(ClickRegion {
             rect: Rect { x: 10, y: 5, width: 3, height: 1 },
             action: ClickAction::DeleteBlock(a),
@@ -9548,7 +9548,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         handle_mouse(&mut app, me);
-        assert!(app.session.block(a).is_some());
+        assert!(app.session.shed(a).is_some());
     }
 
     #[test]
@@ -9597,14 +9597,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_streams_mirrors_chunks_into_block_capture() {
+    async fn drain_streams_mirrors_chunks_into_shed_capture() {
         // Spawn a real `printf` so the reader task actually streams
         // bytes through the channel. Awaiting the handle guarantees
         // the sender closed, so try_recv after will yield every chunk
         // synchronously when drain_streams runs.
         let mut app = App::new();
         app.history.clear();
-        let id = app.session.add_block(vec!["printf".into(), "hello".into()]);
+        let id = app.session.add_shed(vec!["printf".into(), "hello".into()]);
         let (handle, killer, chunks) =
             crate::exec::spawn_command(vec!["printf".into(), "hello".into()], 1024)
                 .await
@@ -9624,7 +9624,7 @@ mod tests {
         }
 
         drain_streams(&mut app);
-        let cap = app.session.block(id).unwrap().capture.as_ref().unwrap();
+        let cap = app.session.shed(id).unwrap().capture.as_ref().unwrap();
         assert_eq!(cap.stdout.as_ref(), b"hello");
         // Streaming sets a partial capture: no exit code, no finish ts.
         assert!(cap.exit_code.is_none());
