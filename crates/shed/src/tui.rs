@@ -1633,21 +1633,37 @@ impl App {
 
     fn move_cursor(&mut self, delta: i32) {
         let ids = self.block_ids_in_order();
-        let Some(cur) = self.session.cursor() else {
+        if ids.is_empty() {
             return;
-        };
-        if let Some(i) = ids.iter().position(|id| *id == cur) {
-            let target = i as i32 + delta;
-            if target >= ids.len() as i32 {
-                // ↓ off the end of the list lands on the scratch box.
-                self.session.set_cursor(None);
-                self.command_focused = false;
-                self.focus = Focus::Prompt;
-                return;
+        }
+        match self.session.cursor() {
+            None => {
+                // Scratch box is "selected" — `↑` walks back to the
+                // last real block; `↓` is a no-op (already at end).
+                if delta < 0 {
+                    self.session.set_cursor(ids.last().copied());
+                    self.reset_pipeline_cursor();
+                }
             }
-            let new_i = target.clamp(0, ids.len() as i32 - 1) as usize;
-            self.session.set_cursor(Some(ids[new_i]));
-            self.reset_pipeline_cursor();
+            Some(cur) => {
+                let Some(i) = ids.iter().position(|id| *id == cur) else {
+                    return;
+                };
+                let target = i as i32 + delta;
+                if target >= ids.len() as i32 {
+                    // `↓` past the last real block parks on the
+                    // scratch box but *stays in BlockCursor*, so `↑`
+                    // walks back instead of jumping into prompt
+                    // history. To start typing the user activates
+                    // the scratch box via Enter / Space / `e`.
+                    self.session.set_cursor(None);
+                    self.command_focused = false;
+                    return;
+                }
+                let new_i = target.clamp(0, ids.len() as i32 - 1) as usize;
+                self.session.set_cursor(Some(ids[new_i]));
+                self.reset_pipeline_cursor();
+            }
         }
     }
 
@@ -3649,6 +3665,24 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             InputOutcome::Continue => {}
         }
         return;
+    }
+    // Scratch box selected (BlockCursor focus, cursor == None): only
+    // ↑↓, Esc, and the explicit "start typing" keys do anything —
+    // everything else (delete, pin, etc.) needs a real block.
+    let on_scratch = app.session.cursor().is_none();
+    if on_scratch {
+        match key.code {
+            KeyCode::Up => {
+                app.move_cursor(-1);
+                return;
+            }
+            KeyCode::Down => return,
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('e') => {
+                app.focus = Focus::Prompt;
+                return;
+            }
+            _ => {}
+        }
     }
     match key.code {
         KeyCode::Esc => {
@@ -6064,10 +6098,23 @@ fn draw_blocks(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegi
 /// press `/` (or scroll down) to start typing.
 fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     let active = app.focus == Focus::Prompt;
+    // "Selected" means the scratch box has been navigated to via ↓ from
+    // BlockCursor but the user hasn't activated it yet (cyan, matching
+    // the BlockCursor selection look on real blocks). Distinct from
+    // active (green) so it's clear what mode keystrokes go to.
+    let selected = !active
+        && app.focus == Focus::BlockCursor
+        && app.session.cursor().is_none();
+
     let title_style = if active {
         Style::default()
             .fg(Color::Black)
             .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -6082,6 +6129,10 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     let border_style = if active {
         Style::default()
             .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -6106,6 +6157,11 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
             Color::Green,
         ));
         Line::from(spans)
+    } else if selected {
+        Line::from(Span::styled(
+            "  press Enter / Space / e to start typing  (↑ to go back)",
+            Style::default().fg(Color::Cyan),
+        ))
     } else {
         Line::from(Span::styled(
             "  press / or ↓ to start typing a command",
@@ -9282,6 +9338,81 @@ mod tests {
             InputOutcome::Continue
         );
         assert_eq!(t, "abc");
+    }
+
+    // === scratch box navigation ===
+
+    #[test]
+    fn down_past_last_block_parks_on_scratch_in_block_cursor() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_block(vec!["a".into()]);
+        let _ = app.session.add_block(vec!["b".into()]);
+        app.session.set_cursor(Some(a));
+        app.focus = Focus::BlockCursor;
+        app.move_cursor(1); // onto b
+        app.move_cursor(1); // off the end — scratch box
+        assert_eq!(app.session.cursor(), None, "cursor cleared");
+        assert_eq!(app.focus, Focus::BlockCursor, "focus stays on cursor");
+    }
+
+    #[test]
+    fn up_from_scratch_returns_to_last_block() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_block(vec!["a".into()]);
+        let b = app.session.add_block(vec!["b".into()]);
+        app.focus = Focus::BlockCursor;
+        app.session.set_cursor(None); // simulate parked on scratch
+        app.move_cursor(-1);
+        assert_eq!(app.session.cursor(), Some(b), "cursor jumps to last block");
+        assert_eq!(app.focus, Focus::BlockCursor);
+    }
+
+    #[test]
+    fn down_from_scratch_is_noop() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_block(vec!["a".into()]);
+        app.focus = Focus::BlockCursor;
+        app.session.set_cursor(None);
+        app.move_cursor(1);
+        assert_eq!(app.session.cursor(), None);
+        assert_eq!(app.focus, Focus::BlockCursor);
+    }
+
+    #[test]
+    fn enter_on_scratch_activates_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_block(vec!["a".into()]);
+        app.focus = Focus::BlockCursor;
+        app.session.set_cursor(None);
+        handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Prompt);
+    }
+
+    #[test]
+    fn space_on_scratch_activates_prompt_without_running_anything() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_block(vec!["a".into()]);
+        app.focus = Focus::BlockCursor;
+        app.session.set_cursor(None);
+        handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Prompt);
+        assert!(app.pending_run_chain.is_empty());
+    }
+
+    #[test]
+    fn e_on_scratch_activates_prompt_not_edit_block() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_block(vec!["a".into()]);
+        app.focus = Focus::BlockCursor;
+        app.session.set_cursor(None);
+        handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Prompt);
     }
 
     // === carapace integration ===

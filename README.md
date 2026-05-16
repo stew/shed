@@ -444,15 +444,19 @@ so you don't lose data without noticing.
 The compact, default focus. Each block renders as a bordered box with
 just `id/name + glyph + output`; the command and pipeline stay hidden
 until you press `e` to enter EditBlock. Pressing `↓` past the last real
-block lands on the scratch box (focus shifts to Prompt).
+block *selects* the scratch box (still in BlockCursor, rendered in
+cyan); `↑` walks back to the last block, and Enter / Space / `e`
+activates the scratch for typing (focus shifts to Prompt, rendered in
+green).
 
 | Key       | Action |
 |-----------|--------|
-| `↑↓`      | navigate between blocks; `↓` past the last block jumps to the scratch (Prompt). |
-| `e`       | enter EditBlock — reveals the command and each filter on its own line so you can navigate / edit them. |
+| `↑↓`      | navigate between blocks; `↓` past the last block selects the scratch box (still BlockCursor); `↑` from the scratch returns to the last block. |
+| `e`       | enter EditBlock — reveals the command and each filter on its own line so you can navigate / edit them. On the scratch box, `e` activates the prompt for typing. |
 | `v`       | view the selected block in the fullscreen pager. |
 | `/`       | jump to the scratch (Prompt) with `/` typed for slash commands like `/aliases`. |
-| Space     | run the selected block in place (re-spawns its argv, replaces the capture). Use this to execute Idle blocks loaded from a notebook, or to re-run a finished block without typing it again. For `@name` snapshot blocks this re-snapshots from the source. |
+| Enter     | on the scratch box, activate the prompt for typing. |
+| Space     | run the selected block in place (re-spawns its argv, replaces the capture). On the scratch box, activate the prompt. For `@name` snapshot blocks this re-snapshots from the source. |
 | `x`       | delete the selected block from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
 | `w`       | write the block's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
 | `p`       | pin the selected block under a name (input bar pre-fills with the existing name if any). Pinned blocks render their box title as `@name` and never evict on capture-budget pressure. Empty name unpins. |
