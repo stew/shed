@@ -3148,6 +3148,59 @@ fn argv0_completions(aliases: &AliasFile, token: &str) -> Vec<String> {
     all.into_iter().collect()
 }
 
+/// Shell out to `carapace <argv0> export <argv0> <tokens...>` to get
+/// rich completions for the current argument position. Returns `None`
+/// when carapace isn't installed, when the spawn fails, or when its
+/// output isn't valid export JSON — in all of those cases the caller
+/// falls back to filesystem path completion.
+///
+/// Carapace's `export` format is a JSON object whose top-level
+/// `values` array holds `{value, display, description, style, tag}`
+/// records; we surface just `value` strings here. The carapace docs
+/// claim sub-10ms response on warm cache, which is well within
+/// interactive Tab-press latency.
+fn run_carapace_export(argv0: &str, tokens: &[String]) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("carapace")
+        .arg(argv0)
+        .arg("export")
+        .arg(argv0)
+        .args(tokens)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
+/// Parse a carapace `export`-format JSON document into a sorted, deduped
+/// list of completion values that start with `token`. Carapace's own
+/// completers usually return only matching values for the partial, but
+/// we filter defensively so we behave the same regardless.
+fn carapace_completions_from_export(json: &[u8], token: &str) -> Vec<String> {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(values) = root.get("values").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = values
+        .iter()
+        .filter_map(|item| item.get("value").and_then(|v| v.as_str()).map(String::from))
+        .filter(|v| v.starts_with(token))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn carapace_completions(argv0: &str, tokens: &[String], token: &str) -> Vec<String> {
+    let Some(json) = run_carapace_export(argv0, tokens) else {
+        return Vec::new();
+    };
+    carapace_completions_from_export(&json, token)
+}
+
 fn path_executables(prefix: &str) -> Vec<String> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
@@ -3254,9 +3307,26 @@ fn compute_completions(
         CompletionContext::Pinned => pinned_completions(session, token),
         CompletionContext::Slash => slash_completions(token),
         CompletionContext::Argv0 => argv0_completions(aliases, token),
-        CompletionContext::Path => path_completions(token),
+        CompletionContext::Path => path_or_carapace_completions(base, token),
     };
     (base.to_string(), matches)
+}
+
+/// For an argv1+ position, ask carapace first (if installed) for
+/// command-aware completions like git branch names, kubectl flags,
+/// docker image tags, etc. Fall back to filesystem path completion if
+/// carapace isn't available or returns no matches.
+fn path_or_carapace_completions(base: &str, token: &str) -> Vec<String> {
+    let prior: Vec<String> = base.split_whitespace().map(String::from).collect();
+    if let Some(argv0) = prior.first() {
+        let mut spans = prior.clone();
+        spans.push(token.to_string());
+        let from_carapace = carapace_completions(argv0, &spans, token);
+        if !from_carapace.is_empty() {
+            return from_carapace;
+        }
+    }
+    path_completions(token)
 }
 
 fn current_input_state(app: &App) -> Option<(String, usize)> {
@@ -9212,6 +9282,55 @@ mod tests {
             InputOutcome::Continue
         );
         assert_eq!(t, "abc");
+    }
+
+    // === carapace integration ===
+
+    #[test]
+    fn carapace_export_parser_extracts_values_matching_prefix() {
+        let json = br#"{
+            "version": "unknown",
+            "messages": [],
+            "values": [
+                {"value": "main", "display": "main", "description": "branch"},
+                {"value": "master", "display": "master"},
+                {"value": "develop", "display": "develop"}
+            ]
+        }"#;
+        let got = carapace_completions_from_export(json, "ma");
+        assert_eq!(got, vec!["main".to_string(), "master".to_string()]);
+    }
+
+    #[test]
+    fn carapace_export_parser_empty_token_returns_all_values_sorted() {
+        let json = br#"{
+            "values": [
+                {"value": "zeta"},
+                {"value": "alpha"},
+                {"value": "alpha"}
+            ]
+        }"#;
+        let got = carapace_completions_from_export(json, "");
+        assert_eq!(got, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn carapace_export_parser_missing_values_returns_empty() {
+        let got = carapace_completions_from_export(b"{\"version\":\"x\"}", "");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn carapace_export_parser_handles_invalid_json() {
+        let got = carapace_completions_from_export(b"not json at all", "");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn carapace_export_parser_ignores_records_without_value_field() {
+        let json = br#"{"values": [{"display": "x"}, {"value": "real"}]}"#;
+        let got = carapace_completions_from_export(json, "");
+        assert_eq!(got, vec!["real".to_string()]);
     }
 
     #[test]

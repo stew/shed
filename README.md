@@ -304,7 +304,9 @@ decides what to complete:
 | `@name`     | pinned block names |
 | `/cmd` (Prompt only, first token) | slash commands (`/aliases`) |
 | first token, otherwise | commands on `$PATH` ∪ saved aliases ∪ shell builtins (`cd`, `export`, `unset`, `exit`) |
-| second token onward, or any path-shaped token (`./`, `../`, `/...`, `~/`) | filesystem paths (directories get a trailing `/`; hidden entries appear only when the prefix starts with `.`) |
+| second token onward, or any path-shaped token (`./`, `../`, `/...`, `~/`) | [carapace](https://carapace.sh/) if installed and it returns matches for the command (e.g. `git checkout <Tab>` → branch names, `kubectl --<Tab>` → flag names); otherwise filesystem paths (directories get a trailing `/`; hidden entries appear only when the prefix starts with `.`) |
+
+If `carapace` is on `$PATH`, shed shells out to `carapace <argv0> export <argv0> <tokens>` for argv1+ completion. It ships completion specs for ~1000 commands, so this is the easiest way to get rich, command-aware completions without writing per-command logic in shed. If carapace isn't installed (or doesn't know the command), shed falls back to plain filesystem path completion.
 
 If no candidates match, the flash bar shows "no completions" and the
 input is left untouched.
