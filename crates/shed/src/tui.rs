@@ -6213,10 +6213,17 @@ fn draw_one_shed(
         ShedState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
         ShedState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
     };
+    // Argv goes in the title so the user can see what the shed runs
+    // without entering EditShed. ratatui clips long titles to the box
+    // width; the `[×]` button is painted over the top border last, so
+    // a long argv can't visually collide with it.
+    let argv_text = shed.argv.join(" ");
     let title = Line::from(vec![
         Span::styled(id_text, id_style),
         Span::raw(" "),
         glyph,
+        Span::raw(" "),
+        Span::styled(argv_text, Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
     ]);
 

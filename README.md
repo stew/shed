@@ -118,10 +118,10 @@ single "scratch" box at the bottom is the place to type a new command —
 it's always present and takes the next id.
 
 - **ShedCursor** — navigate sheds (`↑↓`); the scratch sits one slot
-  past the last real shed. Compact view: id/name + glyph + output. To
-  reveal the command and the pipeline, press `e` to enter EditShed.
-  Press `v` to open the fullscreen pager. Press `/` to jump to the
-  prompt and start typing.
+  past the last real shed. Compact view: id/name + glyph + argv in
+  the top border, output in the body. To reveal each filter on its own
+  navigable line, press `e` to enter EditShed. Press `v` to open the
+  fullscreen pager. Press `/` to jump to the prompt and start typing.
 - **EditShed** — pipeline-edit mode for the cursor shed. The argv is
   shown on the first line and each filter on its own indented line;
   `←→` navigates between the command and the filters; `f`/Enter opens
@@ -441,13 +441,13 @@ so you don't lose data without noticing.
 
 ### ShedCursor
 
-The compact, default focus. Each shed renders as a bordered box with
-just `id/name + glyph + output`; the command and pipeline stay hidden
-until you press `e` to enter EditShed. Pressing `↓` past the last real
-shed *selects* the scratch box (still in ShedCursor, rendered in
-cyan); `↑` walks back to the last shed, and Enter / Space / `e`
-activates the scratch for typing (focus shifts to Prompt, rendered in
-green).
+The compact, default focus. Each shed renders as a bordered box whose
+top border carries `id/name + glyph + argv`; the body is just the
+output. The per-filter pipeline detail stays hidden until you press
+`e` to enter EditShed. Pressing `↓` past the last real shed *selects*
+the scratch box (still in ShedCursor, rendered in cyan); `↑` walks
+back to the last shed, and Enter / Space / `e` activates the scratch
+for typing (focus shifts to Prompt, rendered in green).
 
 | Key       | Action |
 |-----------|--------|
