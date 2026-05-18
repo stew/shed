@@ -17,10 +17,12 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use shed_core::{PipelineValue, Value};
+use shed_core::{
+    CompareOp, FilterSpec, PipelineValue, Predicate, Shed, ShedState, SortDirection, Value,
+};
 
 use super::PREVIEW_LINES;
-use super::{CellLayout, ansi};
+use super::{CellLayout, ansi, apply_pipeline, delim_label};
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
@@ -312,6 +314,278 @@ pub(super) fn render_note_lines(text: &str) -> Vec<Line<'static>> {
             ])
         })
         .collect()
+}
+
+/// Render the body of a single shed.
+///
+/// The body comprises: an optional pre-text note, the command +
+/// pipeline summary (only in EditShed focus), the pipeline-applied
+/// output (table / scalar list / raw bytes), truncation + exit-code
+/// annotations, the "Space to run" hint for idle sheds, and the
+/// optional post-text note. `cells` accumulates per-cell layout entries
+/// for right-click hit-testing — caller passes a fresh
+/// `Vec<CellLayout>` per shed.
+pub(super) fn render_shed(
+    shed: &Shed,
+    selected: bool,
+    editing: bool,
+    pipeline_cursor: Option<usize>,
+    command_focused: bool,
+    cells: &mut Vec<CellLayout>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    if let Some(text) = shed.pre_text.as_deref() {
+        lines.extend(render_note_lines(text));
+    }
+
+    // Compute pipeline outcome up-front so we can show inline drop counts.
+    let pipeline_outcome = shed
+        .capture
+        .as_ref()
+        .map(|c| apply_pipeline(c, &shed.pipeline));
+    let drops: Vec<usize> = pipeline_outcome
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| vec![0; shed.pipeline.len()]);
+
+    // Show the command + each pipeline filter only in EditShed focus.
+    // ShedCursor stays compact — output only — so the list is scannable.
+    if editing {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                shed.argv.join(" "),
+                if command_focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                },
+            ),
+        ]));
+
+        // Each filter on its own line. When command_focused is true the
+        // pipeline cursor is treated as None so no filter wears the
+        // active-magenta highlight and the `+ add` slot is suppressed.
+        let effective_cursor = if command_focused {
+            None
+        } else {
+            pipeline_cursor
+        };
+        let highlight = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let normal = Style::default().fg(Color::LightCyan);
+        let dim = Style::default().fg(Color::DarkGray);
+        let warn = Style::default().fg(Color::Yellow);
+        let indent = "   ";
+
+        for (i, f) in shed.pipeline.iter().enumerate() {
+            let style = if effective_cursor == Some(i) {
+                highlight
+            } else {
+                normal
+            };
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled("│ ", dim),
+                Span::styled(format!(" {} ", describe_filter(f)), style),
+            ];
+            let n = drops.get(i).copied().unwrap_or(0);
+            if n > 0 {
+                spans.push(Span::styled(format!("  ⓘ-{n}"), warn));
+            }
+            lines.push(Line::from(spans));
+        }
+        if effective_cursor.is_some() {
+            let style = if effective_cursor == Some(shed.pipeline.len()) {
+                highlight
+            } else {
+                dim
+            };
+            lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled("│ ", dim),
+                Span::styled(" + add ", style),
+            ]));
+        }
+    }
+
+    // Running sheds tail their preview: the most recent rows are
+    // visible at the bottom, with "N more" pinned at the top. Finished
+    // sheds keep the existing head behaviour.
+    let tail = matches!(shed.state, ShedState::Running);
+    match pipeline_outcome {
+        Some(Ok((value, _))) => {
+            // render_pipeline_value's cells track line_idx relative to its
+            // own output (which is `render_table`'s line vector). Offset by
+            // the number of lines already in this shed body so cells end
+            // up in body-relative coordinates.
+            let body_offset = lines.len();
+            let before = cells.len();
+            lines.extend(render_pipeline_value(value, tail, cells));
+            for cell in &mut cells[before..] {
+                cell.line_idx += body_offset;
+            }
+        }
+        Some(Err(e)) => lines.extend(filter_error_lines(&e)),
+        None => {}
+    }
+
+    if let Some(capture) = &shed.capture {
+        if capture.truncated {
+            lines.push(Line::from(Span::styled(
+                " ✂ output truncated",
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+        if let Some(code) = capture.exit_code {
+            if code != 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(" exit {code}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+    } else if let ShedState::Done(code) = &shed.state {
+        let mut spans = vec![Span::styled(
+            " (no captured output)",
+            Style::default().fg(Color::DarkGray),
+        )];
+        if *code != 0 {
+            spans.push(Span::styled(
+                format!("  exit {code}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let ShedState::Failed(msg) = &shed.state {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+    if matches!(shed.state, ShedState::Idle) && selected {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" to run", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    if let Some(text) = shed.post_text.as_deref() {
+        lines.extend(render_note_lines(text));
+    }
+
+    lines
+}
+
+/// Human-readable label for a filter — used in EditShed's per-filter
+/// row, in the alias-manage view, and in pipeline previews. Mirrors
+/// what `Notebook::from_session` would persist, minus the
+/// data/parameter encoding.
+pub(super) fn describe_filter(spec: &FilterSpec) -> String {
+    match spec {
+        FilterSpec::FromLines => "from-lines".into(),
+        FilterSpec::FromFields => "from-fields".into(),
+        FilterSpec::FromCsv { delim, has_header } => format!(
+            "from-csv {}{}",
+            delim_label(*delim),
+            if *has_header { "" } else { " (no header)" }
+        ),
+        FilterSpec::FromJson => "from-json".into(),
+        FilterSpec::FromRegex { pattern } => format!("from-regex /{pattern}/"),
+        FilterSpec::Where { predicate } => format!("where {}", describe_predicate(predicate)),
+        FilterSpec::Select { columns } => format!("select {}", columns.join(", ")),
+        FilterSpec::Drop { columns } => format!("drop {}", columns.join(", ")),
+        FilterSpec::Take { n } => format!("take {n}"),
+        FilterSpec::Skip { n } => format!("skip {n}"),
+        FilterSpec::SortBy { keys } => {
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let dir = match k.direction {
+                        SortDirection::Asc => "↑",
+                        SortDirection::Desc => "↓",
+                    };
+                    format!("{} {dir}", k.column)
+                })
+                .collect();
+            format!("sort-by {}", parts.join(", "))
+        }
+        FilterSpec::Uniq { by } => match by {
+            Some(cols) => format!("uniq by {}", cols.join(", ")),
+            None => "uniq".into(),
+        },
+        FilterSpec::Count => "count".into(),
+        FilterSpec::Rename { pairs } => {
+            let s = pairs
+                .iter()
+                .map(|(f, t)| format!("{f}→{t}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("rename {s}")
+        }
+        FilterSpec::Split { column, delimiter } => {
+            format!("split {column} by {delimiter:?}")
+        }
+        FilterSpec::Join { column, delimiter } => {
+            format!("join {column} with {delimiter:?}")
+        }
+    }
+}
+
+pub(super) fn describe_predicate(p: &Predicate) -> String {
+    match p {
+        Predicate::Matches { column, pattern } => format!("{column} matches {pattern}"),
+        Predicate::Contains { column, substring } => format!("{column} contains {substring}"),
+        Predicate::Compare { column, op, value } => {
+            format!(
+                "{column} {} {}",
+                describe_compare_op(*op),
+                describe_compare_value(value)
+            )
+        }
+        Predicate::And(a, b) => format!("({} && {})", describe_predicate(a), describe_predicate(b)),
+        Predicate::Or(a, b) => format!("({} || {})", describe_predicate(a), describe_predicate(b)),
+        Predicate::Not(p) => format!("!{}", describe_predicate(p)),
+    }
+}
+
+pub(super) fn describe_compare_op(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "=",
+        CompareOp::Ne => "≠",
+        CompareOp::Lt => "<",
+        CompareOp::Le => "≤",
+        CompareOp::Gt => ">",
+        CompareOp::Ge => "≥",
+    }
+}
+
+pub(super) fn describe_compare_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("\"{s}\""),
+        _ => format_scalar(v),
+    }
 }
 
 #[cfg(test)]
