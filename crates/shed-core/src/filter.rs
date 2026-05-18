@@ -3,6 +3,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use vte::{Params, Parser, Perform};
 
 use crate::value::Value;
 
@@ -248,109 +249,111 @@ fn require_bytes(input: PipelineValue) -> Result<Bytes, FilterError> {
     }
 }
 
-// Strip ANSI escape sequences (CSI and OSC) and apply per-line cursor
-// effects (\r and \x1b[K), so parsers see the *final* state of each line —
-// not the intermediate steps from carriage-return-driven progress bars
-// like cargo's "Building (10%) … (50%) … (100%)". Cursor-up and other
-// multi-line cursor sequences are still dropped (full vt100 emulation
-// is the next step beyond v0).
+/// Strip ANSI escape sequences and apply per-line cursor effects (`\r`
+/// and `\x1b[K`), so parsers see the *final* state of each line — not
+/// the intermediate steps from carriage-return-driven progress bars
+/// like cargo's "Building (10%) … (50%) … (100%)". Cursor-up and other
+/// multi-line cursor sequences are still dropped (full vt100 emulation
+/// is the next step beyond v0).
+///
+/// Driven by `vte::Parser` with a stripped [`Perform`] impl —
+/// `print` writes characters at the cursor, `execute` handles `\n`/`\r`,
+/// `csi_dispatch` honours just `K` (erase-in-line) and discards
+/// everything else (SGR colors, cursor movement, scroll regions, …).
+/// OSC sequences are recognised and dropped by vte's parser automatically;
+/// no `osc_dispatch` needed.
 fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
-    let input = String::from_utf8_lossy(bytes);
-    let chars: Vec<char> = input.chars().collect();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut line: Vec<char> = Vec::new();
-    let mut pos: usize = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\x1b' {
-            i += 1;
-            if i >= chars.len() {
-                break;
-            }
-            match chars[i] {
-                '[' => {
-                    i += 1;
-                    let csi_start = i;
-                    while i < chars.len() {
-                        let ch = chars[i] as u32;
-                        if (0x40..=0x7E).contains(&ch) {
-                            break;
-                        }
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        let action = chars[i];
-                        if action == 'K' {
-                            let params: String = chars[csi_start..i].iter().collect();
-                            let n: u32 = params
-                                .split(';')
-                                .next()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            erase_in_line(&mut line, pos, n);
-                        }
-                        i += 1;
-                    }
-                }
-                ']' => {
-                    i += 1;
-                    while i < chars.len() {
-                        if chars[i] == '\x07' {
-                            i += 1;
-                            break;
-                        }
-                        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                _ => i += 1,
-            }
-        } else if c == '\r' {
-            pos = 0;
-            i += 1;
-        } else if c == '\n' {
-            for ch in &line {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-            }
-            out.push(b'\n');
-            line.clear();
-            pos = 0;
-            i += 1;
-        } else {
-            if pos < line.len() {
-                line[pos] = c;
-            } else {
-                while line.len() < pos {
-                    line.push(' ');
-                }
-                line.push(c);
-            }
-            pos += 1;
-            i += 1;
-        }
-    }
-    for ch in &line {
-        let mut buf = [0u8; 4];
-        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-    }
-    out
+    let mut performer = AnsiStripper::default();
+    let mut parser = Parser::new();
+    parser.advance(&mut performer, bytes);
+    performer.flush_trailing();
+    performer.out
 }
 
-fn erase_in_line(line: &mut Vec<char>, pos: usize, n: u32) {
-    match n {
-        0 => line.truncate(pos),
-        1 => {
-            for j in 0..pos.min(line.len()) {
-                line[j] = ' ';
+#[derive(Default)]
+struct AnsiStripper {
+    out: Vec<u8>,
+    /// In-flight line as Unicode code points. Indexed by `pos` for `\r`
+    /// + `\x1b[K` overwrite behaviour.
+    line: Vec<char>,
+    pos: usize,
+}
+
+impl AnsiStripper {
+    fn write_at_cursor(&mut self, c: char) {
+        if self.pos < self.line.len() {
+            self.line[self.pos] = c;
+        } else {
+            while self.line.len() < self.pos {
+                self.line.push(' ');
             }
+            self.line.push(c);
         }
-        2 => line.clear(),
-        _ => {}
+        self.pos += 1;
+    }
+
+    fn finish_line(&mut self) {
+        for ch in &self.line {
+            let mut buf = [0u8; 4];
+            self.out
+                .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        self.out.push(b'\n');
+        self.line.clear();
+        self.pos = 0;
+    }
+
+    /// Emit any trailing characters that weren't terminated by a `\n`.
+    /// Mirrors the historical strip_ansi behaviour of preserving such
+    /// content (without adding a newline).
+    fn flush_trailing(&mut self) {
+        for ch in &self.line {
+            let mut buf = [0u8; 4];
+            self.out
+                .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        self.line.clear();
+    }
+
+    fn erase_in_line(&mut self, params: &Params) {
+        let n = params.iter().flatten().copied().next().unwrap_or(0);
+        match n {
+            0 => self.line.truncate(self.pos),
+            1 => {
+                let upper = self.pos.min(self.line.len());
+                for cell in &mut self.line[..upper] {
+                    *cell = ' ';
+                }
+            }
+            2 => self.line.clear(),
+            _ => {}
+        }
+    }
+}
+
+impl Perform for AnsiStripper {
+    fn print(&mut self, c: char) {
+        self.write_at_cursor(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\n' => self.finish_line(),
+            b'\r' => self.pos = 0,
+            // Other C0 controls (tab, backspace, …) pass through as
+            // characters — the historical strip_ansi treated them as
+            // ordinary printable text. Tab in particular needs this
+            // behaviour because `from-csv` with a tab delimiter feeds
+            // stripped output back through csv parsing.
+            b'\t' | 0x08 | 0x0B | 0x0C => self.write_at_cursor(byte as char),
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, _: &[u8], _: bool, action: char) {
+        if action == 'K' {
+            self.erase_in_line(params);
+        }
     }
 }
 
