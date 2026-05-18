@@ -78,13 +78,10 @@ use input::{
     InputOutcome, apply_readline_edit, handle_text_input, input_spans_with_cursor, render_input_bar,
 };
 use render::{
-    cell_string, describe_filter, draw_alias_manage, draw_context_menu, draw_env_edit, draw_header,
-    draw_note_edit, draw_palette, draw_shed_expand, filter_error_lines,
-    render_pipeline_value_with_max, render_shed,
+    cell_string, describe_filter, draw_header, filter_error_lines, render_pipeline_value_with_max,
 };
 use tabs::{
-    TabSlot, begin_rename_tab, draw_tab_bar, drive_all_tabs, handle_rename_tab_input_key,
-    try_handle_tab_key,
+    TabSlot, begin_rename_tab, drive_all_tabs, handle_rename_tab_input_key, try_handle_tab_key,
 };
 
 type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
@@ -1935,7 +1932,7 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
         advance_run_chain(&mut app);
         let mut regions: Vec<ClickRegion> = Vec::new();
         let mut bodies: Vec<BodyRegion> = Vec::new();
-        terminal.draw(|f| draw(f, &app, &mut regions, &mut bodies))?;
+        terminal.draw(|f| render::draw(f, &app, &mut regions, &mut bodies))?;
         app.click_regions = regions;
         app.body_regions = bodies;
         if app.quit {
@@ -5262,21 +5259,6 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>, bodies: &mut Vec<BodyRegion>) {
-    match app.focus {
-        Focus::FilterEdit => draw_filter_edit(f, app),
-        Focus::ShedExpand => draw_shed_expand(f, app),
-        Focus::EnvEdit => draw_env_edit(f, app),
-        Focus::Palette => draw_palette(f, app),
-        Focus::NoteEdit => draw_note_edit(f, app),
-        Focus::AliasManage => draw_alias_manage(f, app),
-        _ => draw_repl(f, app, regions, bodies),
-    }
-    if app.context_menu.is_some() {
-        draw_context_menu(f, app);
-    }
-}
-
 fn open_alias_manage(app: &mut App) {
     app.alias_manage = Some(AliasManageState::default());
     app.focus = Focus::AliasManage;
@@ -5531,26 +5513,6 @@ fn insert_at_prompt(app: &mut App, text: &str) {
     app.prompt_cursor = cur + text.len();
 }
 
-fn draw_repl(
-    f: &mut Frame,
-    app: &App,
-    regions: &mut Vec<ClickRegion>,
-    bodies: &mut Vec<BodyRegion>,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // tab bar (now also holds cwd on the right)
-            Constraint::Min(1),    // sheds
-            Constraint::Length(1), // status
-        ])
-        .split(f.area());
-
-    draw_tab_bar(f, chunks[0], app, regions);
-    draw_sheds(f, chunks[1], app, regions, bodies);
-    draw_status(f, chunks[2], app);
-}
-
 fn collapse_home_in_path(p: &std::path::Path) -> String {
     if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
         if let Some(s) = p.to_str() {
@@ -5619,320 +5581,6 @@ fn hypothetical_outcome(
         _ => {}
     }
     Some(apply_pipeline(capture, &hypothetical))
-}
-
-fn draw_sheds(
-    f: &mut Frame,
-    area: Rect,
-    app: &App,
-    regions: &mut Vec<ClickRegion>,
-    bodies: &mut Vec<BodyRegion>,
-) {
-    let cursor_id = app.session.cursor();
-    let cursor_visible = matches!(app.focus, Focus::ShedCursor | Focus::EditShed);
-    let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
-
-    // Render each shed's interior content + record selection state.
-    // `cells` is the per-shed list of CellLayouts produced during render;
-    // draw_one_shed translates them to absolute Rects.
-    let mut renders: Vec<(Vec<Line<'static>>, bool, bool, Vec<CellLayout>)> =
-        Vec::with_capacity(sheds.len());
-    for shed in &sheds {
-        let selected = cursor_visible && cursor_id == Some(shed.id);
-        let editing = selected && app.focus == Focus::EditShed;
-        let pipeline_cursor = if editing {
-            Some(app.pipeline_cursor)
-        } else {
-            None
-        };
-        let command_focused = editing && app.command_focused;
-        let mut shed_cells: Vec<CellLayout> = Vec::new();
-        let lines = render_shed(
-            shed,
-            selected,
-            editing,
-            pipeline_cursor,
-            command_focused,
-            &mut shed_cells,
-        );
-        renders.push((lines, selected, editing, shed_cells));
-    }
-
-    // Box height = content lines + 2 (top + bottom border).
-    let heights: Vec<u16> = renders
-        .iter()
-        .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
-        .collect();
-
-    // Scratch box at the end: 3 lines (border + 1 content row + border).
-    // Reserve its height up front so shed top-clipping accounts for it.
-    let scratch_height: u16 = 3;
-    let avail = area.height.saturating_sub(scratch_height);
-
-    // Top-clip oldest sheds if total exceeds available height — newest
-    // sheds always stay visible. Walk from end backwards, accumulating.
-    let mut total: u16 = 0;
-    let mut start = renders.len();
-    for i in (0..renders.len()).rev() {
-        if total.saturating_add(heights[i]) > avail {
-            break;
-        }
-        total = total.saturating_add(heights[i]);
-        start = i;
-    }
-
-    let visible = &renders[start..];
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 2);
-    for h in &heights[start..] {
-        constraints.push(Constraint::Length(*h));
-    }
-    // Leftover space pushes the scratch to the bottom.
-    constraints.push(Constraint::Min(0));
-    constraints.push(Constraint::Length(scratch_height));
-
-    let rects = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
-    for (i, (lines, selected, editing, shed_cells)) in visible.iter().enumerate() {
-        draw_one_shed(
-            f,
-            rects[i],
-            sheds[start + i],
-            lines,
-            *selected,
-            *editing,
-            regions,
-            bodies,
-            shed_cells,
-        );
-    }
-    let scratch_rect = rects[rects.len() - 1];
-    draw_scratch_box(f, scratch_rect, app);
-}
-
-/// Render the always-present "scratch" / prompt box at the end of the
-/// shed list. When focus is `Prompt`, the buffer is rendered inside the
-/// box with a cursor; otherwise the box shows a hint inviting the user to
-/// press `/` (or scroll down) to start typing.
-fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
-    let active = app.focus == Focus::Prompt;
-    // "Selected" means the scratch box has been navigated to via ↓ from
-    // ShedCursor but the user hasn't activated it yet (cyan, matching
-    // the ShedCursor selection look on real sheds). Distinct from
-    // active (green) so it's clear what mode keystrokes go to.
-    let selected = !active && app.focus == Focus::ShedCursor && app.session.cursor().is_none();
-
-    let title_style = if active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    };
-    let next_id = app.session.sheds().last().map(|b| b.id.0 + 1).unwrap_or(1);
-    let title = Line::from(vec![
-        Span::styled(format!(" %{next_id} "), title_style),
-        Span::raw("  new "),
-    ]);
-    let border_style = if active {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let widget = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-    let inner = widget.inner(area);
-    f.render_widget(widget, area);
-
-    let body = if active {
-        let mut spans = vec![Span::styled(
-            "› ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )];
-        spans.extend(input_spans_with_cursor(
-            &app.prompt,
-            app.prompt_cursor,
-            Color::Green,
-        ));
-        Line::from(spans)
-    } else if selected {
-        Line::from(Span::styled(
-            "  press Enter / Space / e to start typing  (↑ to go back)",
-            Style::default().fg(Color::Cyan),
-        ))
-    } else {
-        Line::from(Span::styled(
-            "  press / or ↓ to start typing a command",
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
-    let para = Paragraph::new(body).wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
-}
-
-/// Render one bordered shed. The box title carries the id (`%5`) or
-/// pinned name (`@list`) plus the run-state glyph; the body is the
-/// caller-supplied content (output, notes, edit details, etc.).
-#[allow(clippy::too_many_arguments)]
-fn draw_one_shed(
-    f: &mut Frame,
-    area: Rect,
-    shed: &shed_core::Shed,
-    lines: &[Line<'static>],
-    selected: bool,
-    editing: bool,
-    regions: &mut Vec<ClickRegion>,
-    bodies: &mut Vec<BodyRegion>,
-    shed_cells: &[CellLayout],
-) {
-    let pinned = shed.name.is_some();
-    let id_text = match &shed.name {
-        Some(name) => format!(" @{name} "),
-        None => format!(" %{} ", shed.id.0),
-    };
-    let id_style = match (selected, pinned) {
-        (true, true) => Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-        (true, false) => Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        (false, true) => Style::default()
-            .fg(Color::LightMagenta)
-            .add_modifier(Modifier::BOLD),
-        (false, false) => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    };
-    let glyph = match &shed.state {
-        ShedState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
-        ShedState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
-        ShedState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
-        ShedState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
-        ShedState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
-        ShedState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
-    };
-    // Argv goes in the title so the user can see what the shed runs
-    // without entering EditShed. ratatui clips long titles to the box
-    // width; the `[×]` button is painted over the top border last, so
-    // a long argv can't visually collide with it.
-    let argv_text = shed.argv.join(" ");
-    let title = Line::from(vec![
-        Span::styled(id_text, id_style),
-        Span::raw(" "),
-        glyph,
-        Span::raw(" "),
-        Span::styled(argv_text, Style::default().fg(Color::DarkGray)),
-        Span::raw(" "),
-    ]);
-
-    let border_style = if editing {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else if selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let widget = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-    let inner = widget.inner(area);
-    f.render_widget(widget, area);
-    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
-
-    if inner.width > 0 && inner.height > 0 {
-        let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
-        // Translate body-relative CellLayouts into absolute-coordinate
-        // CellRegions, clamping to the inner rect so cells past the
-        // visible bottom (rare; only happens if rendered lines exceed
-        // the box height somehow) don't escape.
-        let cell_regions: Vec<CellRegion> = shed_cells
-            .iter()
-            .filter_map(|cell| {
-                let abs_x = inner.x.checked_add(cell.x_offset)?;
-                let abs_y = inner.y.checked_add(cell.line_idx as u16)?;
-                if abs_x >= inner.x.saturating_add(inner.width) {
-                    return None;
-                }
-                if abs_y >= inner.y.saturating_add(inner.height) {
-                    return None;
-                }
-                let max_w = inner.x.saturating_add(inner.width).saturating_sub(abs_x);
-                let width = cell.width.min(max_w);
-                if width == 0 {
-                    return None;
-                }
-                Some(CellRegion {
-                    rect: Rect {
-                        x: abs_x,
-                        y: abs_y,
-                        width,
-                        height: 1,
-                    },
-                    value: cell.value.clone(),
-                })
-            })
-            .collect();
-        bodies.push(BodyRegion {
-            rect: inner,
-            shed_id: shed.id,
-            lines: plain,
-            cells: cell_regions,
-        });
-    }
-
-    // Clickable `×` on the top-right border. Three cells (` × `) so
-    // the hit-target is forgiving; only render when the shed is wide
-    // enough that it can't collide with the title (left side).
-    let close_width: u16 = 3;
-    let min_room: u16 = 6; // corner + 1 padding + title room + close + corner
-    if area.width >= min_room {
-        let close_x = area.right().saturating_sub(close_width + 1);
-        let buf = f.buffer_mut();
-        let close_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-        // Repaint the three cells over the top border with `[×]` (or
-        // ` × ` for a softer look). Picking `[×]` so it visually
-        // reads as a button.
-        buf.set_string(close_x, area.y, "[×]", close_style);
-        regions.push(ClickRegion {
-            rect: Rect {
-                x: close_x,
-                y: area.y,
-                width: close_width,
-                height: 1,
-            },
-            action: ClickAction::DeleteBlock(shed.id),
-        });
-    }
 }
 
 /// Apply a pipeline of filters. Returns the final value plus per-filter

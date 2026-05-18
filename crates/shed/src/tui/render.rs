@@ -26,8 +26,10 @@ use shed_core::{
 
 use super::PREVIEW_LINES;
 use super::{
-    App, CellLayout, EnvInputMode, NotePosition, ansi, apply_pipeline, delim_label, draw_status,
-    find_matches_regex, highlight_matches_in_line, matches_for_input, try_compile,
+    App, BodyRegion, CellLayout, CellRegion, ClickAction, ClickRegion, EnvInputMode, Focus,
+    NotePosition, ansi, apply_pipeline, delim_label, draw_status, find_matches_regex,
+    highlight_matches_in_line, input_spans_with_cursor, line_plain_text, matches_for_input,
+    tabs::draw_tab_bar, try_compile,
 };
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
@@ -1121,6 +1123,338 @@ pub(super) fn draw_shed_expand(f: &mut Frame, app: &App) {
     f.render_widget(para, body_area);
 
     draw_status(f, chunks[2], app);
+}
+
+/// Top-level dispatcher: routes the current frame to the right
+/// per-focus renderer (modals get full-screen replacements; the
+/// non-modal focuses share the main REPL view), then paints the
+/// context menu overlay on top if one is open.
+pub(super) fn draw(
+    f: &mut Frame,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
+    match app.focus {
+        Focus::FilterEdit => super::draw_filter_edit(f, app),
+        Focus::ShedExpand => draw_shed_expand(f, app),
+        Focus::EnvEdit => draw_env_edit(f, app),
+        Focus::Palette => draw_palette(f, app),
+        Focus::NoteEdit => draw_note_edit(f, app),
+        Focus::AliasManage => draw_alias_manage(f, app),
+        _ => draw_repl(f, app, regions, bodies),
+    }
+    if app.context_menu.is_some() {
+        draw_context_menu(f, app);
+    }
+}
+
+pub(super) fn draw_repl(
+    f: &mut Frame,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tab bar (now also holds cwd on the right)
+            Constraint::Min(1),    // sheds
+            Constraint::Length(1), // status
+        ])
+        .split(f.area());
+
+    draw_tab_bar(f, chunks[0], app, regions);
+    draw_sheds(f, chunks[1], app, regions, bodies);
+    draw_status(f, chunks[2], app);
+}
+
+fn draw_sheds(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
+    let cursor_id = app.session.cursor();
+    let cursor_visible = matches!(app.focus, Focus::ShedCursor | Focus::EditShed);
+    let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
+
+    // Render each shed's interior content + record selection state.
+    let mut renders: Vec<(Vec<Line<'static>>, bool, bool, Vec<CellLayout>)> =
+        Vec::with_capacity(sheds.len());
+    for shed in &sheds {
+        let selected = cursor_visible && cursor_id == Some(shed.id);
+        let editing = selected && app.focus == Focus::EditShed;
+        let pipeline_cursor = if editing {
+            Some(app.pipeline_cursor)
+        } else {
+            None
+        };
+        let command_focused = editing && app.command_focused;
+        let mut shed_cells: Vec<CellLayout> = Vec::new();
+        let lines = render_shed(
+            shed,
+            selected,
+            editing,
+            pipeline_cursor,
+            command_focused,
+            &mut shed_cells,
+        );
+        renders.push((lines, selected, editing, shed_cells));
+    }
+
+    let heights: Vec<u16> = renders
+        .iter()
+        .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
+        .collect();
+
+    let scratch_height: u16 = 3;
+    let avail = area.height.saturating_sub(scratch_height);
+
+    let mut total: u16 = 0;
+    let mut start = renders.len();
+    for i in (0..renders.len()).rev() {
+        if total.saturating_add(heights[i]) > avail {
+            break;
+        }
+        total = total.saturating_add(heights[i]);
+        start = i;
+    }
+
+    let visible = &renders[start..];
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 2);
+    for h in &heights[start..] {
+        constraints.push(Constraint::Length(*h));
+    }
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(scratch_height));
+
+    let rects = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for (i, (lines, selected, editing, shed_cells)) in visible.iter().enumerate() {
+        draw_one_shed(
+            f,
+            rects[i],
+            sheds[start + i],
+            lines,
+            *selected,
+            *editing,
+            regions,
+            bodies,
+            shed_cells,
+        );
+    }
+    let scratch_rect = rects[rects.len() - 1];
+    draw_scratch_box(f, scratch_rect, app);
+}
+
+/// Render the always-present "scratch" / prompt box at the end of the
+/// shed list. When focus is `Prompt`, the buffer is rendered inside the
+/// box with a cursor; otherwise the box shows a hint inviting the user
+/// to press `/` (or scroll down) to start typing.
+fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
+    let active = app.focus == Focus::Prompt;
+    let selected = !active && app.focus == Focus::ShedCursor && app.session.cursor().is_none();
+
+    let title_style = if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    let next_id = app.session.sheds().last().map(|b| b.id.0 + 1).unwrap_or(1);
+    let title = Line::from(vec![
+        Span::styled(format!(" %{next_id} "), title_style),
+        Span::raw("  new "),
+    ]);
+    let border_style = if active {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let widget = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = widget.inner(area);
+    f.render_widget(widget, area);
+
+    let body = if active {
+        let mut spans = vec![Span::styled(
+            "› ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(input_spans_with_cursor(
+            &app.prompt,
+            app.prompt_cursor,
+            Color::Green,
+        ));
+        Line::from(spans)
+    } else if selected {
+        Line::from(Span::styled(
+            "  press Enter / Space / e to start typing  (↑ to go back)",
+            Style::default().fg(Color::Cyan),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "  press / or ↓ to start typing a command",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let para = Paragraph::new(body).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+/// Render one bordered shed. The box title carries the id (`%5`) or
+/// pinned name (`@list`) plus the run-state glyph; the body is the
+/// caller-supplied content (output, notes, edit details, etc.).
+#[allow(clippy::too_many_arguments)]
+fn draw_one_shed(
+    f: &mut Frame,
+    area: Rect,
+    shed: &shed_core::Shed,
+    lines: &[Line<'static>],
+    selected: bool,
+    editing: bool,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+    shed_cells: &[CellLayout],
+) {
+    let pinned = shed.name.is_some();
+    let id_text = match &shed.name {
+        Some(name) => format!(" @{name} "),
+        None => format!(" %{} ", shed.id.0),
+    };
+    let id_style = match (selected, pinned) {
+        (true, true) => Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        (false, true) => Style::default()
+            .fg(Color::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+        (false, false) => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    };
+    let glyph = match &shed.state {
+        ShedState::Idle => Span::styled("○", Style::default().fg(Color::DarkGray)),
+        ShedState::Running => Span::styled("⏵", Style::default().fg(Color::Yellow)),
+        ShedState::Done(0) => Span::styled("●", Style::default().fg(Color::Green)),
+        ShedState::Done(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+        ShedState::Snapshotted => Span::styled("❄", Style::default().fg(Color::LightBlue)),
+        ShedState::Failed(_) => Span::styled("⚠", Style::default().fg(Color::Red)),
+    };
+    let argv_text = shed.argv.join(" ");
+    let title = Line::from(vec![
+        Span::styled(id_text, id_style),
+        Span::raw(" "),
+        glyph,
+        Span::raw(" "),
+        Span::styled(argv_text, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ]);
+
+    let border_style = if editing {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let widget = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = widget.inner(area);
+    f.render_widget(widget, area);
+    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+
+    if inner.width > 0 && inner.height > 0 {
+        let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
+        let cell_regions: Vec<CellRegion> = shed_cells
+            .iter()
+            .filter_map(|cell| {
+                let abs_x = inner.x.checked_add(cell.x_offset)?;
+                let abs_y = inner.y.checked_add(cell.line_idx as u16)?;
+                if abs_x >= inner.x.saturating_add(inner.width) {
+                    return None;
+                }
+                if abs_y >= inner.y.saturating_add(inner.height) {
+                    return None;
+                }
+                let max_w = inner.x.saturating_add(inner.width).saturating_sub(abs_x);
+                let width = cell.width.min(max_w);
+                if width == 0 {
+                    return None;
+                }
+                Some(CellRegion {
+                    rect: Rect {
+                        x: abs_x,
+                        y: abs_y,
+                        width,
+                        height: 1,
+                    },
+                    value: cell.value.clone(),
+                })
+            })
+            .collect();
+        bodies.push(BodyRegion {
+            rect: inner,
+            shed_id: shed.id,
+            lines: plain,
+            cells: cell_regions,
+        });
+    }
+
+    let close_width: u16 = 3;
+    let min_room: u16 = 6; // corner + 1 padding + title room + close + corner
+    if area.width >= min_room {
+        let close_x = area.right().saturating_sub(close_width + 1);
+        let buf = f.buffer_mut();
+        let close_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        buf.set_string(close_x, area.y, "[×]", close_style);
+        regions.push(ClickRegion {
+            rect: Rect {
+                x: close_x,
+                y: area.y,
+                width: close_width,
+                height: 1,
+            },
+            action: ClickAction::DeleteBlock(shed.id),
+        });
+    }
 }
 
 #[cfg(test)]
