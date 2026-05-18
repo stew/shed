@@ -1,4 +1,8 @@
+use std::collections::HashMap;
 use std::time::Instant;
+
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 
 use crate::capture::Capture;
 use crate::filter::FilterSpec;
@@ -23,6 +27,28 @@ pub enum ShedState {
     Snapshotted,
     Done(i32),
     Failed(String),
+}
+
+/// A named output a shed advertises to downstream sheds. Two flavours
+/// in v0:
+///
+/// - [`OutputSpec::Literal`] — a fixed string. Always resolvable, even
+///   before the shed runs. Useful for declaring stable file paths or
+///   any other constant the next shed needs to consume.
+/// - [`OutputSpec::TempPath`] — shed generates a unique path on each
+///   spawn (under `std::env::temp_dir()`), substitutes it into argv
+///   wherever `${name}` appears, and exposes the same path to
+///   downstream sheds as `${@source.name}`. The file is *not*
+///   created — the command is expected to write to it.
+///
+/// A future variant could extract a value from stdout via a regex.
+/// Until then, the always-available implicit `${@source}` (no field)
+/// returns the source's trimmed stdout, covering the
+/// "command-substitution" idiom.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutputSpec {
+    Literal(String),
+    TempPath,
 }
 
 /// A single command and its retroactive pipeline.
@@ -51,6 +77,18 @@ pub struct Shed {
     /// Free-form note rendered below the shed's content. Persisted to
     /// notebooks.
     pub post_text: Option<String>,
+    /// Named outputs this shed declares. Persisted in notebooks. Each
+    /// entry maps a name → spec; downstream sheds reference values via
+    /// `${@source.name}` interpolation in argv. Insertion order is
+    /// preserved (IndexMap) for stable JSON round-trip.
+    pub outputs: IndexMap<String, OutputSpec>,
+    /// Resolved output values from the most recent spawn. Populated
+    /// pre-spawn (TempPath generates a fresh path, Literal is its
+    /// declared value) so own-output `${name}` interpolation works in
+    /// this shed's own argv. Cleared on re-run start; survives across
+    /// successful completions so downstream sheds can read them.
+    /// Runtime artefact — *not* persisted to notebooks.
+    pub output_values: HashMap<String, String>,
 }
 
 impl Shed {

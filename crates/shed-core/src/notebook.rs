@@ -24,9 +24,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use indexmap::IndexMap;
+
 use crate::filter::FilterSpec;
 use crate::session::Session;
-use crate::shed::ShedState;
+use crate::shed::{OutputSpec, ShedState};
 
 /// On-disk schema version. Bumped whenever the file format changes in a
 /// non-backwards-compatible way.
@@ -55,6 +57,11 @@ pub enum NotebookEntry {
         pre_text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         post_text: Option<String>,
+        /// Named outputs this shed declares — see [`OutputSpec`].
+        /// Persisted only when the shed actually declares outputs;
+        /// older notebooks load with an empty map.
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        outputs: IndexMap<String, OutputSpec>,
     },
 }
 
@@ -81,6 +88,7 @@ impl Notebook {
                 pipeline: b.pipeline.clone(),
                 pre_text: b.pre_text.clone(),
                 post_text: b.post_text.clone(),
+                outputs: b.outputs.clone(),
             })
             .collect();
         Self {
@@ -100,6 +108,7 @@ impl Notebook {
                 pipeline,
                 pre_text,
                 post_text,
+                outputs,
             } = entry;
             let id = session.add_shed(argv.clone());
             session.set_state(id, ShedState::Idle);
@@ -107,6 +116,7 @@ impl Notebook {
                 shed.pipeline = pipeline.clone();
                 shed.pre_text = pre_text.clone();
                 shed.post_text = post_text.clone();
+                shed.outputs = outputs.clone();
             }
             if let Some(n) = name {
                 session.pin(id, n.clone());

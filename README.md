@@ -255,6 +255,45 @@ Cycles (`@a` pinned as `a`) terminate via cycle-detection.
 argv is just `@name`); on re-open they're `Idle` and re-snapshot when
 you run them.
 
+### Outputs and argv interpolation
+
+A shed can declare named **outputs** that downstream sheds consume via
+`${...}` interpolation in their argv. The classic motivating case is
+the tofu plan / apply workflow: `tofu plan` writes a plan file that
+`tofu apply` then reads, and you want the apply step to run only after
+plan succeeds, against the same file.
+
+Two output flavours in v0:
+
+| Spec | Behaviour |
+|------|-----------|
+| `Literal(string)` | A fixed value, always resolvable, even before the shed runs. Use for stable paths or constants. |
+| `TempPath` | Each spawn generates a fresh path under `$TMPDIR` (e.g. `/tmp/shed-1-plan-1763458920123`) and substitutes it into argv. The file is **not** created — the command is expected to write to it. |
+
+Interpolation grammar inside argv strings:
+
+- `${name}` — the shed's *own* declared output.
+- `${@source}` / `${%N}` — the source's trimmed stdout (like shell `$(...)`).
+- `${@source.name}` / `${%N.name}` — the source's named output.
+
+Interpolations are resolved at spawn time. The source must have ended
+in `Done(0)` or `Snapshotted` for the lookup to succeed — a still-
+running, idle, failed, or non-zero-exit source returns an error and
+the dependent shed lands in `Failed` with a clear message. That's the
+safety property: shed 3 (`tofu apply ${@tofuplan.plan}`) cannot run
+on a stale or failed plan.
+
+The run chain machinery walks interpolation references the same way it
+walks `@name` snapshot refs — so `Space` on the apply shed auto-runs
+the plan shed first, then apply, in order. Re-running a source
+regenerates its `TempPath` outputs; downstream sheds running after
+will pick up the new values.
+
+Notebooks persist output **declarations** (the `outputs:` map); the
+**values** are runtime state, recomputed each spawn. Today, declaring
+outputs is a notebook-edit task — the in-app UI for adding outputs is
+planned but not yet present.
+
 ### Shed notes (pre / post text)
 
 Each shed can carry two free-form text notes — `pre_text` shown above

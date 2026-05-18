@@ -58,7 +58,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use shed_core::{
-    Alias, AliasFile, Capture, CompareOp, Filter, FilterSpec, Notebook, NotebookEntry,
+    Alias, AliasFile, Capture, CompareOp, Filter, FilterSpec, Notebook, NotebookEntry, OutputSpec,
     PipelineValue, Predicate, Session, Shed, ShedId, ShedState, SortDirection, SortKey, Value,
     apply_with_notes,
 };
@@ -2104,6 +2104,253 @@ fn shed_ref_display(r: &ShedRef) -> String {
     }
 }
 
+/// One `${…}` reference parsed out of an argv token. The parser allows
+/// three shapes — see [`parse_interpolations`] for the grammar:
+///
+/// - `${name}` — the *own* shed's declared output `name`.
+/// - `${@source}` or `${%N}` — the upstream source's implicit stdout
+///   (trimmed). `output` is `None`.
+/// - `${@source.name}` or `${%N.name}` — the upstream source's named
+///   output `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InterpRef {
+    Own(String),
+    Source {
+        source: ShedRef,
+        output: Option<String>,
+    },
+}
+
+/// One slice of an argv token after interpolation parsing — either
+/// literal text or a single `${…}` reference. Tokens are reassembled
+/// from these parts at spawn time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenPart {
+    Literal(String),
+    Interp(InterpRef),
+}
+
+/// Parse all `${…}` references in `s`. Returns a `Vec<TokenPart>` that
+/// reassembles to `s` when each `Interp` is resolved to its value.
+/// Errors out (as a human-readable string) on malformed references —
+/// unterminated `${`, empty `${}`, or syntactically invalid contents.
+fn parse_interpolations(s: &str) -> Result<Vec<TokenPart>, String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut literal_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            // Emit accumulated literal first.
+            if i > literal_start {
+                out.push(TokenPart::Literal(s[literal_start..i].to_string()));
+            }
+            // Find the matching `}`. Nested braces aren't supported.
+            let body_start = i + 2;
+            let Some(end_rel) = s[body_start..].find('}') else {
+                return Err(format!("unterminated `${{` in {s:?}"));
+            };
+            let body = &s[body_start..body_start + end_rel];
+            if body.is_empty() {
+                return Err(format!("empty `${{}}` in {s:?}"));
+            }
+            out.push(TokenPart::Interp(parse_interp_body(body)?));
+            i = body_start + end_rel + 1;
+            literal_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if literal_start < bytes.len() {
+        out.push(TokenPart::Literal(s[literal_start..].to_string()));
+    }
+    Ok(out)
+}
+
+fn parse_interp_body(body: &str) -> Result<InterpRef, String> {
+    // ${name} — own output.
+    if !body.starts_with('@') && !body.starts_with('%') {
+        if !is_valid_ident(body) {
+            return Err(format!(
+                "invalid output name `${{{body}}}` (expected letters/digits/underscore)"
+            ));
+        }
+        return Ok(InterpRef::Own(body.to_string()));
+    }
+    // ${@source} / ${@source.field} / ${%N} / ${%N.field}
+    let (head, field) = match body.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (body, None),
+    };
+    let source = parse_shed_ref(head).ok_or_else(|| format!("invalid source ref `${{{body}}}`"))?;
+    if let Some(f) = field
+        && !is_valid_ident(f)
+    {
+        return Err(format!("invalid output name in `${{{body}}}`"));
+    }
+    Ok(InterpRef::Source {
+        source,
+        output: field.map(String::from),
+    })
+}
+
+fn is_valid_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Walk an argv looking for every distinct `${@source.…}` /
+/// `${%N.…}` reference and return the unique [`ShedRef`]s. Used by
+/// the run-chain machinery to discover dependencies inferred from
+/// interpolations. Malformed interpolations are silently skipped here
+/// (the real error fires at spawn time when [`resolve_argv`] runs).
+fn argv_interp_sources(argv: &[String]) -> Vec<ShedRef> {
+    let mut seen = Vec::new();
+    for token in argv {
+        let Ok(parts) = parse_interpolations(token) else {
+            continue;
+        };
+        for part in parts {
+            if let TokenPart::Interp(InterpRef::Source { source, .. }) = part
+                && !seen.contains(&source)
+            {
+                seen.push(source);
+            }
+        }
+    }
+    seen
+}
+
+/// Resolve every `${…}` in `argv` to its value, using `own` for
+/// own-output references and `session` for source references. Returns
+/// the fully-resolved argv suitable for handing to exec, or an error
+/// naming the unresolved reference (undefined output, missing source,
+/// source not yet succeeded, …).
+fn resolve_argv(
+    argv: &[String],
+    own: &std::collections::HashMap<String, String>,
+    session: &Session,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(argv.len());
+    for token in argv {
+        let parts = parse_interpolations(token)?;
+        let mut buf = String::new();
+        for part in parts {
+            match part {
+                TokenPart::Literal(s) => buf.push_str(&s),
+                TokenPart::Interp(InterpRef::Own(name)) => match own.get(&name) {
+                    Some(v) => buf.push_str(v),
+                    None => {
+                        return Err(format!("undefined own output `${{{name}}}` in argv"));
+                    }
+                },
+                TokenPart::Interp(InterpRef::Source { source, output }) => {
+                    let value = lookup_source_output(session, &source, output.as_deref())?;
+                    buf.push_str(&value);
+                }
+            }
+        }
+        out.push(buf);
+    }
+    Ok(out)
+}
+
+/// Pre-spawn setup: clear the shed's runtime `output_values`, seed
+/// `Literal` outputs with their declared strings, generate a fresh
+/// `TempPath` for each declared temp-path output, then resolve every
+/// `${…}` in `argv` against the freshly-seeded own outputs + the
+/// session's other sheds. Returns the resolved argv ready for exec.
+///
+/// Errors (returned as `Err`, caller stamps the shed `Failed`):
+/// undefined own output, unknown source, source not yet completed
+/// successfully, undeclared source output, malformed `${…}` syntax.
+fn prepare_outputs_and_resolve(
+    app: &mut App,
+    id: ShedId,
+    argv: &[String],
+) -> Result<Vec<String>, String> {
+    // Phase 1: clear + seed own output_values.
+    if let Some(shed) = app.session.shed_mut(id) {
+        shed.output_values.clear();
+        for (name, spec) in &shed.outputs {
+            let value = match spec {
+                OutputSpec::Literal(s) => s.clone(),
+                OutputSpec::TempPath => generate_temp_path(id, name),
+            };
+            shed.output_values.insert(name.clone(), value);
+        }
+    }
+    // Phase 2: resolve argv. Pull own-output map out by value because
+    // resolve_argv needs both `own` and `&session` and we can't borrow
+    // through `&mut app` twice.
+    let own = app
+        .session
+        .shed(id)
+        .map(|s| s.output_values.clone())
+        .unwrap_or_default();
+    resolve_argv(argv, &own, &app.session)
+}
+
+/// Generate a unique temp path for a shed's `TempPath` output. Includes
+/// the shed id, the output name, and nanos-since-epoch so concurrent
+/// or repeated runs don't collide. The file is *not* created; the
+/// spawned command is expected to write to the path.
+fn generate_temp_path(id: ShedId, output_name: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir();
+    dir.join(format!("shed-{}-{}-{}", id.0, output_name, nanos))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Look up an upstream shed's output for `${@source.field}` /
+/// `${%N.field}` / `${@source}` interpolation. The unnamed form returns
+/// the source's trimmed stdout (mirrors shell `$(...)`); named forms
+/// read from `Shed::output_values`. Either form requires the source to
+/// have completed successfully — a missing source, an unsuccessful
+/// source, or an undeclared output name returns a structured error.
+fn lookup_source_output(
+    session: &Session,
+    source: &ShedRef,
+    output: Option<&str>,
+) -> Result<String, String> {
+    let label = shed_ref_display(source);
+    let Some(id) = resolve_shed_ref(session, source) else {
+        return Err(format!("no shed at {label}"));
+    };
+    let Some(shed) = session.shed(id) else {
+        return Err(format!("{label} missing from session"));
+    };
+    // Both implicit and named outputs require the source to have
+    // succeeded — otherwise the value isn't trustworthy.
+    if !matches!(shed.state, ShedState::Done(0) | ShedState::Snapshotted) {
+        return Err(format!("{label} hasn't completed successfully"));
+    }
+    match output {
+        None => {
+            // Implicit ${@source} — trimmed stdout.
+            let Some(cap) = shed.capture.as_ref() else {
+                return Err(format!("{label} has no captured output"));
+            };
+            Ok(String::from_utf8_lossy(&cap.stdout).trim().to_string())
+        }
+        Some(name) => match shed.output_values.get(name) {
+            Some(v) => Ok(v.clone()),
+            None => Err(format!("{label} doesn't define output `{name}`")),
+        },
+    }
+}
+
 /// `Done`/`Failed`/`Snapshotted` are terminal — the run-chain machinery
 /// uses this to decide when to advance. `Idle` and `Running` are not.
 fn is_terminal_state(state: &ShedState) -> bool {
@@ -2132,11 +2379,30 @@ fn build_run_chain(
         Some(b) => b,
         None => return chain,
     };
+    // Snapshot data dep: argv is `@name` / `%N`.
     if let Some(r) = shed_ref_of(&shed.argv)
         && let Some(src_id) = resolve_shed_ref(session, &r)
         && let Some(src) = session.shed(src_id)
         && matches!(src.state, ShedState::Idle | ShedState::Running)
     {
+        let mut sub = build_run_chain(session, src_id, visited);
+        chain.append(&mut sub);
+    }
+    // Interpolation deps: any `${@source.…}` / `${%N.…}` in argv. Only
+    // queue the source as a prereq if it hasn't already completed
+    // successfully — a source already in `Done(0)`/`Snapshotted` has
+    // valid output_values that downstream can read directly, no need to
+    // re-run.
+    for r in argv_interp_sources(&shed.argv) {
+        let Some(src_id) = resolve_shed_ref(session, &r) else {
+            continue;
+        };
+        let Some(src) = session.shed(src_id) else {
+            continue;
+        };
+        if matches!(src.state, ShedState::Done(0) | ShedState::Snapshotted) {
+            continue;
+        }
         let mut sub = build_run_chain(session, src_id, visited);
         chain.append(&mut sub);
     }
@@ -2161,16 +2427,22 @@ fn collect_dependents_recursive(
     let Some(src_shed) = session.shed(source) else {
         return;
     };
-    let name_target = src_shed.name.as_ref().map(|n| format!("@{n}"));
-    let id_target = format!("%{}", source.0);
+    let name_ref = src_shed.name.as_ref().map(|n| ShedRef::Name(n.clone()));
+    let id_ref = ShedRef::Id(source);
     let direct: Vec<ShedId> = session
         .sheds()
         .filter(|b| {
-            if b.argv.len() != 1 {
-                return false;
+            // Snapshot reference: argv is exactly `@source.name` / `%N`.
+            let snapshot_match = b.argv.len() == 1
+                && parse_shed_ref(&b.argv[0])
+                    .is_some_and(|r| r == id_ref || name_ref.as_ref().is_some_and(|n| &r == n));
+            if snapshot_match {
+                return true;
             }
-            let tok = &b.argv[0];
-            tok == &id_target || name_target.as_ref().is_some_and(|t| tok == t)
+            // Interpolation reference: `${@source.…}` / `${%N.…}` anywhere.
+            argv_interp_sources(&b.argv)
+                .iter()
+                .any(|r| r == &id_ref || name_ref.as_ref().is_some_and(|n| r == n))
         })
         .map(|b| b.id)
         .collect();
@@ -2508,6 +2780,19 @@ async fn perform_run_in_place(app: &mut App, id: ShedId) {
         }
         _ => {}
     }
+
+    // Compute the shed's own output values (TempPath gets a fresh path
+    // each spawn; Literal is its declared string), then resolve every
+    // `${…}` interpolation in argv into a concrete string. Failures here
+    // (undefined output, unresolved source, source not yet succeeded)
+    // mark the shed Failed without spawning.
+    let argv = match prepare_outputs_and_resolve(app, id, &argv) {
+        Ok(a) => a,
+        Err(e) => {
+            app.session.set_state(id, ShedState::Failed(e));
+            return;
+        }
+    };
 
     if needs_fullscreen(&argv) {
         app.pending_handover = Some(HandoverRequest {
@@ -2873,6 +3158,7 @@ fn pinned_entries_json(session: &Session) -> String {
             pipeline: s.pipeline.clone(),
             pre_text: s.pre_text.clone(),
             post_text: s.post_text.clone(),
+            outputs: s.outputs.clone(),
         })
         .collect();
     serde_json::to_string(&entries).unwrap_or_default()
@@ -5583,6 +5869,8 @@ mod tests {
             last_touched: Instant::now(),
             pre_text: None,
             post_text: None,
+            outputs: indexmap::IndexMap::new(),
+            output_values: std::collections::HashMap::new(),
         }
     }
 
@@ -6574,6 +6862,218 @@ mod tests {
         assert_eq!(parse_shed_ref("%"), None);
         assert_eq!(parse_shed_ref("%x"), None);
         assert_eq!(parse_shed_ref("logs"), None);
+    }
+
+    // === argv interpolation ===
+
+    #[test]
+    fn parse_interpolations_handles_each_shape() {
+        // Plain literal — single Literal part, no interpolations.
+        let parts = parse_interpolations("plain text").unwrap();
+        assert_eq!(parts, vec![TokenPart::Literal("plain text".into())]);
+
+        // Own output.
+        let parts = parse_interpolations("${plan}").unwrap();
+        assert_eq!(
+            parts,
+            vec![TokenPart::Interp(InterpRef::Own("plan".into()))]
+        );
+
+        // Source with field.
+        let parts = parse_interpolations("${@src.path}").unwrap();
+        assert_eq!(
+            parts,
+            vec![TokenPart::Interp(InterpRef::Source {
+                source: ShedRef::Name("src".into()),
+                output: Some("path".into()),
+            })]
+        );
+
+        // Source no field (implicit stdout).
+        let parts = parse_interpolations("${%3}").unwrap();
+        assert_eq!(
+            parts,
+            vec![TokenPart::Interp(InterpRef::Source {
+                source: ShedRef::Id(ShedId(3)),
+                output: None,
+            })]
+        );
+
+        // Mixed literal + interp.
+        let parts = parse_interpolations("apply ${@p.f} now").unwrap();
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], TokenPart::Literal(s) if s == "apply "));
+        assert!(matches!(&parts[2], TokenPart::Literal(s) if s == " now"));
+    }
+
+    #[test]
+    fn parse_interpolations_rejects_malformed() {
+        assert!(parse_interpolations("${").is_err(), "unterminated");
+        assert!(parse_interpolations("${}").is_err(), "empty");
+        assert!(
+            parse_interpolations("${1bad}").is_err(),
+            "starts with digit"
+        );
+        assert!(parse_interpolations("${@}").is_err(), "bare @");
+    }
+
+    #[test]
+    fn argv_interp_sources_collects_unique_refs() {
+        let argv = vec![
+            "echo".into(),
+            "${@a.x}".into(),
+            "${%5}".into(),
+            "${@a.y}".into(),  // duplicate source @a — only counted once
+            "${plain}".into(), // own output — not a source dep
+        ];
+        let refs = argv_interp_sources(&argv);
+        assert_eq!(
+            refs,
+            vec![ShedRef::Name("a".into()), ShedRef::Id(ShedId(5))]
+        );
+    }
+
+    #[test]
+    fn resolve_argv_substitutes_own_outputs() {
+        let mut own = std::collections::HashMap::new();
+        own.insert("plan".into(), "/tmp/plan-123".into());
+        let s = Session::new();
+        let out = resolve_argv(&["tofu".into(), "-out=${plan}".into()], &own, &s).unwrap();
+        assert_eq!(out, vec!["tofu", "-out=/tmp/plan-123"]);
+    }
+
+    #[test]
+    fn resolve_argv_errors_on_undefined_own_output() {
+        let own = std::collections::HashMap::new();
+        let s = Session::new();
+        let err = resolve_argv(&["${nope}".into()], &own, &s).unwrap_err();
+        assert!(err.contains("undefined own output"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_argv_reads_source_named_output() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["echo".into()]);
+        s.set_state(src, ShedState::Done(0));
+        s.pin(src, "p".into());
+        if let Some(b) = s.shed_mut(src) {
+            b.output_values.insert("path".into(), "/tmp/plan".into());
+        }
+        let own = std::collections::HashMap::new();
+        let out = resolve_argv(&["apply".into(), "${@p.path}".into()], &own, &s).unwrap();
+        assert_eq!(out, vec!["apply", "/tmp/plan"]);
+    }
+
+    #[test]
+    fn resolve_argv_reads_implicit_stdout_trimmed() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["echo".into()]);
+        s.pin(src, "p".into());
+        s.set_state(src, ShedState::Done(0));
+        s.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::from_static(b"   hello world\n   "),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
+        let own = std::collections::HashMap::new();
+        let out = resolve_argv(&["echo".into(), "${@p}".into()], &own, &s).unwrap();
+        assert_eq!(out, vec!["echo", "hello world"]);
+    }
+
+    #[test]
+    fn resolve_argv_errors_when_source_not_yet_succeeded() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["echo".into()]);
+        s.set_state(src, ShedState::Idle);
+        s.pin(src, "p".into());
+        let own = std::collections::HashMap::new();
+        let err = resolve_argv(&["${@p.x}".into()], &own, &s).unwrap_err();
+        assert!(err.contains("hasn't completed successfully"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_argv_errors_on_failed_source() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["false".into()]);
+        s.set_state(src, ShedState::Done(1));
+        s.pin(src, "p".into());
+        if let Some(b) = s.shed_mut(src) {
+            b.output_values.insert("x".into(), "value".into());
+        }
+        let own = std::collections::HashMap::new();
+        let err = resolve_argv(&["${@p.x}".into()], &own, &s).unwrap_err();
+        assert!(err.contains("hasn't completed successfully"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_argv_errors_on_undeclared_source_output() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["echo".into()]);
+        s.set_state(src, ShedState::Done(0));
+        s.pin(src, "p".into());
+        let own = std::collections::HashMap::new();
+        let err = resolve_argv(&["${@p.missing}".into()], &own, &s).unwrap_err();
+        assert!(err.contains("doesn't define output"), "got: {err}");
+    }
+
+    #[test]
+    fn build_run_chain_includes_interpolation_sources() {
+        let mut s = Session::new();
+        let plan = s.add_shed(vec![
+            "tofu".into(),
+            "plan".into(),
+            "-out".into(),
+            "${file}".into(),
+        ]);
+        s.shed_mut(plan)
+            .unwrap()
+            .outputs
+            .insert("file".to_string(), OutputSpec::TempPath);
+        s.pin(plan, "tfplan".into());
+        s.set_state(plan, ShedState::Idle);
+        let apply = s.add_shed(vec![
+            "tofu".into(),
+            "apply".into(),
+            "${@tfplan.file}".into(),
+        ]);
+        s.set_state(apply, ShedState::Idle);
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, apply, &mut visited);
+        assert_eq!(chain, vec![plan, apply], "plan must run before apply");
+    }
+
+    #[test]
+    fn build_run_chain_skips_interpolation_source_thats_already_done() {
+        let mut s = Session::new();
+        let plan = s.add_shed(vec!["plan".into()]);
+        s.pin(plan, "tfplan".into());
+        s.set_state(plan, ShedState::Done(0));
+        let apply = s.add_shed(vec!["apply".into(), "${@tfplan.x}".into()]);
+        s.set_state(apply, ShedState::Idle);
+        let mut visited = HashSet::new();
+        let chain = build_run_chain(&s, apply, &mut visited);
+        assert_eq!(
+            chain,
+            vec![apply],
+            "Done(0) source is skipped (output already cached)"
+        );
+    }
+
+    #[test]
+    fn temp_path_is_unique_per_call() {
+        let p1 = generate_temp_path(ShedId(1), "file");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let p2 = generate_temp_path(ShedId(1), "file");
+        assert_ne!(p1, p2, "two calls should yield distinct paths");
+        assert!(p1.contains("shed-1-file"));
     }
 
     #[test]

@@ -42,5 +42,5 @@ pub use filter::{
 };
 pub use notebook::{NOTEBOOK_VERSION, Notebook, NotebookEntry, NotebookError};
 pub use session::{DEFAULT_CAPTURE_BUDGET_BYTES, Session};
-pub use shed::{Shed, ShedId, ShedState};
+pub use shed::{OutputSpec, Shed, ShedId, ShedState};
 pub use value::Value;

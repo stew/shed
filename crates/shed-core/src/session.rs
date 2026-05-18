@@ -65,6 +65,8 @@ impl Session {
             last_touched: Instant::now(),
             pre_text: None,
             post_text: None,
+            outputs: indexmap::IndexMap::new(),
+            output_values: std::collections::HashMap::new(),
         };
         self.sheds.insert(id, shed);
         id
