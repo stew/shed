@@ -951,9 +951,9 @@ struct WhereClause {
 }
 
 impl WhereClause {
-    fn default_for(available_columns: &[String]) -> Self {
+    fn default_for(_available_columns: &[String]) -> Self {
         Self {
-            column: if available_columns.is_empty() { 0 } else { 0 },
+            column: 0,
             op: WhereOp::Matches,
             pattern: String::new(),
         }
@@ -3338,7 +3338,7 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
                 app.flash = Some("path required".into());
                 return;
             }
-            let path = PathBuf::from(expand_tilde(trimmed));
+            let path = expand_tilde(trimmed);
             save_to_path(app, &path);
             // If we were saving on exit, complete the quit now that the
             // file is on disk (or fall through if save failed).
@@ -3368,7 +3368,7 @@ fn handle_open_input_key(app: &mut App, key: KeyEvent) {
                 app.flash = Some("path required".into());
                 return;
             }
-            let path = PathBuf::from(expand_tilde(trimmed));
+            let path = expand_tilde(trimmed);
             load_from_path(app, &path);
         }
         InputOutcome::Continue => {}
@@ -5836,7 +5836,7 @@ async fn spawn_prompt(app: &mut App) {
     // Save the original input to history before clearing the prompt.
     // Suppress consecutive duplicates so spamming Up doesn't grow history.
     let original = app.prompt.clone();
-    if !app.history.last().map_or(false, |last| last == &original) {
+    if app.history.last().is_none_or(|last| last != &original) {
         app.history.push(original.clone());
         // Best-effort persist to ~/.cache/shed/history; ignore failures so
         // a missing $HOME / read-only FS / etc. doesn't break the session.
@@ -7666,7 +7666,7 @@ fn draw_one_shed(
         // Repaint the three cells over the top border with `[×]` (or
         // ` × ` for a softer look). Picking `[×]` so it visually
         // reads as a button.
-        let _ = buf.set_string(close_x, area.y, "[×]", close_style);
+        buf.set_string(close_x, area.y, "[×]", close_style);
         regions.push(ClickRegion {
             rect: Rect {
                 x: close_x,
@@ -8461,7 +8461,7 @@ fn render_rename_map_field(state: &FilterEditState) -> Vec<Line<'static>> {
 
         let mut spans = vec![
             label,
-            Span::styled(format!("{col}"), from_style),
+            Span::styled(col.to_string(), from_style),
             Span::styled(" → ", arrow_style),
         ];
         if to.is_empty() && !on_cursor {
@@ -9825,7 +9825,7 @@ mod tests {
     fn parse_value_input_heuristics() {
         assert_eq!(parse_value_input("123"), Value::Int(123));
         assert_eq!(parse_value_input("-7"), Value::Int(-7));
-        assert_eq!(parse_value_input("3.14"), Value::Float(3.14));
+        assert_eq!(parse_value_input("2.5"), Value::Float(2.5));
         assert_eq!(parse_value_input("true"), Value::Bool(true));
         assert_eq!(parse_value_input("false"), Value::Bool(false));
         assert_eq!(parse_value_input("hello"), Value::String("hello".into()));

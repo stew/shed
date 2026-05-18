@@ -922,9 +922,9 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
                 Some(x.cmp(y))
             }
         }
-        (String(x), Int(y)) => x.parse::<i64>().ok().and_then(|n| Some(n.cmp(y))),
+        (String(x), Int(y)) => x.parse::<i64>().ok().map(|n| n.cmp(y)),
         (String(x), Float(y)) => x.parse::<f64>().ok().and_then(|n| n.partial_cmp(y)),
-        (Int(x), String(y)) => y.parse::<i64>().ok().and_then(|n| Some(x.cmp(&n))),
+        (Int(x), String(y)) => y.parse::<i64>().ok().map(|n| x.cmp(&n)),
         (Float(x), String(y)) => y.parse::<f64>().ok().and_then(|n| x.partial_cmp(&n)),
         _ => None,
     }
