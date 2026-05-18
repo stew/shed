@@ -74,6 +74,37 @@ To quit: `Ctrl-D`.
 
 ## Concepts
 
+### Tabs
+
+shed supports multiple tabs, each with its own session, prompt, focus,
+undo/redo stack, and notebook binding. Commands running in a background
+tab keep streaming output; the tab bar shows a yellow indicator on any
+tab with activity since you last viewed it.
+
+| Key                 | Action |
+|---------------------|--------|
+| Ctrl-T              | new tab |
+| Ctrl-Q              | close active tab (refused when only one) |
+| Ctrl-Tab            | next tab (wraps) |
+| Ctrl-Shift-Tab      | previous tab (wraps) |
+| Alt-1 … Alt-9       | jump to tab N (clamps to last tab) |
+| F2                  | rename the active tab (Esc to cancel; empty input resets to default) |
+| click on a tab      | switch to it |
+| click `+` in the bar | new tab |
+
+Tab title defaults to the notebook basename when one is loaded,
+otherwise `tab N`. A user-set title (via F2 or the palette's "Rename
+tab") wins over both. Closing the last tab is refused — Ctrl-D still
+quits.
+
+Background semantics: drain + reap run for every tab each tick, so
+output streams in and finished children get reaped no matter which tab
+is active. Pending fullscreen handover and new chain dispatch only
+fire for the active tab — they pick up next time you switch to a tab
+that has them queued. Switching tabs closes any open modal/input bar
+in the source tab (palette, FilterEdit, rerun bar, etc.) — the
+destination tab lands clean on its persistent state.
+
 ### Sheds
 
 Each command spawns a *shed* with:
