@@ -82,6 +82,41 @@ enum ClickAction {
     DeleteBlock(ShedId),
 }
 
+/// A right-clickable shed body. Records the inner rect plus the plain-text
+/// rendering of each line so a right-click can target the specific line
+/// under the cursor. Wrap is not currently accounted for — long lines that
+/// wrap to multiple terminal rows resolve to the wrong index past row 0.
+#[derive(Debug, Clone)]
+struct BodyRegion {
+    rect: Rect,
+    shed_id: ShedId,
+    lines: Vec<String>,
+}
+
+/// State for the floating context menu opened by right-clicking on a shed
+/// body. `pos` is the top-left where the menu renders; the renderer
+/// shifts it inward if it would overflow the frame.
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    pos: (u16, u16),
+    items: Vec<ContextMenuItem>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ContextMenuItem {
+    label: String,
+    action: ContextMenuAction,
+}
+
+#[derive(Debug, Clone)]
+enum ContextMenuAction {
+    /// Write the payload to the system clipboard via OSC 52.
+    CopyText(String),
+    /// Insert the payload at the current prompt cursor.
+    InsertAtPrompt(String),
+}
+
 struct RunningCommand {
     handle: CommandTask,
     killer: Killer,
@@ -1518,6 +1553,12 @@ struct App {
     /// Clickable screen regions registered by the last draw pass.
     /// Rebuilt every frame; hit-tested when a mouse click arrives.
     click_regions: Vec<ClickRegion>,
+    /// Per-shed body regions captured during the last draw pass. Right
+    /// clicks hit-test these to open the line-targeted context menu.
+    body_regions: Vec<BodyRegion>,
+    /// Open right-click context menu, if any. While `Some`, all mouse
+    /// and key events route to the menu before normal focus handling.
+    context_menu: Option<ContextMenu>,
 }
 
 /// Disposition of the save-on-quit prompt. `AwaitingPath` is the rare
@@ -1607,6 +1648,8 @@ impl App {
             open_cursor: 0,
             exit_prompt: None,
             click_regions: Vec::new(),
+            body_regions: Vec::new(),
+            context_menu: None,
         }
     }
 
@@ -1739,8 +1782,10 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
         reap_completed(&mut app).await;
         advance_run_chain(&mut app);
         let mut regions: Vec<ClickRegion> = Vec::new();
-        terminal.draw(|f| draw(f, &app, &mut regions))?;
+        let mut bodies: Vec<BodyRegion> = Vec::new();
+        terminal.draw(|f| draw(f, &app, &mut regions, &mut bodies))?;
         app.click_regions = regions;
+        app.body_regions = bodies;
         if app.quit {
             return Ok(());
         }
@@ -1815,11 +1860,70 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
     }
 }
 
-/// True if `argv` is a single token starting with `@` — shed's syntax for
-/// "snapshot the output of pinned shed @name". The bare prefix `@`
-/// (length 1) is rejected as nameless.
-fn is_pinned_ref(argv: &[String]) -> bool {
-    argv.len() == 1 && argv[0].len() > 1 && argv[0].starts_with('@')
+/// A reference to a shed from another shed's argv. shed's syntax for
+/// "snapshot the output of this shed":
+///
+/// - `@name` — by pinned name. Resolved via `Session::lookup_by_name`.
+/// - `%N`   — by monotonic id (visible in every shed's title).
+///
+/// Either form may appear as a *single-token* argv; mixing with other
+/// args treats the whole thing as a regular external command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShedRef {
+    Name(String),
+    Id(ShedId),
+}
+
+/// Parse a single argv token as a [`ShedRef`]. The bare prefixes `@`
+/// and `%` alone, or `%foo` (not all digits), return `None`.
+fn parse_shed_ref(token: &str) -> Option<ShedRef> {
+    if let Some(name) = token.strip_prefix('@') {
+        if !name.is_empty() {
+            return Some(ShedRef::Name(name.to_string()));
+        }
+    }
+    if let Some(rest) = token.strip_prefix('%') {
+        if let Ok(n) = rest.parse::<u64>() {
+            return Some(ShedRef::Id(ShedId(n)));
+        }
+    }
+    None
+}
+
+/// If `argv` is exactly one token that parses as a [`ShedRef`], return
+/// it; otherwise `None`. Used at the dispatch sites that fork on
+/// "is this a snapshot reference?" before treating argv as a regular
+/// external command.
+fn shed_ref_of(argv: &[String]) -> Option<ShedRef> {
+    if argv.len() != 1 {
+        return None;
+    }
+    parse_shed_ref(&argv[0])
+}
+
+/// True if `argv` is a single token that parses as a [`ShedRef`].
+/// Convenience wrapper around [`shed_ref_of`]; only used in tests
+/// since the runtime sites need the parsed `ShedRef` itself.
+#[cfg(test)]
+fn is_shed_ref(argv: &[String]) -> bool {
+    shed_ref_of(argv).is_some()
+}
+
+/// Resolve a [`ShedRef`] to the concrete `ShedId` in `session`, or
+/// `None` if the referenced shed isn't present.
+fn resolve_shed_ref(session: &Session, r: &ShedRef) -> Option<ShedId> {
+    match r {
+        ShedRef::Name(name) => session.lookup_by_name(name),
+        ShedRef::Id(id) => session.shed(*id).map(|_| *id),
+    }
+}
+
+/// Render a [`ShedRef`] back to its argv-token form.
+fn shed_ref_display(r: &ShedRef) -> String {
+    match r {
+        ShedRef::Name(n) => format!("@{n}"),
+        ShedRef::Id(id) => format!("%{}", id.0),
+    }
 }
 
 /// `Done`/`Failed`/`Snapshotted` are terminal — the run-chain machinery
@@ -1831,11 +1935,12 @@ fn is_terminal_state(state: &ShedState) -> bool {
     )
 }
 
-/// Walk `@-ref` deps to compute the run order for `target`. Sources that
-/// are `Idle` or `Running` get added before the target so the chain
-/// either runs them first or simply waits on them. `Done`/`Failed`
-/// sources are not re-run — the snapshot will use the existing capture
-/// or fail with a clear error. Cycles are guarded via `visited`.
+/// Walk shed-ref deps (`@name` and `%N`) to compute the run order for
+/// `target`. Sources that are `Idle` or `Running` get added before the
+/// target so the chain either runs them first or simply waits on them.
+/// `Done`/`Failed` sources are not re-run — the snapshot will use the
+/// existing capture or fail with a clear error. Cycles are guarded via
+/// `visited`.
 fn build_run_chain(session: &Session, target: ShedId, visited: &mut HashSet<ShedId>) -> Vec<ShedId> {
     if !visited.insert(target) {
         return Vec::new();
@@ -1845,9 +1950,8 @@ fn build_run_chain(session: &Session, target: ShedId, visited: &mut HashSet<Shed
         Some(b) => b,
         None => return chain,
     };
-    if is_pinned_ref(&shed.argv) {
-        let name = &shed.argv[0][1..];
-        if let Some(src_id) = session.lookup_by_name(name) {
+    if let Some(r) = shed_ref_of(&shed.argv) {
+        if let Some(src_id) = resolve_shed_ref(session, &r) {
             if let Some(src) = session.shed(src_id) {
                 if matches!(src.state, ShedState::Idle | ShedState::Running) {
                     let mut sub = build_run_chain(session, src_id, visited);
@@ -1860,10 +1964,11 @@ fn build_run_chain(session: &Session, target: ShedId, visited: &mut HashSet<Shed
     chain
 }
 
-/// Walk *downward* from `source` to find every shed whose argv is
-/// `@<source's name>` (recursively, so dependents-of-dependents are
-/// included). Output is in BFS order so a downstream rebuild runs
-/// closest first. Source must be pinned for the search to find anything.
+/// Walk *downward* from `source` to find every shed that references it
+/// (recursively, so dependents-of-dependents are included). Output is
+/// in BFS order so a downstream rebuild runs closest first. A
+/// dependent is one whose argv is `@<source.name>` (if source is
+/// pinned) or `%<source.id>`.
 fn collect_dependents_recursive(
     session: &Session,
     source: ShedId,
@@ -1873,13 +1978,20 @@ fn collect_dependents_recursive(
     if !visited.insert(source) {
         return;
     }
-    let Some(name) = session.shed(source).and_then(|b| b.name.clone()) else {
+    let Some(src_shed) = session.shed(source) else {
         return;
     };
-    let target = format!("@{name}");
+    let name_target = src_shed.name.as_ref().map(|n| format!("@{n}"));
+    let id_target = format!("%{}", source.0);
     let direct: Vec<ShedId> = session
         .sheds()
-        .filter(|b| b.argv.len() == 1 && b.argv[0] == target)
+        .filter(|b| {
+            if b.argv.len() != 1 {
+                return false;
+            }
+            let tok = &b.argv[0];
+            tok == &id_target || name_target.as_ref().is_some_and(|t| tok == t)
+        })
         .map(|b| b.id)
         .collect();
     for id in &direct {
@@ -2009,25 +2121,25 @@ fn advance_run_chain(app: &mut App) {
     app.chain_in_flight = None;
 }
 
-/// Apply `name`'s pipeline to its current capture and serialize the
-/// result to bytes — JSON-pretty for structured values, raw passthrough
-/// for byte streams. Errors describe what went wrong so the caller can
-/// route them into a `Failed` shed state.
-fn snapshot_pinned(session: &Session, name: &str) -> Result<Vec<u8>, String> {
-    let id = session
-        .lookup_by_name(name)
-        .ok_or_else(|| format!("no pinned shed named @{name}"))?;
+/// Apply the referenced shed's pipeline to its current capture and
+/// serialize the result to bytes — JSON-pretty for structured values,
+/// raw passthrough for byte streams. Errors describe what went wrong
+/// so the caller can route them into a `Failed` shed state.
+fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<Vec<u8>, String> {
+    let label = shed_ref_display(r);
+    let id =
+        resolve_shed_ref(session, r).ok_or_else(|| format!("no shed at {label}"))?;
     let shed = session
         .shed(id)
-        .ok_or_else(|| format!("@{name} missing from session"))?;
+        .ok_or_else(|| format!("{label} missing from session"))?;
     let capture = shed
         .capture
         .as_ref()
-        .ok_or_else(|| format!("@{name} has no captured output yet"))?;
+        .ok_or_else(|| format!("{label} has no captured output yet"))?;
 
     let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
         Ok((v, _)) => v,
-        Err(e) => return Err(format!("@{name} pipeline error: {e}")),
+        Err(e) => return Err(format!("{label} pipeline error: {e}")),
     };
 
     let bytes = match value {
@@ -2043,12 +2155,12 @@ fn snapshot_pinned(session: &Session, name: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Run `snapshot_pinned` and write the result onto `id` as a synthetic
-/// capture. Used both at create time (typing `@name`) and on re-run
-/// (Space on a snapshot shed).
-fn populate_snapshot(app: &mut App, id: ShedId, name: &str) {
+/// Run `snapshot_ref` and write the result onto `id` as a synthetic
+/// capture. Used both at create time (typing `@name` or `%N`) and on
+/// re-run (Space on a snapshot shed).
+fn populate_snapshot(app: &mut App, id: ShedId, r: &ShedRef) {
     let started_at = Instant::now();
-    match snapshot_pinned(&app.session, name) {
+    match snapshot_ref(&app.session, r) {
         Ok(bytes) => {
             let capture = Capture {
                 stdout: Bytes::from(bytes),
@@ -2071,12 +2183,12 @@ fn populate_snapshot(app: &mut App, id: ShedId, name: &str) {
     }
 }
 
-/// Append a new snapshot shed referencing pinned `@name` and queue it
+/// Append a new snapshot shed referencing `@name` or `%N` and queue it
 /// (along with any deps) on the run chain. The actual snapshot runs from
 /// `perform_run_in_place` so the source's pipeline output is fresh.
-fn spawn_pinned_snapshot(app: &mut App, name: &str) {
+fn spawn_ref_snapshot(app: &mut App, r: &ShedRef) {
     app.savepoint();
-    let argv = vec![format!("@{name}")];
+    let argv = vec![shed_ref_display(r)];
     let id = app.session.add_shed(argv);
     app.session.set_state(id, ShedState::Idle);
     queue_run_chain(app, id);
@@ -2167,9 +2279,8 @@ async fn perform_run_in_place(app: &mut App, id: ShedId) {
         return;
     }
 
-    if is_pinned_ref(&argv) {
-        let name = argv[0][1..].to_string();
-        populate_snapshot(app, id, &name);
+    if let Some(r) = shed_ref_of(&argv) {
+        populate_snapshot(app, id, &r);
         return;
     }
 
@@ -2355,6 +2466,11 @@ async fn reap_completed(app: &mut App) {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) {
+    // Context menu, when open, owns the keyboard.
+    if app.context_menu.is_some() {
+        handle_context_menu_key(app, key);
+        return;
+    }
     // Exit confirmation takes priority over everything: y / n / c (cancel).
     if app.exit_prompt.is_some() {
         handle_exit_prompt_key(app, key);
@@ -3075,6 +3191,7 @@ struct CompletionState {
 enum CompletionContext {
     EnvVar,
     Pinned,
+    ShedId,
     Slash,
     Argv0,
     Path,
@@ -3098,6 +3215,9 @@ fn classify_completion(focus: Focus, base: &str, token: &str) -> CompletionConte
     }
     if token.starts_with('@') {
         return CompletionContext::Pinned;
+    }
+    if token.starts_with('%') {
+        return CompletionContext::ShedId;
     }
     let argv0 = base.trim().is_empty();
     if argv0 {
@@ -3123,6 +3243,18 @@ fn env_completions(token: &str) -> Vec<String> {
     names.sort();
     names.dedup();
     names.into_iter().map(|n| format!("${n}")).collect()
+}
+
+fn id_completions(session: &Session, token: &str) -> Vec<String> {
+    let prefix = &token[1..]; // strip %
+    let mut matches: Vec<String> = session
+        .sheds()
+        .map(|b| format!("%{}", b.id.0))
+        .filter(|s| s.starts_with(&format!("%{prefix}")))
+        .collect();
+    matches.sort();
+    matches.dedup();
+    matches
 }
 
 fn pinned_completions(session: &Session, token: &str) -> Vec<String> {
@@ -3321,6 +3453,7 @@ fn compute_completions(
     let matches = match ctx {
         CompletionContext::EnvVar => env_completions(token),
         CompletionContext::Pinned => pinned_completions(session, token),
+        CompletionContext::ShedId => id_completions(session, token),
         CompletionContext::Slash => slash_completions(token),
         CompletionContext::Argv0 => argv0_completions(aliases, token),
         CompletionContext::Path => path_or_carapace_completions(base, token),
@@ -3412,29 +3545,120 @@ fn cycle_completion(app: &mut App, dir: i32) {
 }
 
 /// Dispatch a mouse event by hit-testing the click regions registered
-/// during the last draw pass. Only left-button-down counts as a
-/// "click" today; scroll and motion events are ignored.
+/// during the last draw pass. Left-button-down activates the targeted
+/// region; right-button-down opens a context menu for the shed body
+/// under the cursor. Scroll and motion events are ignored.
 fn handle_mouse(app: &mut App, me: MouseEvent) {
-    if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+    // If a context menu is open, every click closes it. Clicks on a menu
+    // item additionally fire that item; clicks elsewhere just dismiss.
+    if app.context_menu.is_some() {
+        if let MouseEventKind::Down(_) = me.kind {
+            if let Some(idx) = menu_item_at(app, me.column, me.row) {
+                if let Some(menu) = app.context_menu.as_mut() {
+                    menu.selected = idx;
+                }
+                activate_menu_item(app);
+            } else {
+                app.context_menu = None;
+            }
+        }
         return;
     }
-    let hit = app
-        .click_regions
-        .iter()
-        .find(|r| {
-            me.column >= r.rect.x
-                && me.column < r.rect.x + r.rect.width
-                && me.row >= r.rect.y
-                && me.row < r.rect.y + r.rect.height
-        })
-        .map(|r| r.action);
-    let Some(action) = hit else {
-        return;
-    };
-    app.flash = None;
-    match action {
-        ClickAction::DeleteBlock(id) => delete_shed(app, id),
+    match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = app
+                .click_regions
+                .iter()
+                .find(|r| rect_contains(r.rect, me.column, me.row))
+                .map(|r| r.action);
+            let Some(action) = hit else {
+                return;
+            };
+            app.flash = None;
+            match action {
+                ClickAction::DeleteBlock(id) => delete_shed(app, id),
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            let hit = app
+                .body_regions
+                .iter()
+                .find(|r| rect_contains(r.rect, me.column, me.row))
+                .cloned();
+            let Some(region) = hit else {
+                return;
+            };
+            open_body_context_menu(app, &region, me.column, me.row);
+        }
+        _ => {}
     }
+}
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// Build the line-targeted context menu for a right-clicked shed body.
+/// Always offers "Copy whole output"; line-specific items appear when
+/// the clicked row maps to a non-empty rendered line.
+fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16) {
+    let line_idx = row.saturating_sub(region.rect.y) as usize;
+    let line_text: Option<String> = region
+        .lines
+        .get(line_idx)
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.is_empty());
+
+    let whole_output = shed_plain_output(&app.session, region.shed_id);
+
+    let mut items: Vec<ContextMenuItem> = Vec::new();
+    if let Some(line) = line_text {
+        items.push(ContextMenuItem {
+            label: "Copy line".into(),
+            action: ContextMenuAction::CopyText(line.clone()),
+        });
+        if app.focus == Focus::Prompt {
+            items.push(ContextMenuItem {
+                label: "Add line to prompt".into(),
+                action: ContextMenuAction::InsertAtPrompt(line),
+            });
+        }
+    }
+    if let Some(out) = whole_output {
+        items.push(ContextMenuItem {
+            label: "Copy whole output".into(),
+            action: ContextMenuAction::CopyText(out),
+        });
+    }
+    if items.is_empty() {
+        return;
+    }
+    app.context_menu = Some(ContextMenu {
+        pos: (col, row),
+        items,
+        selected: 0,
+    });
+}
+
+/// Plain UTF-8 stdout of a shed's capture, or `None` if the shed is
+/// missing or has no capture yet. The pipeline is *not* applied — users
+/// asking for "copy whole output" usually want the raw captured text,
+/// not the filtered view.
+fn shed_plain_output(session: &Session, id: ShedId) -> Option<String> {
+    let shed = session.shed(id)?;
+    let capture = shed.capture.as_ref()?;
+    Some(String::from_utf8_lossy(&capture.stdout).into_owned())
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    let mut s = String::new();
+    for span in &line.spans {
+        s.push_str(&span.content);
+    }
+    s
 }
 
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
@@ -4856,9 +5080,8 @@ async fn spawn_prompt(app: &mut App) {
         return;
     }
 
-    if is_pinned_ref(&argv) {
-        let name = argv[0][1..].to_string();
-        spawn_pinned_snapshot(app, &name);
+    if let Some(r) = shed_ref_of(&argv) {
+        spawn_ref_snapshot(app, &r);
         return;
     }
 
@@ -5308,7 +5531,12 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
+fn draw(
+    f: &mut Frame,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
         Focus::ShedExpand => draw_shed_expand(f, app),
@@ -5316,7 +5544,10 @@ fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
         Focus::Palette => draw_palette(f, app),
         Focus::NoteEdit => draw_note_edit(f, app),
         Focus::AliasManage => draw_alias_manage(f, app),
-        _ => draw_repl(f, app, regions),
+        _ => draw_repl(f, app, regions, bodies),
+    }
+    if app.context_menu.is_some() {
+        draw_context_menu(f, app);
     }
 }
 
@@ -5637,6 +5868,223 @@ fn draw_note_edit(f: &mut Frame, app: &App) {
     draw_status(f, chunks[2], app);
 }
 
+/// Render the floating right-click context menu over the existing frame.
+/// Sized to the longest item label + padding; shifted inward if it would
+/// overflow the right or bottom edge.
+fn draw_context_menu(f: &mut Frame, app: &App) {
+    let Some(menu) = app.context_menu.as_ref() else {
+        return;
+    };
+    if menu.items.is_empty() {
+        return;
+    }
+    let frame = f.area();
+    let inner_width: u16 = menu
+        .items
+        .iter()
+        .map(|i| i.label.chars().count() as u16)
+        .max()
+        .unwrap_or(1);
+    // 2 borders + 2 padding cells on each side.
+    let width = (inner_width + 4).min(frame.width.max(1));
+    let height = (menu.items.len() as u16 + 2).min(frame.height.max(1));
+    let mut x = menu.pos.0;
+    let mut y = menu.pos.1;
+    if x + width > frame.x + frame.width {
+        x = frame.x + frame.width - width;
+    }
+    if y + height > frame.y + frame.height {
+        y = frame.y + frame.height - height;
+    }
+    let area = Rect { x, y, width, height };
+
+    let block = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(block, area);
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let lines: Vec<Line<'static>> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == menu.selected { highlight } else { normal };
+            Line::from(Span::styled(format!(" {} ", item.label), style))
+        })
+        .collect();
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
+}
+
+/// Return the index of the menu item under (col, row), or `None` if the
+/// coordinates fall outside the menu's rendered rows.
+fn menu_item_at(app: &App, col: u16, row: u16) -> Option<usize> {
+    let menu = app.context_menu.as_ref()?;
+    if menu.items.is_empty() {
+        return None;
+    }
+    let frame_x = menu.pos.0;
+    let frame_y = menu.pos.1;
+    let inner_width: u16 = menu
+        .items
+        .iter()
+        .map(|i| i.label.chars().count() as u16)
+        .max()
+        .unwrap_or(1);
+    let width = inner_width + 4;
+    let height = menu.items.len() as u16 + 2;
+    // The renderer may shift the menu to keep it in-frame; we don't know
+    // the frame size here, so accept any column inside the unshifted box
+    // as a hit. The mouse routing checks against the post-render rect for
+    // dismissal; this is just a best-effort proximity check.
+    if col < frame_x || col >= frame_x + width {
+        return None;
+    }
+    if row <= frame_y || row + 1 > frame_y + height {
+        return None;
+    }
+    let idx = (row - frame_y - 1) as usize;
+    if idx < menu.items.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Dispatch a keypress while the context menu is open. Up/Down navigate,
+/// Enter activates, Esc dismisses. Anything else just dismisses so the
+/// menu doesn't trap focus.
+fn handle_context_menu_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(menu) = app.context_menu.as_mut() {
+                if menu.selected == 0 {
+                    menu.selected = menu.items.len().saturating_sub(1);
+                } else {
+                    menu.selected -= 1;
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(menu) = app.context_menu.as_mut() {
+                if menu.items.is_empty() {
+                    return;
+                }
+                menu.selected = (menu.selected + 1) % menu.items.len();
+            }
+        }
+        KeyCode::Enter => activate_menu_item(app),
+        KeyCode::Esc => {
+            app.context_menu = None;
+        }
+        _ => {
+            app.context_menu = None;
+        }
+    }
+}
+
+/// Apply the currently-selected menu item's action and close the menu.
+fn activate_menu_item(app: &mut App) {
+    let Some(menu) = app.context_menu.take() else {
+        return;
+    };
+    let Some(item) = menu.items.into_iter().nth(menu.selected) else {
+        return;
+    };
+    match item.action {
+        ContextMenuAction::CopyText(text) => match write_clipboard_osc52(&text) {
+            Ok(()) => app.flash = Some(format!("copied {} bytes", text.len())),
+            Err(e) => app.flash = Some(format!("clipboard write failed: {e}")),
+        },
+        ContextMenuAction::InsertAtPrompt(text) => {
+            insert_at_prompt(app, &text);
+        }
+    }
+}
+
+/// Insert `text` at the current prompt cursor position. Silently does
+/// nothing if focus isn't on the prompt — the menu only offers this
+/// item when focus is on the prompt.
+fn insert_at_prompt(app: &mut App, text: &str) {
+    if app.focus != Focus::Prompt {
+        return;
+    }
+    let cur = app.prompt_cursor.min(app.prompt.len());
+    let mut new_text = String::with_capacity(app.prompt.len() + text.len());
+    new_text.push_str(&app.prompt[..cur]);
+    new_text.push_str(text);
+    new_text.push_str(&app.prompt[cur..]);
+    app.prompt = new_text;
+    app.prompt_cursor = cur + text.len();
+}
+
+/// Write `text` to the system clipboard via OSC 52. Targets both the
+/// CLIPBOARD and PRIMARY selections so terminals that distinguish them
+/// (X11) get the value in the place pasting expects.
+///
+/// Inside tmux this relies on `set -g set-clipboard on` — tmux then
+/// forwards OSC 52 from applications to the outer terminal natively.
+/// (We deliberately do NOT use DCS passthrough wrapping: that would
+/// additionally require `set -g allow-passthrough on`, which is off by
+/// default in tmux ≥ 3.3, and would *break* the common case.) The outer
+/// terminal must also support OSC 52 — kitty, iTerm2, wezterm, alacritty,
+/// foot, and modern xterm do; many older terminals silently ignore it.
+fn write_clipboard_osc52(text: &str) -> io::Result<()> {
+    let payload = base64_encode(text.as_bytes());
+    let seq = format!("\x1b]52;cp;{payload}\x07");
+    use std::io::Write;
+    let mut out = io::stdout();
+    out.write_all(seq.as_bytes())?;
+    out.flush()
+}
+
+/// Minimal base64 encoder. OSC 52 is the only caller; we don't need
+/// streaming or url-safe variants, so a 40-line implementation is
+/// cheaper than pulling in a dep.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let b0 = rem[0];
+            out.push(ALPHABET[(b0 >> 2) as usize] as char);
+            out.push(ALPHABET[((b0 & 0x03) << 4) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b0 = rem[0];
+            let b1 = rem[1];
+            out.push(ALPHABET[(b0 >> 2) as usize] as char);
+            out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
 fn draw_palette(f: &mut Frame, app: &App) {
     let Some(state) = app.palette_state.as_ref() else {
         return;
@@ -5914,7 +6362,12 @@ fn draw_shed_expand(f: &mut Frame, app: &App) {
     draw_status(f, chunks[2], app);
 }
 
-fn draw_repl(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
+fn draw_repl(
+    f: &mut Frame,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -5929,7 +6382,7 @@ fn draw_repl(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
         .map(|p| collapse_home_in_path(&p))
         .unwrap_or_else(|| "?".into());
     draw_header(f, chunks[0], &cwd);
-    draw_sheds(f, chunks[1], app, regions);
+    draw_sheds(f, chunks[1], app, regions, bodies);
     draw_status(f, chunks[2], app);
 }
 
@@ -6020,7 +6473,13 @@ fn draw_header(f: &mut Frame, area: Rect, title: &str) {
     f.render_widget(header, area);
 }
 
-fn draw_sheds(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
+fn draw_sheds(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
+) {
     let cursor_id = app.session.cursor();
     let cursor_visible = matches!(app.focus, Focus::ShedCursor | Focus::EditShed);
     let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
@@ -6086,6 +6545,7 @@ fn draw_sheds(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegio
             *selected,
             *editing,
             regions,
+            bodies,
         );
     }
     let scratch_rect = rects[rects.len() - 1];
@@ -6175,6 +6635,7 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
 /// Render one bordered shed. The box title carries the id (`%5`) or
 /// pinned name (`@list`) plus the run-state glyph; the body is the
 /// caller-supplied content (output, notes, edit details, etc.).
+#[allow(clippy::too_many_arguments)]
 fn draw_one_shed(
     f: &mut Frame,
     area: Rect,
@@ -6183,6 +6644,7 @@ fn draw_one_shed(
     selected: bool,
     editing: bool,
     regions: &mut Vec<ClickRegion>,
+    bodies: &mut Vec<BodyRegion>,
 ) {
     let pinned = shed.name.is_some();
     let id_text = match &shed.name {
@@ -6247,6 +6709,15 @@ fn draw_one_shed(
     f.render_widget(widget, area);
     let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+
+    if inner.width > 0 && inner.height > 0 {
+        let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
+        bodies.push(BodyRegion {
+            rect: inner,
+            shed_id: shed.id,
+            lines: plain,
+        });
+    }
 
     // Clickable `×` on the top-right border. Three cells (` × `) so
     // the hit-target is forgiving; only render when the shed is wide
@@ -7499,7 +7970,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Enter", "run"),
             ("↑↓", "history"),
             ("!cmd", "fullscreen"),
-            ("@name", "snapshot"),
+            ("@name | %N", "snapshot"),
             ("/aliases", "manage"),
             ("Ctrl-A/E/U/K/W", "line edit"),
             ("Ctrl-P", "palette"),
@@ -8575,16 +9046,32 @@ mod tests {
     }
 
     #[test]
-    fn is_pinned_ref_only_for_single_at_token() {
-        assert!(is_pinned_ref(&["@logs".into()]));
-        assert!(!is_pinned_ref(&["@logs".into(), "extra".into()]));
-        assert!(!is_pinned_ref(&["@".into()]));
-        assert!(!is_pinned_ref(&["logs".into()]));
-        assert!(!is_pinned_ref(&[]));
+    fn is_shed_ref_only_for_single_at_or_percent_token() {
+        assert!(is_shed_ref(&["@logs".into()]));
+        assert!(is_shed_ref(&["%5".into()]));
+        assert!(!is_shed_ref(&["@logs".into(), "extra".into()]));
+        assert!(!is_shed_ref(&["@".into()]));
+        assert!(!is_shed_ref(&["%".into()]));
+        assert!(!is_shed_ref(&["%abc".into()]));
+        assert!(!is_shed_ref(&["logs".into()]));
+        assert!(!is_shed_ref(&[]));
     }
 
     #[test]
-    fn snapshot_pinned_renders_structured_as_json() {
+    fn parse_shed_ref_recognizes_both_forms() {
+        assert_eq!(
+            parse_shed_ref("@logs"),
+            Some(ShedRef::Name("logs".into()))
+        );
+        assert_eq!(parse_shed_ref("%7"), Some(ShedRef::Id(ShedId(7))));
+        assert_eq!(parse_shed_ref("@"), None);
+        assert_eq!(parse_shed_ref("%"), None);
+        assert_eq!(parse_shed_ref("%x"), None);
+        assert_eq!(parse_shed_ref("logs"), None);
+    }
+
+    #[test]
+    fn snapshot_ref_renders_structured_as_json_for_pinned() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         s.set_capture(src, Capture {
@@ -8599,7 +9086,7 @@ mod tests {
         s.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
         s.pin(src, "nums".into());
 
-        let bytes = snapshot_pinned(&s, "nums").expect("snapshot");
+        let bytes = snapshot_ref(&s, &ShedRef::Name("nums".into())).expect("snapshot");
         let text = String::from_utf8(bytes).unwrap();
         // from-lines yields a list of records {line: ...}. Pretty JSON.
         assert!(text.contains("\"line\""));
@@ -8609,7 +9096,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_pinned_passes_raw_bytes_through_when_unparsed() {
+    fn snapshot_ref_by_id_works_without_a_pinned_name() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["echo".into(), "hi".into()]);
         s.set_capture(src, Capture {
@@ -8621,17 +9108,50 @@ mod tests {
             truncated: false,
             snapshotted: false,
         });
-        s.pin(src, "h".into());
-
-        let bytes = snapshot_pinned(&s, "h").expect("snapshot");
+        // Unpinned: only the %N form can reach it.
+        let bytes = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
         assert_eq!(bytes, b"hello\n");
     }
 
     #[test]
-    fn snapshot_pinned_errors_on_unknown_name() {
+    fn snapshot_ref_errors_on_missing_id_or_name() {
         let s = Session::new();
-        let err = snapshot_pinned(&s, "nope").unwrap_err();
-        assert!(err.contains("nope"));
+        let err = snapshot_ref(&s, &ShedRef::Name("nope".into())).unwrap_err();
+        assert!(err.contains("@nope"), "got: {err}");
+        let err = snapshot_ref(&s, &ShedRef::Id(ShedId(99))).unwrap_err();
+        assert!(err.contains("%99"), "got: {err}");
+    }
+
+    #[test]
+    fn spawn_ref_snapshot_adds_an_idle_shed_with_percent_id_argv() {
+        let mut app = App::new();
+        app.history.clear();
+        let src = app.session.add_shed(vec!["echo".into(), "hi".into()]);
+        spawn_ref_snapshot(&mut app, &ShedRef::Id(src));
+        // The new shed should have argv ["%N"] and be Idle.
+        let new_id = app.newest_shed_id().unwrap();
+        assert_ne!(new_id, src);
+        let new_shed = app.session.shed(new_id).unwrap();
+        assert_eq!(new_shed.argv, vec![format!("%{}", src.0)]);
+        assert!(matches!(new_shed.state, ShedState::Idle));
+        // And the new shed should be queued on the run chain.
+        assert!(app.pending_run_chain.contains(&new_id));
+    }
+
+    #[test]
+    fn collect_dependents_finds_both_name_and_id_refs() {
+        let mut s = Session::new();
+        let src = s.add_shed(vec!["src".into()]);
+        s.pin(src, "the_src".into());
+        let dep_by_name = s.add_shed(vec!["@the_src".into()]);
+        let dep_by_id = s.add_shed(vec![format!("%{}", src.0)]);
+        let _unrelated = s.add_shed(vec!["echo".into(), "x".into()]);
+
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        collect_dependents_recursive(&s, src, &mut out, &mut visited);
+        assert!(out.contains(&dep_by_name), "by-name dep missing: {out:?}");
+        assert!(out.contains(&dep_by_id), "by-id dep missing: {out:?}");
     }
 
     #[test]
@@ -9095,6 +9615,35 @@ mod tests {
         assert_eq!(got, vec!["@logs".to_string(), "@long".to_string()]);
         let none = pinned_completions(&s, "@zzz");
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn id_completions_returns_all_shed_ids_matching_prefix() {
+        let mut s = Session::new();
+        for _ in 0..15 {
+            s.add_shed(vec!["x".into()]);
+        }
+        // `%1` matches %1, %10..%15 (string prefix).
+        let got = id_completions(&s, "%1");
+        assert!(got.contains(&"%1".to_string()));
+        assert!(got.contains(&"%10".to_string()));
+        assert!(got.contains(&"%15".to_string()));
+        assert!(!got.contains(&"%2".to_string()));
+        // Bare `%` yields every shed.
+        let all = id_completions(&s, "%");
+        assert_eq!(all.len(), 15);
+    }
+
+    #[test]
+    fn classify_completion_recognises_percent_prefix() {
+        assert_eq!(
+            classify_completion(Focus::Prompt, "", "%5"),
+            CompletionContext::ShedId
+        );
+        assert_eq!(
+            classify_completion(Focus::Prompt, "cat ", "%5"),
+            CompletionContext::ShedId
+        );
     }
 
     #[test]
@@ -9654,5 +10203,267 @@ mod tests {
         let state = app.completion.as_ref().unwrap();
         assert_eq!(state.suffix, " foo");
         assert_eq!(app.prompt_cursor, app.prompt.len() - " foo".len());
+    }
+
+    // === right-click context menu ===
+
+    fn make_body_region(shed_id: ShedId, lines: Vec<&str>) -> BodyRegion {
+        BodyRegion {
+            rect: Rect { x: 2, y: 3, width: 40, height: lines.len() as u16 },
+            shed_id,
+            lines: lines.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        // RFC 4648 §10 vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn right_click_in_shed_body_opens_menu_with_line_item() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        // Give the shed a capture so "copy whole output" has content.
+        let id_marker = a;
+        if let Some(b) = app.session.shed_mut(id_marker) {
+            b.capture = Some(Capture {
+                stdout: Bytes::from_static(b"hello\nworld\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+            });
+        }
+        app.body_regions.push(make_body_region(a, vec!["hello", "world"]));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5, // inside rect.x=2..42
+            row: 3,    // first line
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let menu = app.context_menu.as_ref().expect("menu opened");
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Copy line"));
+        assert!(labels.contains(&"Copy whole output"));
+        // Targeted line text should be the first body row.
+        match &menu.items.iter().find(|i| i.label == "Copy line").unwrap().action {
+            ContextMenuAction::CopyText(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected CopyText"),
+        }
+    }
+
+    #[test]
+    fn right_click_on_blank_line_still_offers_whole_output() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        if let Some(b) = app.session.shed_mut(a) {
+            b.capture = Some(Capture {
+                stdout: Bytes::from_static(b"only output"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+            });
+        }
+        // Empty line at row 3.
+        app.body_regions.push(make_body_region(a, vec!["", "world"]));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let menu = app.context_menu.as_ref().expect("menu opened");
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(!labels.contains(&"Copy line"), "blank line shouldn't offer copy");
+        assert!(labels.contains(&"Copy whole output"));
+    }
+
+    #[test]
+    fn right_click_outside_body_does_nothing() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        app.body_regions.push(make_body_region(a, vec!["x"]));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 99, // outside rect
+            row: 99,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn menu_key_arrows_cycle_through_items() {
+        let mut app = App::new();
+        app.context_menu = Some(ContextMenu {
+            pos: (0, 0),
+            items: vec![
+                ContextMenuItem {
+                    label: "a".into(),
+                    action: ContextMenuAction::CopyText("a".into()),
+                },
+                ContextMenuItem {
+                    label: "b".into(),
+                    action: ContextMenuAction::CopyText("b".into()),
+                },
+                ContextMenuItem {
+                    label: "c".into(),
+                    action: ContextMenuAction::CopyText("c".into()),
+                },
+            ],
+            selected: 0,
+        });
+        handle_context_menu_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, 1);
+        handle_context_menu_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, 2);
+        // Down past end wraps to 0.
+        handle_context_menu_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, 0);
+        // Up from 0 wraps to last.
+        handle_context_menu_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
+    fn menu_enter_on_insert_action_closes_menu_and_splices_prompt() {
+        // Using InsertAtPrompt avoids touching stdout (OSC 52) during the
+        // test, which would otherwise pollute test output.
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::Prompt;
+        app.prompt = "echo ".into();
+        app.prompt_cursor = 5;
+        app.context_menu = Some(ContextMenu {
+            pos: (0, 0),
+            items: vec![ContextMenuItem {
+                label: "Add line to prompt".into(),
+                action: ContextMenuAction::InsertAtPrompt("hello".into()),
+            }],
+            selected: 0,
+        });
+        handle_context_menu_key(&mut app, key(KeyCode::Enter));
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.prompt, "echo hello");
+        assert_eq!(app.prompt_cursor, 10);
+    }
+
+    #[test]
+    fn menu_key_esc_dismisses_without_acting() {
+        let mut app = App::new();
+        app.context_menu = Some(ContextMenu {
+            pos: (0, 0),
+            items: vec![ContextMenuItem {
+                label: "x".into(),
+                action: ContextMenuAction::CopyText("x".into()),
+            }],
+            selected: 0,
+        });
+        handle_context_menu_key(&mut app, key(KeyCode::Esc));
+        assert!(app.context_menu.is_none());
+        assert!(app.flash.is_none(), "esc should not trigger copy");
+    }
+
+    #[test]
+    fn insert_at_prompt_splices_text_at_cursor() {
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::Prompt;
+        app.prompt = "echo  bar".into();
+        app.prompt_cursor = 5; // between "echo " and " bar"
+        insert_at_prompt(&mut app, "foo");
+        assert_eq!(app.prompt, "echo foo bar");
+        assert_eq!(app.prompt_cursor, 8);
+    }
+
+    #[test]
+    fn add_to_prompt_only_offered_when_focus_is_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        if let Some(b) = app.session.shed_mut(a) {
+            b.capture = Some(Capture {
+                stdout: Bytes::from_static(b"hello\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+            });
+        }
+        app.body_regions.push(make_body_region(a, vec!["hello"]));
+        // Focus is ShedCursor (not Prompt) — no Add line to prompt.
+        app.focus = Focus::ShedCursor;
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let labels: Vec<String> = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert!(!labels.contains(&"Add line to prompt".to_string()));
+
+        // Now with Focus::Prompt the item appears.
+        app.context_menu = None;
+        app.focus = Focus::Prompt;
+        handle_mouse(&mut app, me);
+        let labels: Vec<String> = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert!(labels.contains(&"Add line to prompt".to_string()));
+    }
+
+    #[test]
+    fn click_outside_menu_dismisses_it() {
+        let mut app = App::new();
+        app.context_menu = Some(ContextMenu {
+            pos: (10, 10),
+            items: vec![ContextMenuItem {
+                label: "x".into(),
+                action: ContextMenuAction::CopyText("x".into()),
+            }],
+            selected: 0,
+        });
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.context_menu.is_none());
     }
 }

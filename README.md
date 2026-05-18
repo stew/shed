@@ -287,6 +287,39 @@ undoable — re-runs are runtime, not structural, and don't dirty the
 notebook. Undo restores notebook structure; if you want to revert a
 re-run's output, save before re-running and reload.
 
+### Copy and paste
+
+shed enables mouse capture so it can route clicks to the per-shed `[×]`
+buttons and the right-click context menu, which blocks the terminal's
+native click-and-drag selection. Two ways to get text out:
+
+- **Shift-drag** to bypass mouse capture and use the terminal's own
+  selection (works in kitty, iTerm2, wezterm, alacritty, foot, modern
+  xterm; behaviour varies by emulator). Whatever you select is sent to
+  the clipboard the same way as in a normal terminal.
+- **Right-click** on a shed body opens a small context menu with:
+  - **Copy line** — the rendered line under the cursor
+  - **Add line to prompt** — splice that line into the prompt at the
+    cursor (only offered when focus is on the prompt)
+  - **Copy whole output** — the shed's raw captured stdout (pre-pipeline)
+
+  Navigate with `↑↓`, **Enter** to activate, **Esc** to dismiss. Clicking
+  outside the menu also dismisses.
+
+Copy uses OSC 52 to write to the system clipboard (both CLIPBOARD and
+PRIMARY selections, for X11 environments). Most modern terminals support
+it; some older ones silently ignore it.
+
+Inside **tmux**, OSC 52 forwarding requires `set -g set-clipboard on` in
+your tmux config — without it tmux discards the sequence. Once that's
+on, tmux forwards application OSC 52 to the outer terminal natively (no
+extra `allow-passthrough` setting needed). Reload tmux config and try
+again if the first copy attempt doesn't land.
+
+Type-aware cell actions (copy a specific column value, open a URL, `cd`
+to a path) are planned for the same menu once structured-row filters
+land and the renderer can map screen coordinates back to a field.
+
 ### Tab completion
 
 Available at the Prompt and inside the in-place command editor (the bar
