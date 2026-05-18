@@ -50,12 +50,12 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
 use ratatui::{
-    DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    DefaultTerminal,
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
     Alias, AliasFile, Capture, CompareOp, Filter, FilterSpec, Notebook, NotebookEntry,
@@ -77,9 +77,7 @@ use completion::{CompletionState, cycle_completion};
 use input::{
     InputOutcome, apply_readline_edit, handle_text_input, input_spans_with_cursor, render_input_bar,
 };
-use render::{
-    cell_string, describe_filter, draw_header, filter_error_lines, render_pipeline_value_with_max,
-};
+use render::{cell_string, filter_error_lines, render_pipeline_value_with_max};
 use tabs::{
     TabSlot, begin_rename_tab, drive_all_tabs, handle_rename_tab_input_key, try_handle_tab_key,
 };
@@ -727,7 +725,7 @@ impl FilterKind {
         FilterKind::Join,
     ];
 
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             FilterKind::FromLines => "from-lines",
             FilterKind::FromFields => "from-fields",
@@ -748,7 +746,7 @@ impl FilterKind {
         }
     }
 
-    fn description(self) -> &'static str {
+    pub(super) fn description(self) -> &'static str {
         match self {
             FilterKind::FromLines => "parse bytes into one record per line",
             FilterKind::FromFields => "parse bytes into records by whitespace (auto _1, _2, …)",
@@ -829,7 +827,7 @@ impl WhereOp {
         WhereOp::Ge,
     ];
 
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             WhereOp::Matches => "matches",
             WhereOp::Contains => "contains",
@@ -842,7 +840,7 @@ impl WhereOp {
         }
     }
 
-    fn description(self) -> &'static str {
+    pub(super) fn description(self) -> &'static str {
         match self {
             WhereOp::Matches => "regex match (unanchored)",
             WhereOp::Contains => "case-sensitive substring",
@@ -855,7 +853,7 @@ impl WhereOp {
         }
     }
 
-    fn value_label(self) -> &'static str {
+    pub(super) fn value_label(self) -> &'static str {
         match self {
             WhereOp::Matches => "pattern",
             WhereOp::Contains => "substring",
@@ -863,7 +861,7 @@ impl WhereOp {
         }
     }
 
-    fn to_compare_op(self) -> Option<CompareOp> {
+    pub(super) fn to_compare_op(self) -> Option<CompareOp> {
         match self {
             WhereOp::Eq => Some(CompareOp::Eq),
             WhereOp::Ne => Some(CompareOp::Ne),
@@ -911,14 +909,14 @@ enum WhereCombine {
 }
 
 impl WhereCombine {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             WhereCombine::And => "AND",
             WhereCombine::Or => "OR",
         }
     }
 
-    fn description(self) -> &'static str {
+    pub(super) fn description(self) -> &'static str {
         match self {
             WhereCombine::And => "all clauses must match",
             WhereCombine::Or => "any clause may match",
@@ -1254,7 +1252,7 @@ impl FilterEditState {
         state
     }
 
-    fn fields(&self) -> &'static [FormField] {
+    pub(super) fn fields(&self) -> &'static [FormField] {
         match self.kind {
             FilterKind::FromLines
             | FilterKind::FromFields
@@ -1300,7 +1298,7 @@ impl FilterEditState {
         }
     }
 
-    fn form_lines(&self) -> u16 {
+    pub(super) fn form_lines(&self) -> u16 {
         self.fields().iter().map(|f| self.field_height(*f)).sum()
     }
 
@@ -1366,18 +1364,18 @@ impl FilterEditState {
         }
     }
 
-    fn selected_column(&self) -> Option<&str> {
+    pub(super) fn selected_column(&self) -> Option<&str> {
         let idx = self.active_clause().map(|c| c.column)?;
         self.available_columns.get(idx).map(|s| s.as_str())
     }
 
-    fn active_op(&self) -> WhereOp {
+    pub(super) fn active_op(&self) -> WhereOp {
         self.active_clause()
             .map(|c| c.op)
             .unwrap_or(WhereOp::Matches)
     }
 
-    fn active_pattern(&self) -> &str {
+    pub(super) fn active_pattern(&self) -> &str {
         self.active_clause()
             .map(|c| c.pattern.as_str())
             .unwrap_or("")
@@ -1401,7 +1399,7 @@ impl FilterEditState {
         self.n_input.trim().parse().ok()
     }
 
-    fn build_filter(&self) -> Option<FilterSpec> {
+    pub(super) fn build_filter(&self) -> Option<FilterSpec> {
         match self.kind {
             FilterKind::FromLines => Some(FilterSpec::FromLines),
             FilterKind::FromFields => Some(FilterSpec::FromFields),
@@ -5524,65 +5522,6 @@ fn collapse_home_in_path(p: &std::path::Path) -> String {
     p.display().to_string()
 }
 
-fn draw_filter_edit(f: &mut Frame, app: &App) {
-    let Some(state) = app.filter_edit.as_ref() else {
-        return;
-    };
-    let Some(shed) = app.session.shed(state.shed_id) else {
-        return;
-    };
-
-    let stack_rows = match state.mode {
-        EditMode::Add | EditMode::Insert(_) => shed.pipeline.len() + 1,
-        EditMode::Edit(_) => shed.pipeline.len(),
-    };
-    let stack_height = stack_rows.max(1) as u16 + 2;
-    let form_height = state.form_lines() + 2;
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(stack_height),
-            Constraint::Length(form_height),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let outcome = hypothetical_outcome(shed, state);
-    let drops: Vec<usize> = outcome
-        .as_ref()
-        .and_then(|r| r.as_ref().ok())
-        .map(|(_, d)| d.clone())
-        .unwrap_or_default();
-
-    let title = format!("editing  %{}  {}", shed.id.0, shed.argv.join(" "));
-    draw_header(f, chunks[0], &title);
-    draw_preview_pane(f, chunks[1], &outcome);
-    draw_stack_pane(f, chunks[2], shed, state, &drops);
-    draw_form_pane(f, chunks[3], state);
-    render::draw_status(f, chunks[4], app);
-}
-
-fn hypothetical_outcome(
-    shed: &Shed,
-    state: &FilterEditState,
-) -> Option<Result<(PipelineValue, Vec<usize>), String>> {
-    let capture = shed.capture.as_ref()?;
-    let mut hypothetical: Vec<FilterSpec> = shed.pipeline.clone();
-    match (state.mode, state.build_filter()) {
-        (EditMode::Add, Some(spec)) => hypothetical.push(spec),
-        (EditMode::Edit(i), Some(spec)) if i < hypothetical.len() => hypothetical[i] = spec,
-        (EditMode::Insert(i), Some(spec)) => {
-            let pos = i.min(hypothetical.len());
-            hypothetical.insert(pos, spec);
-        }
-        _ => {}
-    }
-    Some(apply_pipeline(capture, &hypothetical))
-}
-
 /// Apply a pipeline of filters. Returns the final value plus per-filter
 /// drop counts (rows silently filtered by a `where` due to type mismatch),
 /// indexed by filter position in the pipeline.
@@ -5605,521 +5544,6 @@ fn apply_pipeline(
         }
     }
     Ok((value, drops))
-}
-
-fn draw_preview_pane(
-    f: &mut Frame,
-    area: Rect,
-    outcome: &Option<Result<(PipelineValue, Vec<usize>), String>>,
-) {
-    let pane = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("preview", Style::default().fg(Color::Cyan)),
-            Span::raw(" "),
-        ]));
-    let inner = pane.inner(area);
-    f.render_widget(pane, area);
-
-    let max_rows = inner.height.saturating_sub(2) as usize;
-    let max = max_rows.max(3);
-    let lines = match outcome {
-        None => vec![Line::from(Span::styled(
-            "      (no capture)",
-            Style::default().fg(Color::DarkGray),
-        ))],
-        Some(Ok((value, _))) => {
-            render_pipeline_value_with_max(value.clone(), max, false, &mut Vec::new())
-        }
-        Some(Err(e)) => filter_error_lines(e),
-    };
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
-}
-
-fn draw_stack_pane(
-    f: &mut Frame,
-    area: Rect,
-    shed: &Shed,
-    state: &FilterEditState,
-    drops: &[usize],
-) {
-    let shed_widget = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("pipeline", Style::default().fg(Color::Cyan)),
-            Span::raw(" "),
-        ]));
-    let inner = shed_widget.inner(area);
-    f.render_widget(shed_widget, area);
-
-    let active_label = match state.build_filter() {
-        Some(spec) => describe_filter(&spec),
-        None => format!("{} (incomplete)", state.kind.name()),
-    };
-    let edit_style = Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let normal = Style::default().fg(Color::LightCyan);
-
-    let warn = Style::default().fg(Color::Yellow);
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, spec) in shed.pipeline.iter().enumerate() {
-        // Insert mode: emit the in-progress row before the existing
-        // filter at the insert index. The hypothetical pipeline has the
-        // new filter at index i, so drops[i] reports the new filter's
-        // type-mismatch count; drops indices for existing filters at or
-        // after the insert position shift up by one.
-        if state.mode == EditMode::Insert(i) {
-            let n = drops.get(i).copied().unwrap_or(0);
-            let mut spans = vec![
-                Span::styled("  ▸ ", edit_style),
-                Span::styled(active_label.clone(), edit_style),
-                Span::styled(format!("  ← inserting before {}", circled(i + 1)), dim),
-            ];
-            if n > 0 {
-                spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
-            }
-            lines.push(Line::from(spans));
-        }
-
-        let is_editing_here = state.mode == EditMode::Edit(i);
-        let (label, style, suffix) = if is_editing_here {
-            (active_label.clone(), edit_style, Some("  ← editing"))
-        } else {
-            (describe_filter(spec), normal, None)
-        };
-        let mut spans = vec![
-            Span::styled(format!("  {} ", circled(i + 1)), dim),
-            Span::styled(label, style),
-        ];
-        if let Some(s) = suffix {
-            spans.push(Span::styled(s, dim));
-        }
-        // For Insert mode, the existing filter at original index i
-        // lives in hypothetical at i+1, so use the shifted drops index.
-        let drops_idx = match state.mode {
-            EditMode::Insert(j) if i >= j => i + 1,
-            _ => i,
-        };
-        let n = drops.get(drops_idx).copied().unwrap_or(0);
-        if n > 0 {
-            spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
-        }
-        lines.push(Line::from(spans));
-    }
-    if state.mode == EditMode::Add {
-        let mut spans = vec![
-            Span::styled(
-                format!("  {} ", circled(shed.pipeline.len() + 1)),
-                edit_style,
-            ),
-            Span::styled(active_label, edit_style),
-            Span::styled("  ← editing", dim),
-        ];
-        let n = drops.get(shed.pipeline.len()).copied().unwrap_or(0);
-        if n > 0 {
-            spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
-}
-
-fn circled(n: usize) -> String {
-    const SYMS: &[&str] = &["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
-    SYMS.get(n.saturating_sub(1))
-        .copied()
-        .unwrap_or("●")
-        .to_string()
-}
-
-fn draw_form_pane(f: &mut Frame, area: Rect, state: &FilterEditState) {
-    let title = state.kind.name().to_string();
-    let shed_widget = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(title, Style::default().fg(Color::Magenta)),
-            Span::raw(" "),
-        ]));
-    let inner = shed_widget.inner(area);
-    f.render_widget(shed_widget, area);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for field in state.fields() {
-        match *field {
-            FormField::SortKeys => lines.extend(render_sort_keys_field(state)),
-            FormField::RenameMap => lines.extend(render_rename_map_field(state)),
-            _ => lines.push(render_form_row(state, *field)),
-        }
-    }
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
-}
-
-fn render_rename_map_field(state: &FilterEditState) -> Vec<Line<'static>> {
-    let active = state.field == FormField::RenameMap;
-    let label_first = format!("  {:>8}: ", "rename");
-    let label_rest: String = " ".repeat(label_first.chars().count());
-
-    let label_style = if active {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    if state.available_columns.is_empty() {
-        return vec![Line::from(vec![
-            Span::styled(label_first, label_style),
-            Span::styled(
-                "(no columns — pipeline output is bytes; add a parser)",
-                Style::default().fg(Color::Red),
-            ),
-        ])];
-    }
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, col) in state.available_columns.iter().enumerate() {
-        let on_cursor = active && i == state.rename_cursor;
-        let label = if i == 0 {
-            Span::styled(label_first.clone(), label_style)
-        } else {
-            Span::raw(label_rest.clone())
-        };
-        let to = state.rename_to_inputs.get(i).cloned().unwrap_or_default();
-
-        let from_style = if on_cursor {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let arrow_style = Style::default().fg(Color::DarkGray);
-        let to_style = if on_cursor {
-            Style::default().fg(Color::White)
-        } else if to.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Magenta)
-        };
-
-        let mut spans = vec![
-            label,
-            Span::styled(col.to_string(), from_style),
-            Span::styled(" → ", arrow_style),
-        ];
-        if to.is_empty() && !on_cursor {
-            spans.push(Span::styled(
-                "(unchanged)".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ));
-        } else {
-            spans.push(Span::styled(to.clone(), to_style));
-        }
-        if on_cursor {
-            spans.push(Span::styled("▏", Style::default().fg(Color::Magenta)));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
-}
-
-fn render_sort_keys_field(state: &FilterEditState) -> Vec<Line<'static>> {
-    let active = state.field == FormField::SortKeys;
-    let label_first = format!("  {:>8}: ", "keys");
-    let label_rest: String = " ".repeat(label_first.chars().count());
-
-    let label_style = if active {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    if state.available_columns.is_empty() {
-        return vec![Line::from(vec![
-            Span::styled(label_first, label_style),
-            Span::styled(
-                "(no columns — pipeline output is bytes; add a parser)",
-                Style::default().fg(Color::Red),
-            ),
-        ])];
-    }
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-    let normal = Style::default().fg(Color::White);
-    let dim = Style::default().fg(Color::DarkGray);
-
-    for (i, (col_idx, dir)) in state.sort_keys.iter().enumerate() {
-        let on_cursor = active && i == state.sort_keys_cursor;
-        let label = if i == 0 {
-            Span::styled(label_first.clone(), label_style)
-        } else {
-            Span::raw(label_rest.clone())
-        };
-        let col = state
-            .available_columns
-            .get(*col_idx)
-            .map(String::as_str)
-            .unwrap_or("?");
-        let dir_glyph = match dir {
-            SortDirection::Asc => "↑",
-            SortDirection::Desc => "↓",
-        };
-        let mut spans = vec![label];
-        if on_cursor {
-            spans.push(Span::styled("◂ ", Style::default().fg(Color::Magenta)));
-        }
-        spans.push(Span::styled(
-            format!("{col} {dir_glyph}"),
-            if on_cursor { highlight } else { normal },
-        ));
-        if on_cursor {
-            spans.push(Span::styled(" ▸", Style::default().fg(Color::Magenta)));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    if state.sort_keys.len() < MAX_SORT_KEYS {
-        let on_cursor = active && state.sort_keys_cursor == state.sort_keys.len();
-        let label = if state.sort_keys.is_empty() {
-            Span::styled(label_first.clone(), label_style)
-        } else {
-            Span::raw(label_rest.clone())
-        };
-        let mut spans = vec![label];
-        if on_cursor {
-            spans.push(Span::styled("◂ ", Style::default().fg(Color::Magenta)));
-        }
-        spans.push(Span::styled(
-            "+ add (a)".to_string(),
-            if on_cursor { highlight } else { dim },
-        ));
-        if on_cursor {
-            spans.push(Span::styled(" ▸", Style::default().fg(Color::Magenta)));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    lines
-}
-
-fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
-    let active = state.field == field;
-    let label = match field {
-        FormField::Kind => "filter",
-        FormField::Column => "column",
-        FormField::Op => "op",
-        FormField::Pattern => state.active_op().value_label(),
-        FormField::N => "n",
-        FormField::Columns => "columns",
-        FormField::CsvDelim => "delim",
-        FormField::CsvHasHeader => "header",
-        FormField::RegexPattern => "regex",
-        FormField::SortKeys => "keys",
-        FormField::RenameMap => "rename",
-        FormField::WhereCombine => "combine",
-        FormField::WhereClauseSelect => "clause",
-        FormField::TargetColumn => "column",
-        FormField::DelimText => "delim",
-    };
-    let label_style = if active {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let label_span = Span::styled(format!("  {label:>8}: "), label_style);
-
-    let value_spans: Vec<Span<'static>> = match field {
-        FormField::Kind => render_select_value(state.kind.name(), state.kind.description(), active),
-        FormField::Column => {
-            if state.available_columns.is_empty() {
-                vec![Span::styled(
-                    "(no columns — pipeline output is bytes; add a parser)",
-                    Style::default().fg(Color::Red),
-                )]
-            } else {
-                let col = state.selected_column().unwrap_or("");
-                render_select_value(col, "", active)
-            }
-        }
-        FormField::Op => {
-            let op = state.active_op();
-            render_select_value(op.name(), op.description(), active)
-        }
-        FormField::Pattern => {
-            let op = state.active_op();
-            let empty_hint = match op {
-                WhereOp::Matches | WhereOp::Contains => "(empty: matches everything)",
-                _ => "(unset)",
-            };
-            render_text_field(state.active_pattern(), active, empty_hint)
-        }
-        FormField::N => render_text_field(&state.n_input, active, "(unset)"),
-        FormField::Columns => render_columns_field(state, active),
-        FormField::CsvDelim => render_select_value(delim_label(state.csv_delim), "", active),
-        FormField::CsvHasHeader => render_select_value(
-            if state.csv_has_header {
-                "true"
-            } else {
-                "false"
-            },
-            if state.csv_has_header {
-                "first row is column names"
-            } else {
-                "auto-name columns _1, _2, …"
-            },
-            active,
-        ),
-        FormField::RegexPattern => render_text_field(
-            &state.regex_pattern,
-            active,
-            "(empty: matches nothing — use named groups like (?<col>…))",
-        ),
-        FormField::SortKeys | FormField::RenameMap => {
-            // Multi-line — handled separately.
-            return Line::from("");
-        }
-        FormField::WhereCombine => render_select_value(
-            state.where_combine.name(),
-            state.where_combine.description(),
-            active,
-        ),
-        FormField::WhereClauseSelect => {
-            let total = state.where_clauses.len();
-            let label = format!("{} of {}", circled(state.where_active_clause + 1), total,);
-            let desc = if active {
-                "←→ select  a add  x remove"
-            } else {
-                ""
-            };
-            render_select_value(&label, desc, active)
-        }
-        FormField::TargetColumn => {
-            if state.available_columns.is_empty() {
-                vec![Span::styled(
-                    "(no columns — pipeline output is bytes; add a parser)",
-                    Style::default().fg(Color::Red),
-                )]
-            } else {
-                let col = state
-                    .available_columns
-                    .get(state.target_column)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                render_select_value(col, "", active)
-            }
-        }
-        FormField::DelimText => render_text_field(
-            &state.delim_text,
-            active,
-            "(empty: no split / no separator)",
-        ),
-    };
-
-    let mut all = vec![label_span];
-    all.extend(value_spans);
-    Line::from(all)
-}
-
-fn render_text_field(value: &str, active: bool, empty_hint: &'static str) -> Vec<Span<'static>> {
-    let cursor_marker = if active { "▏" } else { "" };
-    let value_style = if active {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let mut spans = Vec::new();
-    spans.push(Span::styled(value.to_string(), value_style));
-    spans.push(Span::styled(
-        cursor_marker,
-        Style::default().fg(Color::Magenta),
-    ));
-    if value.is_empty() && !active {
-        spans.push(Span::styled(
-            empty_hint,
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans
-}
-
-fn render_columns_field(state: &FilterEditState, active: bool) -> Vec<Span<'static>> {
-    if state.available_columns.is_empty() {
-        return vec![Span::styled(
-            "(no columns — pipeline output is bytes; add a parser)",
-            Style::default().fg(Color::Red),
-        )];
-    }
-    let mut spans = Vec::new();
-    for (i, col) in state.available_columns.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let check = if state.column_selections[i] {
-            "☑"
-        } else {
-            "☐"
-        };
-        let on_cursor = active && i == state.column_cursor;
-        let style = if on_cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else if state.column_selections[i] {
-            Style::default().fg(Color::Magenta)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(format!(" {check} {col} "), style));
-    }
-    spans
-}
-
-fn render_select_value(value: &str, description: &str, active: bool) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if active {
-        spans.push(Span::styled("◂ ", Style::default().fg(Color::Magenta)));
-    }
-    spans.push(Span::styled(
-        value.to_string(),
-        if active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        },
-    ));
-    if active {
-        spans.push(Span::styled(" ▸", Style::default().fg(Color::Magenta)));
-    }
-    if !description.is_empty() {
-        spans.push(Span::styled(
-            format!("   {description}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    spans
 }
 
 #[cfg(test)]
