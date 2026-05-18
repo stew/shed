@@ -453,13 +453,13 @@ pub(super) fn render_shed(
                 Style::default().fg(Color::Magenta),
             )));
         }
-        if let Some(code) = capture.exit_code {
-            if code != 0 {
-                lines.push(Line::from(Span::styled(
-                    format!(" exit {code}"),
-                    Style::default().fg(Color::Red),
-                )));
-            }
+        if let Some(code) = capture.exit_code
+            && code != 0
+        {
+            lines.push(Line::from(Span::styled(
+                format!(" exit {code}"),
+                Style::default().fg(Color::Red),
+            )));
         }
     } else if let ShedState::Done(code) = &shed.state {
         let mut spans = vec![Span::styled(
@@ -1459,42 +1459,42 @@ fn draw_one_shed(
 }
 
 pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(prompt) = app.exit_prompt {
-        if prompt == ExitPrompt::Confirm {
-            let widget = Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    "unsaved changes — save before quitting?",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    "[y]es",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    "[n]o",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    "[c]ancel",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]))
-            .style(Style::default().bg(Color::DarkGray));
-            f.render_widget(widget, area);
-            return;
-        }
-        // AwaitingPath falls through; the save_input_mode bar takes over.
+    if let Some(prompt) = app.exit_prompt
+        && prompt == ExitPrompt::Confirm
+    {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "unsaved changes — save before quitting?",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[y]es",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[n]o",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[c]ancel",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
     }
+    // AwaitingPath falls through; the save_input_mode bar takes over.
     if app.is_input(InputKind::Save) {
         f.render_widget(
             render_input_bar(

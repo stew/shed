@@ -82,18 +82,17 @@ impl TabSlot {
     }
 
     pub(super) fn display_title(&self, index: usize) -> String {
-        if let Some(t) = &self.title {
-            if !t.is_empty() {
-                return t.clone();
-            }
+        if let Some(t) = &self.title
+            && !t.is_empty()
+        {
+            return t.clone();
         }
         // Fall back to the notebook basename if one is bound.
-        if let Some(stashed) = &self.stashed {
-            if let Some(p) = &stashed.notebook_path {
-                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    return name.to_string();
-                }
-            }
+        if let Some(stashed) = &self.stashed
+            && let Some(p) = &stashed.notebook_path
+            && let Some(name) = p.file_name().and_then(|s| s.to_str())
+        {
+            return name.to_string();
         }
         format!("tab {}", index + 1)
     }
@@ -317,16 +316,14 @@ pub(super) fn try_handle_tab_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     // Alt-1..Alt-9: jump to tab N (1-indexed). Out-of-range is a no-op.
-    if alt {
-        if let KeyCode::Char(c) = key.code {
-            if let Some(d) = c.to_digit(10) {
-                if (1..=9).contains(&d) {
-                    let idx = (d as usize) - 1;
-                    app.switch_to_tab(idx);
-                    return true;
-                }
-            }
-        }
+    if alt
+        && let KeyCode::Char(c) = key.code
+        && let Some(d) = c.to_digit(10)
+        && (1..=9).contains(&d)
+    {
+        let idx = (d as usize) - 1;
+        app.switch_to_tab(idx);
+        return true;
     }
     // F2: rename active tab.
     if matches!(key.code, KeyCode::F(2)) {
@@ -378,11 +375,11 @@ pub(super) async fn drive_all_tabs(app: &mut App) {
     // Active tab first.
     let active_a = drain_streams(app);
     let active_b = reap_completed(app).await;
-    if active_a || active_b {
-        if let Some(slot) = app.tabs.get_mut(saved_active) {
-            slot.activity_seq = slot.activity_seq.saturating_add(1);
-            slot.last_viewed_seq = slot.activity_seq;
-        }
+    if (active_a || active_b)
+        && let Some(slot) = app.tabs.get_mut(saved_active)
+    {
+        slot.activity_seq = slot.activity_seq.saturating_add(1);
+        slot.last_viewed_seq = slot.activity_seq;
     }
     // Each background tab, temporarily swapped into the App slots.
     for i in 0..app.tabs.len() {
@@ -405,10 +402,10 @@ pub(super) async fn drive_all_tabs(app: &mut App) {
         let new_stash = app.stash_active();
         app.tabs[i].stashed = Some(new_stash);
         app.restore_stashed(prev);
-        if bg_a || bg_b {
-            if let Some(slot) = app.tabs.get_mut(i) {
-                slot.activity_seq = slot.activity_seq.saturating_add(1);
-            }
+        if (bg_a || bg_b)
+            && let Some(slot) = app.tabs.get_mut(i)
+        {
+            slot.activity_seq = slot.activity_seq.saturating_add(1);
         }
     }
 }

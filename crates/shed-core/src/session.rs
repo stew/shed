@@ -143,10 +143,10 @@ impl Session {
     }
 
     pub fn unpin(&mut self, id: ShedId) {
-        if let Some(b) = self.sheds.get_mut(&id) {
-            if let Some(name) = b.name.take() {
-                self.names.remove(&name);
-            }
+        if let Some(b) = self.sheds.get_mut(&id)
+            && let Some(name) = b.name.take()
+        {
+            self.names.remove(&name);
         }
     }
 

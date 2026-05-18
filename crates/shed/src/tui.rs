@@ -554,13 +554,13 @@ const ACTIONS: &[Action] = &[
         description: "Re-run the shed's command (edited) with the same pipeline",
         enabled: shed_selected,
         handler: |app| {
-            if let Some(id) = app.session.cursor() {
-                if let Some(shed) = app.session.shed(id) {
-                    let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
-                        .unwrap_or_else(|_| shed.argv.join(" "));
-                    app.open_input(InputKind::Rerun, joined);
-                    app.rerun_source_id = Some(id);
-                }
+            if let Some(id) = app.session.cursor()
+                && let Some(shed) = app.session.shed(id)
+            {
+                let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
+                    .unwrap_or_else(|_| shed.argv.join(" "));
+                app.open_input(InputKind::Rerun, joined);
+                app.rerun_source_id = Some(id);
             }
             app.focus = Focus::ShedCursor;
         },
@@ -1213,10 +1213,10 @@ impl FilterEditState {
             Some(FilterSpec::Rename { pairs }) => {
                 state.kind = FilterKind::Rename;
                 for (from, to) in pairs {
-                    if let Some(i) = state.available_columns.iter().position(|c| c == from) {
-                        if let Some(slot) = state.rename_to_inputs.get_mut(i) {
-                            *slot = to.clone();
-                        }
+                    if let Some(i) = state.available_columns.iter().position(|c| c == from)
+                        && let Some(slot) = state.rename_to_inputs.get_mut(i)
+                    {
+                        *slot = to.clone();
                     }
                 }
             }
@@ -1947,11 +1947,11 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
         if let Some(req) = app.pending_rerun.take() {
             perform_rerun(&mut app, req).await;
         }
-        if app.chain_in_flight.is_none() {
-            if let Some(next) = app.pending_run_chain.pop_front() {
-                app.chain_in_flight = Some(next);
-                perform_run_in_place(&mut app, next).await;
-            }
+        if app.chain_in_flight.is_none()
+            && let Some(next) = app.pending_run_chain.pop_front()
+        {
+            app.chain_in_flight = Some(next);
+            perform_run_in_place(&mut app, next).await;
         }
         // Drive every tab so background tabs keep streaming output and
         // reaping finished children; advance_run_chain runs only for the
@@ -2015,10 +2015,10 @@ async fn perform_rerun(app: &mut App, req: RerunRequest) {
 
     app.savepoint();
     let id = app.session.add_shed(req.argv.clone());
-    if !req.pipeline.is_empty() {
-        if let Some(shed) = app.session.shed_mut(id) {
-            shed.pipeline = req.pipeline;
-        }
+    if !req.pipeline.is_empty()
+        && let Some(shed) = app.session.shed_mut(id)
+    {
+        shed.pipeline = req.pipeline;
     }
     match exec::spawn_command(req.argv, CAPTURE_CAP).await {
         Ok((handle, killer, chunks)) => {
@@ -2055,15 +2055,15 @@ enum ShedRef {
 /// Parse a single argv token as a [`ShedRef`]. The bare prefixes `@`
 /// and `%` alone, or `%foo` (not all digits), return `None`.
 fn parse_shed_ref(token: &str) -> Option<ShedRef> {
-    if let Some(name) = token.strip_prefix('@') {
-        if !name.is_empty() {
-            return Some(ShedRef::Name(name.to_string()));
-        }
+    if let Some(name) = token.strip_prefix('@')
+        && !name.is_empty()
+    {
+        return Some(ShedRef::Name(name.to_string()));
     }
-    if let Some(rest) = token.strip_prefix('%') {
-        if let Ok(n) = rest.parse::<u64>() {
-            return Some(ShedRef::Id(ShedId(n)));
-        }
+    if let Some(rest) = token.strip_prefix('%')
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return Some(ShedRef::Id(ShedId(n)));
     }
     None
 }
@@ -2132,15 +2132,13 @@ fn build_run_chain(
         Some(b) => b,
         None => return chain,
     };
-    if let Some(r) = shed_ref_of(&shed.argv) {
-        if let Some(src_id) = resolve_shed_ref(session, &r) {
-            if let Some(src) = session.shed(src_id) {
-                if matches!(src.state, ShedState::Idle | ShedState::Running) {
-                    let mut sub = build_run_chain(session, src_id, visited);
-                    chain.append(&mut sub);
-                }
-            }
-        }
+    if let Some(r) = shed_ref_of(&shed.argv)
+        && let Some(src_id) = resolve_shed_ref(session, &r)
+        && let Some(src) = session.shed(src_id)
+        && matches!(src.state, ShedState::Idle | ShedState::Running)
+    {
+        let mut sub = build_run_chain(session, src_id, visited);
+        chain.append(&mut sub);
     }
     chain.push(target);
     chain
@@ -2816,10 +2814,10 @@ fn apply_snapshot(app: &mut App, snap: Session) {
 /// slot, the cursor, child processes whose sheds vanished. Also
 /// rebases `pipeline_cursor` on the (possibly new) cursor shed.
 fn sanitize_after_restore(app: &mut App) {
-    if let Some(id) = app.session.cursor() {
-        if app.session.shed(id).is_none() {
-            app.session.set_cursor(app.newest_shed_id());
-        }
+    if let Some(id) = app.session.cursor()
+        && app.session.shed(id).is_none()
+    {
+        app.session.set_cursor(app.newest_shed_id());
     }
     app.command_focused = false;
     app.reset_pipeline_cursor();
@@ -3097,10 +3095,10 @@ fn handle_palette_key(app: &mut App, key: KeyEvent) {
                 .as_ref()
                 .map(|s| matches_for_input(&s.input, app).len())
                 .unwrap_or(0);
-            if let Some(state) = app.palette_state.as_mut() {
-                if matches_len > 0 {
-                    state.cursor = (state.cursor + 1).min(matches_len - 1);
-                }
+            if let Some(state) = app.palette_state.as_mut()
+                && matches_len > 0
+            {
+                state.cursor = (state.cursor + 1).min(matches_len - 1);
             }
         }
         KeyCode::Enter => commit_palette(app),
@@ -3283,18 +3281,18 @@ fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16
                     action: ContextMenuAction::InsertAtPrompt(trimmed.clone()),
                 });
             }
-            if let Some(base) = path_basename(&trimmed) {
-                if base != trimmed {
+            if let Some(base) = path_basename(&trimmed)
+                && base != trimmed
+            {
+                items.push(ContextMenuItem {
+                    label: "Copy filename".into(),
+                    action: ContextMenuAction::CopyText(base.clone()),
+                });
+                if app.focus == Focus::Prompt {
                     items.push(ContextMenuItem {
-                        label: "Copy filename".into(),
-                        action: ContextMenuAction::CopyText(base.clone()),
+                        label: "Add filename to prompt".into(),
+                        action: ContextMenuAction::InsertAtPrompt(base),
                     });
-                    if app.focus == Focus::Prompt {
-                        items.push(ContextMenuItem {
-                            label: "Add filename to prompt".into(),
-                            action: ContextMenuAction::InsertAtPrompt(base),
-                        });
-                    }
                 }
             }
         }
@@ -3666,16 +3664,12 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             app.prompt_cursor = app.prompt.len();
             app.history_cursor = None;
         }
-        KeyCode::Char('v') => {
-            if app.session.cursor().is_some() {
-                app.expand_scroll = 0;
-                app.focus = Focus::ShedExpand;
-            }
+        KeyCode::Char('v') if app.session.cursor().is_some() => {
+            app.expand_scroll = 0;
+            app.focus = Focus::ShedExpand;
         }
-        KeyCode::Char('w') => {
-            if app.session.cursor().is_some() {
-                app.open_input(InputKind::Write, String::new());
-            }
+        KeyCode::Char('w') if app.session.cursor().is_some() => {
+            app.open_input(InputKind::Write, String::new());
         }
         KeyCode::Char('p') => {
             if let Some(id) = app.session.cursor() {
@@ -3701,13 +3695,13 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('r') => {
-            if let Some(id) = app.session.cursor() {
-                if let Some(shed) = app.session.shed(id) {
-                    let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
-                        .unwrap_or_else(|_| shed.argv.join(" "));
-                    app.open_input(InputKind::Rerun, joined);
-                    app.rerun_source_id = Some(id);
-                }
+            if let Some(id) = app.session.cursor()
+                && let Some(shed) = app.session.shed(id)
+            {
+                let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
+                    .unwrap_or_else(|_| shed.argv.join(" "));
+                app.open_input(InputKind::Rerun, joined);
+                app.rerun_source_id = Some(id);
             }
         }
         _ => {}
@@ -4495,40 +4489,34 @@ fn handle_sort_keys_key(state: &mut FilterEditState, key: KeyEvent) {
         KeyCode::Down => {
             state.sort_keys_cursor = (state.sort_keys_cursor + 1).min(last_visible);
         }
-        KeyCode::Left | KeyCode::Right => {
-            if state.sort_keys_cursor < n {
-                let cols = state.available_columns.len() as i32;
-                let delta: i32 = if matches!(key.code, KeyCode::Right) {
-                    1
-                } else {
-                    -1
-                };
-                let cur = state.sort_keys[state.sort_keys_cursor].0 as i32;
-                let new = (cur + delta).rem_euclid(cols) as usize;
-                state.sort_keys[state.sort_keys_cursor].0 = new;
-            }
+        KeyCode::Left | KeyCode::Right if state.sort_keys_cursor < n => {
+            let cols = state.available_columns.len() as i32;
+            let delta: i32 = if matches!(key.code, KeyCode::Right) {
+                1
+            } else {
+                -1
+            };
+            let cur = state.sort_keys[state.sort_keys_cursor].0 as i32;
+            let new = (cur + delta).rem_euclid(cols) as usize;
+            state.sort_keys[state.sort_keys_cursor].0 = new;
         }
-        KeyCode::Char(' ') => {
-            if state.sort_keys_cursor < n {
-                let cur = state.sort_keys[state.sort_keys_cursor].1;
-                state.sort_keys[state.sort_keys_cursor].1 = match cur {
-                    SortDirection::Asc => SortDirection::Desc,
-                    SortDirection::Desc => SortDirection::Asc,
-                };
-            }
+        KeyCode::Char(' ') if state.sort_keys_cursor < n => {
+            let cur = state.sort_keys[state.sort_keys_cursor].1;
+            state.sort_keys[state.sort_keys_cursor].1 = match cur {
+                SortDirection::Asc => SortDirection::Desc,
+                SortDirection::Desc => SortDirection::Asc,
+            };
         }
-        KeyCode::Char('a') => {
-            if n < MAX_SORT_KEYS {
-                state.sort_keys.push((0, SortDirection::Asc));
-                state.sort_keys_cursor = state.sort_keys.len() - 1;
-            }
+        KeyCode::Char('a') if n < MAX_SORT_KEYS => {
+            state.sort_keys.push((0, SortDirection::Asc));
+            state.sort_keys_cursor = state.sort_keys.len() - 1;
         }
-        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
-            if state.sort_keys_cursor < n && state.sort_keys.len() > 1 {
-                state.sort_keys.remove(state.sort_keys_cursor);
-                if state.sort_keys_cursor >= state.sort_keys.len() {
-                    state.sort_keys_cursor = state.sort_keys.len().saturating_sub(1);
-                }
+        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete
+            if state.sort_keys_cursor < n && state.sort_keys.len() > 1 =>
+        {
+            state.sort_keys.remove(state.sort_keys_cursor);
+            if state.sort_keys_cursor >= state.sort_keys.len() {
+                state.sort_keys_cursor = state.sort_keys.len().saturating_sub(1);
             }
         }
         _ => {}
@@ -4581,15 +4569,13 @@ fn handle_where_combine_key(state: &mut FilterEditState, key: KeyEvent) {
 
 fn handle_where_clause_select_key(state: &mut FilterEditState, key: KeyEvent) {
     match key.code {
-        KeyCode::Left | KeyCode::Up => {
-            if state.where_active_clause > 0 {
-                state.where_active_clause -= 1;
-            }
+        KeyCode::Left | KeyCode::Up if state.where_active_clause > 0 => {
+            state.where_active_clause -= 1;
         }
-        KeyCode::Right | KeyCode::Down => {
-            if state.where_active_clause + 1 < state.where_clauses.len() {
-                state.where_active_clause += 1;
-            }
+        KeyCode::Right | KeyCode::Down
+            if state.where_active_clause + 1 < state.where_clauses.len() =>
+        {
+            state.where_active_clause += 1;
         }
         KeyCode::Char('a') => {
             state
@@ -4597,12 +4583,12 @@ fn handle_where_clause_select_key(state: &mut FilterEditState, key: KeyEvent) {
                 .push(WhereClause::default_for(&state.available_columns));
             state.where_active_clause = state.where_clauses.len() - 1;
         }
-        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete => {
-            if state.where_clauses.len() > 1 {
-                state.where_clauses.remove(state.where_active_clause);
-                if state.where_active_clause >= state.where_clauses.len() {
-                    state.where_active_clause = state.where_clauses.len() - 1;
-                }
+        KeyCode::Char('x') | KeyCode::Backspace | KeyCode::Delete
+            if state.where_clauses.len() > 1 =>
+        {
+            state.where_clauses.remove(state.where_active_clause);
+            if state.where_active_clause >= state.where_clauses.len() {
+                state.where_active_clause = state.where_clauses.len() - 1;
             }
         }
         _ => {}
@@ -4814,11 +4800,12 @@ async fn spawn_prompt(app: &mut App) {
     // saved alias materialises a shed with that alias's argv + pipeline
     // and drops the user into in-place command edit so they can append
     // args before running. Multi-token inputs bypass the lookup.
-    if !force_fullscreen && argv.len() == 1 {
-        if let Some(alias) = app.aliases.lookup(&argv[0]).cloned() {
-            spawn_alias(app, &alias);
-            return;
-        }
+    if !force_fullscreen
+        && argv.len() == 1
+        && let Some(alias) = app.aliases.lookup(&argv[0]).cloned()
+    {
+        spawn_alias(app, &alias);
+        return;
     }
 
     if force_fullscreen || needs_fullscreen(&argv) {
@@ -5000,16 +4987,12 @@ fn handle_note_edit_key(app: &mut App, key: KeyEvent) {
             state.buffer.insert(state.cursor, c);
             state.cursor += 1;
         }
-        KeyCode::Backspace => {
-            if state.cursor > 0 {
-                state.buffer.remove(state.cursor - 1);
-                state.cursor -= 1;
-            }
+        KeyCode::Backspace if state.cursor > 0 => {
+            state.buffer.remove(state.cursor - 1);
+            state.cursor -= 1;
         }
-        KeyCode::Delete => {
-            if state.cursor < state.buffer.len() {
-                state.buffer.remove(state.cursor);
-            }
+        KeyCode::Delete if state.cursor < state.buffer.len() => {
+            state.buffer.remove(state.cursor);
         }
         KeyCode::Left => {
             state.cursor = state.cursor.saturating_sub(1);
@@ -5283,10 +5266,10 @@ fn expand_tilde(s: &str) -> PathBuf {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home);
         }
-    } else if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    } else if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(s)
 }
@@ -5309,27 +5292,27 @@ fn handle_alias_manage_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(state) = app.alias_manage.as_mut() {
-                if total > 0 {
-                    state.cursor = (state.cursor + 1).min(total - 1);
-                }
+            if let Some(state) = app.alias_manage.as_mut()
+                && total > 0
+            {
+                state.cursor = (state.cursor + 1).min(total - 1);
             }
         }
         KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete => {
             let cursor = app.alias_manage.as_ref().map(|s| s.cursor).unwrap_or(0);
-            if let Some(alias) = app.aliases.aliases.get(cursor).cloned() {
-                if app.aliases.delete(&alias.name) {
-                    persist_aliases(app);
-                    let new_total = app.aliases.aliases.len();
-                    if let Some(state) = app.alias_manage.as_mut() {
-                        if new_total > 0 {
-                            state.cursor = state.cursor.min(new_total - 1);
-                        } else {
-                            state.cursor = 0;
-                        }
+            if let Some(alias) = app.aliases.aliases.get(cursor).cloned()
+                && app.aliases.delete(&alias.name)
+            {
+                persist_aliases(app);
+                let new_total = app.aliases.aliases.len();
+                if let Some(state) = app.alias_manage.as_mut() {
+                    if new_total > 0 {
+                        state.cursor = state.cursor.min(new_total - 1);
+                    } else {
+                        state.cursor = 0;
                     }
-                    app.flash = Some(format!("deleted alias {}", alias.name));
                 }
+                app.flash = Some(format!("deleted alias {}", alias.name));
             }
         }
         _ => {}
@@ -5540,12 +5523,11 @@ fn insert_at_prompt(app: &mut App, text: &str) {
 }
 
 fn collapse_home_in_path(p: &std::path::Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
-        if let Some(s) = p.to_str() {
-            if let Some(rest) = s.strip_prefix(&home) {
-                return format!("~{rest}");
-            }
-        }
+    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok())
+        && let Some(s) = p.to_str()
+        && let Some(rest) = s.strip_prefix(&home)
+    {
+        return format!("~{rest}");
     }
     p.display().to_string()
 }

@@ -74,10 +74,10 @@ impl AliasFile {
     /// Write pretty-printed JSON to `path`, creating parent dirs as
     /// needed. Overwrites any existing file.
     pub fn save(&self, path: &Path) -> Result<(), AliasError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
