@@ -59,7 +59,8 @@ use ratatui::{
 };
 use shed_core::{
     Alias, AliasFile, Shed, ShedId, ShedState, Capture, CompareOp, Filter, FilterSpec,
-    Notebook, PipelineValue, Predicate, Session, SortDirection, SortKey, Value, apply_with_notes,
+    Notebook, NotebookEntry, PipelineValue, Predicate, Session, SortDirection, SortKey, Value,
+    apply_with_notes,
 };
 use tokio::task::JoinHandle;
 
@@ -167,6 +168,12 @@ struct StashedTab {
     chain_in_flight: Option<ShedId>,
     pending_handover: Option<HandoverRequest>,
     pending_rerun: Option<RerunRequest>,
+    /// JSON-serialised snapshot of the *pinned* sheds at the last save
+    /// or load. Compared against the current pinned-shed JSON to decide
+    /// whether the exit prompt should fire — unpinned-shed edits are
+    /// treated as scratch and don't trigger the "save before quitting"
+    /// dialog.
+    saved_pinned_json: String,
 }
 
 /// Per-tab metadata that lives on App regardless of which tab is
@@ -1648,6 +1655,11 @@ struct App {
     /// is added, edited, pinned/unpinned, re-run, or its pipeline mutated.
     /// Cleared on save/load.
     dirty: bool,
+    /// JSON-serialised snapshot of the *pinned* sheds at the last save
+    /// or load. The exit prompt fires only when the current pinned JSON
+    /// differs from this — unpinned-shed edits are scratch work and
+    /// don't nag the user on quit.
+    saved_pinned_json: String,
     /// Queue of sheds to run in sequence (head first). Built by walking
     /// `@-ref` deps so a snapshot shed runs its source before itself.
     /// The event loop kicks off one at a time and gates on terminal state.
@@ -1780,6 +1792,7 @@ impl App {
             alias_overwrite: None,
             alias_manage: None,
             dirty: false,
+            saved_pinned_json: pinned_entries_json(&Session::new()),
             pending_run_chain: VecDeque::new(),
             chain_in_flight: None,
             undo_stack: Vec::new(),
@@ -1836,6 +1849,7 @@ impl App {
             chain_in_flight: self.chain_in_flight.take(),
             pending_handover: self.pending_handover.take(),
             pending_rerun: self.pending_rerun.take(),
+            saved_pinned_json: std::mem::take(&mut self.saved_pinned_json),
         }
     }
 
@@ -1854,13 +1868,16 @@ impl App {
         self.chain_in_flight = t.chain_in_flight;
         self.pending_handover = t.pending_handover;
         self.pending_rerun = t.pending_rerun;
+        self.saved_pinned_json = t.saved_pinned_json;
     }
 
     /// Build a fresh [`StashedTab`] for a brand-new tab — empty session,
     /// prompt focus, no pending work.
     fn fresh_stashed_tab() -> StashedTab {
+        let empty = Session::new();
+        let baseline = pinned_entries_json(&empty);
         StashedTab {
-            session: Session::new(),
+            session: empty,
             running: HashMap::new(),
             prompt: String::new(),
             prompt_cursor: 0,
@@ -1873,6 +1890,7 @@ impl App {
             chain_in_flight: None,
             pending_handover: None,
             pending_rerun: None,
+            saved_pinned_json: baseline,
         }
     }
 
@@ -3140,13 +3158,37 @@ fn sanitize_after_restore(app: &mut App) {
     }
 }
 
-/// Quit if clean; otherwise show the save-changes confirmation.
+/// Quit if clean; otherwise show the save-changes confirmation. "Dirty"
+/// here means *the pinned sheds have changed since the last save/load*
+/// — unpinned-shed edits are scratch work the user can lose silently.
 fn request_quit(app: &mut App) {
-    if app.dirty {
+    if has_unsaved_pinned_changes(app) {
         app.exit_prompt = Some(ExitPrompt::Confirm);
     } else {
         app.quit = true;
     }
+}
+
+/// JSON-serialised snapshot of the *pinned* sheds in `session`. Used to
+/// detect whether the user has made changes the notebook would persist
+/// to a different on-disk state.
+fn pinned_entries_json(session: &Session) -> String {
+    let entries: Vec<NotebookEntry> = session
+        .sheds()
+        .filter(|s| s.name.is_some())
+        .map(|s| NotebookEntry::Command {
+            argv: s.argv.clone(),
+            name: s.name.clone(),
+            pipeline: s.pipeline.clone(),
+            pre_text: s.pre_text.clone(),
+            post_text: s.post_text.clone(),
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_default()
+}
+
+fn has_unsaved_pinned_changes(app: &App) -> bool {
+    pinned_entries_json(&app.session) != app.saved_pinned_json
 }
 
 /// Open the save input bar — or, if a notebook path is already bound,
@@ -3178,6 +3220,7 @@ fn save_to_path(app: &mut App, path: &std::path::Path) {
         Ok(()) => {
             app.notebook_path = Some(path.to_path_buf());
             app.dirty = false;
+            app.saved_pinned_json = pinned_entries_json(&app.session);
             app.flash = Some(format!("saved → {}", path.display()));
         }
         Err(e) => {
@@ -3201,6 +3244,7 @@ fn load_from_path(app: &mut App, path: &std::path::Path) {
             nb.apply_to_session(&mut app.session);
             app.notebook_path = Some(path.to_path_buf());
             app.dirty = false;
+            app.saved_pinned_json = pinned_entries_json(&app.session);
             app.session.set_cursor(app.newest_shed_id());
             app.reset_pipeline_cursor();
             // Refocus on the loaded sheds if any exist; otherwise stay
@@ -3245,7 +3289,9 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
             save_to_path(app, &path);
             // If we were saving on exit, complete the quit now that the
             // file is on disk (or fall through if save failed).
-            if app.exit_prompt == Some(ExitPrompt::AwaitingPath) && !app.dirty {
+            if app.exit_prompt == Some(ExitPrompt::AwaitingPath)
+                && !has_unsaved_pinned_changes(app)
+            {
                 app.exit_prompt = None;
                 app.quit = true;
             }
@@ -3294,7 +3340,7 @@ fn handle_exit_prompt_key(app: &mut App, key: KeyEvent) {
             // and reuse the save input bar.
             if let Some(path) = app.notebook_path.clone() {
                 save_to_path(app, &path);
-                if !app.dirty {
+                if !has_unsaved_pinned_changes(app) {
                     app.exit_prompt = None;
                     app.quit = true;
                 }
@@ -11705,6 +11751,100 @@ mod tests {
             .collect();
         assert!(labels.contains(&"Copy line".to_string()));
         assert!(!labels.contains(&"Copy cell".to_string()));
+    }
+
+    // === pinned-only exit-prompt gating ===
+
+    #[test]
+    fn fresh_app_has_no_unsaved_pinned_changes() {
+        let app = App::new();
+        assert!(!has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn adding_unpinned_sheds_does_not_trigger_save_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.session.add_shed(vec!["ls".into()]);
+        let _ = app.session.add_shed(vec!["pwd".into()]);
+        // Sheds exist but none are pinned — exit should be silent.
+        assert!(!has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn pinning_a_shed_triggers_save_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        assert!(!has_unsaved_pinned_changes(&app));
+        app.session.pin(id, "listing".into());
+        assert!(has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn unpinning_a_shed_triggers_save_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.pin(id, "listing".into());
+        // Pretend we just saved this state.
+        app.saved_pinned_json = pinned_entries_json(&app.session);
+        assert!(!has_unsaved_pinned_changes(&app));
+        // Unpin (set name back to None).
+        if let Some(b) = app.session.shed_mut(id) {
+            b.name = None;
+        }
+        assert!(has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn editing_argv_of_pinned_shed_triggers_save_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.pin(id, "listing".into());
+        app.saved_pinned_json = pinned_entries_json(&app.session);
+        // Edit argv.
+        if let Some(b) = app.session.shed_mut(id) {
+            b.argv = vec!["ls".into(), "-la".into()];
+        }
+        assert!(has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn editing_argv_of_unpinned_shed_does_not_trigger_save_prompt() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        // Unpinned — edit doesn't matter.
+        if let Some(b) = app.session.shed_mut(id) {
+            b.argv = vec!["ls".into(), "-la".into()];
+        }
+        assert!(!has_unsaved_pinned_changes(&app));
+    }
+
+    #[test]
+    fn request_quit_skips_prompt_when_only_unpinned_changes() {
+        let mut app = App::new();
+        app.history.clear();
+        // Add unpinned sheds (and even set the old dirty flag to verify
+        // it's no longer consulted).
+        let _ = app.session.add_shed(vec!["foo".into()]);
+        app.dirty = true;
+        request_quit(&mut app);
+        assert!(app.exit_prompt.is_none(), "exit prompt should not fire");
+        assert!(app.quit, "should quit immediately");
+    }
+
+    #[test]
+    fn request_quit_shows_prompt_when_a_pinned_shed_changed() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.pin(id, "listing".into());
+        request_quit(&mut app);
+        assert_eq!(app.exit_prompt, Some(ExitPrompt::Confirm));
+        assert!(!app.quit);
     }
 
     // === tabs (#1) ===
