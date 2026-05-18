@@ -11,6 +11,7 @@ name = "shed"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22.1"
 bytes = "1.11.1"
 crossterm = "0.29.0"
 csv = "1.4.0"

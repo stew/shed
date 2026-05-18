@@ -1257,6 +1257,7 @@ dependencies = [
 name = "shed"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bytes",
  "crossterm",
  "csv",

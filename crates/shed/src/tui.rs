@@ -67,6 +67,9 @@ use tokio::task::JoinHandle;
 use crate::ansi;
 use crate::exec::{self, CaptureOutcome, ExecError, Killer};
 
+mod clipboard;
+use clipboard::write_clipboard_osc52;
+
 type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
 
 /// A clickable region of the screen registered by a draw pass.
@@ -6825,64 +6828,6 @@ fn insert_at_prompt(app: &mut App, text: &str) {
     app.prompt_cursor = cur + text.len();
 }
 
-/// Write `text` to the system clipboard via OSC 52. Targets both the
-/// CLIPBOARD and PRIMARY selections so terminals that distinguish them
-/// (X11) get the value in the place pasting expects.
-///
-/// Inside tmux this relies on `set -g set-clipboard on` — tmux then
-/// forwards OSC 52 from applications to the outer terminal natively.
-/// (We deliberately do NOT use DCS passthrough wrapping: that would
-/// additionally require `set -g allow-passthrough on`, which is off by
-/// default in tmux ≥ 3.3, and would *break* the common case.) The outer
-/// terminal must also support OSC 52 — kitty, iTerm2, wezterm, alacritty,
-/// foot, and modern xterm do; many older terminals silently ignore it.
-fn write_clipboard_osc52(text: &str) -> io::Result<()> {
-    let payload = base64_encode(text.as_bytes());
-    let seq = format!("\x1b]52;cp;{payload}\x07");
-    use std::io::Write;
-    let mut out = io::stdout();
-    out.write_all(seq.as_bytes())?;
-    out.flush()
-}
-
-/// Minimal base64 encoder. OSC 52 is the only caller; we don't need
-/// streaming or url-safe variants, so a 40-line implementation is
-/// cheaper than pulling in a dep.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
-        let b0 = chunk[0];
-        let b1 = chunk[1];
-        let b2 = chunk[2];
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
-    }
-    let rem = chunks.remainder();
-    match rem.len() {
-        1 => {
-            let b0 = rem[0];
-            out.push(ALPHABET[(b0 >> 2) as usize] as char);
-            out.push(ALPHABET[((b0 & 0x03) << 4) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let b0 = rem[0];
-            let b1 = rem[1];
-            out.push(ALPHABET[(b0 >> 2) as usize] as char);
-            out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-            out.push(ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
-            out.push('=');
-        }
-        _ => {}
-    }
-    out
-}
-
 fn draw_palette(f: &mut Frame, app: &App) {
     let Some(state) = app.palette_state.as_ref() else {
         return;
@@ -11460,18 +11405,6 @@ mod tests {
             lines: lines.into_iter().map(|s| s.to_string()).collect(),
             cells: Vec::new(),
         }
-    }
-
-    #[test]
-    fn base64_encode_matches_known_vectors() {
-        // RFC 4648 §10 vectors.
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]
