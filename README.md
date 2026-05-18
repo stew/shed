@@ -298,14 +298,33 @@ native click-and-drag selection. Two ways to get text out:
   selection (works in kitty, iTerm2, wezterm, alacritty, foot, modern
   xterm; behaviour varies by emulator). Whatever you select is sent to
   the clipboard the same way as in a normal terminal.
-- **Right-click** on a shed body opens a small context menu with:
-  - **Copy line** — the rendered line under the cursor
-  - **Add line to prompt** — splice that line into the prompt at the
-    cursor (only offered when focus is on the prompt)
-  - **Copy whole output** — the shed's raw captured stdout (pre-pipeline)
+- **Right-click** on a shed body opens a small context menu. Items depend
+  on what's under the cursor:
+  - On a **table cell** (structured row output):
+    - **Copy cell** — the cell's typed value as text
+    - **Add cell to prompt** — splice it into the prompt (prompt focus only)
+    - **Copy filename** — for path-like cells (`/etc/passwd`, `./foo.txt`,
+      `~/dir`, anything with `/` and no whitespace), just the basename
+    - **Add filename to prompt** — same, into the prompt
+  - On a non-cell line (or non-table output):
+    - **Copy line** — the rendered line under the cursor
+    - **Add line to prompt** — splice that line into the prompt
+  - Always available:
+    - **Copy whole output** — the shed's raw captured stdout
+      (pre-pipeline), or the structured table as text for snapshot sheds
 
   Navigate with `↑↓`, **Enter** to activate, **Esc** to dismiss. Clicking
   outside the menu also dismisses.
+- **Shift-Left-Click** *or* **Ctrl-Left-Click** on a cell or line is a
+  shortcut for "add to prompt" — skips the menu, splices the cell value
+  (or the line, if no cell is hit) into the prompt at the cursor, and
+  switches focus to Prompt if you weren't already there. The `[×]`
+  delete button is ignored while a modifier is held so the click reaches
+  the body behind it. Both modifiers are accepted because most terminals
+  (kitty, iTerm2, wezterm, alacritty, foot, modern xterm) intercept
+  Shift+click to bypass mouse capture for their own text selection,
+  while a few use Ctrl+click for "open link" — whichever your terminal
+  lets through wins.
 
 Copy uses OSC 52 to write to the system clipboard (both CLIPBOARD and
 PRIMARY selections, for X11 environments). Most modern terminals support

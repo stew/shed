@@ -86,11 +86,38 @@ enum ClickAction {
 /// rendering of each line so a right-click can target the specific line
 /// under the cursor. Wrap is not currently accounted for — long lines that
 /// wrap to multiple terminal rows resolve to the wrong index past row 0.
+///
+/// `cells` is populated when the body renders as a structured table; each
+/// entry maps a screen rect to the typed cell value beneath it so
+/// right-click can offer cell-specific actions (Copy cell, Copy filename,
+/// …) before falling back to line-level options.
 #[derive(Debug, Clone)]
 struct BodyRegion {
     rect: Rect,
     shed_id: ShedId,
     lines: Vec<String>,
+    cells: Vec<CellRegion>,
+}
+
+/// Absolute-coordinate hit rect for a single table cell, plus the typed
+/// value the cell renders.
+#[derive(Debug, Clone)]
+struct CellRegion {
+    rect: Rect,
+    value: Value,
+}
+
+/// Pre-translation cell layout produced by the render functions.
+/// `line_idx` is relative to the start of the body's rendered lines and
+/// `x_offset` is in column units within that line — the caller (in
+/// `draw_one_shed`) translates these to absolute screen coordinates
+/// using the body's inner rect.
+#[derive(Debug, Clone)]
+struct CellLayout {
+    line_idx: usize,
+    x_offset: u16,
+    width: u16,
+    value: Value,
 }
 
 /// State for the floating context menu opened by right-clicking on a shed
@@ -3586,6 +3613,20 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
     }
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Shift-Left-Click OR Ctrl-Left-Click is a shortcut for "Add
+            // to prompt": grab the cell text (or line text if no cell)
+            // under the cursor and splice it into the prompt, switching
+            // focus to Prompt first if needed. Both modifiers are
+            // accepted because most terminals intercept Shift for native
+            // text selection (so Shift+click never reaches us), while a
+            // few use Ctrl for "open link"; whichever your terminal lets
+            // through wins. Bypasses the [×] button and the menu.
+            if me.modifiers.contains(KeyModifiers::SHIFT)
+                || me.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                handle_shift_left_click(app, me.column, me.row);
+                return;
+            }
             let hit = app
                 .click_regions
                 .iter()
@@ -3621,9 +3662,49 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-/// Build the line-targeted context menu for a right-clicked shed body.
-/// Always offers "Copy whole output"; line-specific items appear when
-/// the clicked row maps to a non-empty rendered line.
+/// Modifier-Left-Click handler (Shift or Ctrl): insert the cell-or-line
+/// text under (col, row) into the prompt. Switches focus to Prompt so
+/// the shortcut works from anywhere (ShedCursor, EditShed, etc.).
+/// No-op when the click lands outside any shed body or on an empty
+/// target.
+fn handle_shift_left_click(app: &mut App, col: u16, row: u16) {
+    let Some(region) = app
+        .body_regions
+        .iter()
+        .find(|r| rect_contains(r.rect, col, row))
+        .cloned()
+    else {
+        return;
+    };
+    let cell_text = region
+        .cells
+        .iter()
+        .find(|c| rect_contains(c.rect, col, row))
+        .map(|c| cell_string(&c.value).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let text = cell_text.or_else(|| {
+        let line_idx = row.saturating_sub(region.rect.y) as usize;
+        region
+            .lines
+            .get(line_idx)
+            .map(|s| s.trim_end().to_string())
+            .filter(|s| !s.is_empty())
+    });
+    let Some(text) = text else {
+        return;
+    };
+    if app.focus != Focus::Prompt {
+        app.focus = Focus::Prompt;
+    }
+    insert_at_prompt(app, &text);
+    app.flash = Some(format!("added {} chars to prompt", text.len()));
+}
+
+/// Build the context menu for a right-clicked shed body. Hit-tests cells
+/// first (most specific) — for cell hits the menu leads with cell-level
+/// actions plus type-specific items (e.g. "Copy filename" when the cell
+/// looks like a path). Falls back to line-level actions when no cell is
+/// hit; always offers "Copy whole output" as the catch-all.
 fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16) {
     let line_idx = row.saturating_sub(region.rect.y) as usize;
     let line_text: Option<String> = region
@@ -3632,10 +3713,44 @@ fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16
         .map(|s| s.trim_end().to_string())
         .filter(|s| !s.is_empty());
 
-    let whole_output = shed_plain_output(&app.session, region.shed_id);
+    let cell_hit = region
+        .cells
+        .iter()
+        .find(|c| rect_contains(c.rect, col, row));
 
+    let whole_output = shed_plain_output(&app.session, region.shed_id);
     let mut items: Vec<ContextMenuItem> = Vec::new();
-    if let Some(line) = line_text {
+
+    if let Some(cell) = cell_hit {
+        let text = cell_string(&cell.value);
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            items.push(ContextMenuItem {
+                label: "Copy cell".into(),
+                action: ContextMenuAction::CopyText(trimmed.clone()),
+            });
+            if app.focus == Focus::Prompt {
+                items.push(ContextMenuItem {
+                    label: "Add cell to prompt".into(),
+                    action: ContextMenuAction::InsertAtPrompt(trimmed.clone()),
+                });
+            }
+            if let Some(base) = path_basename(&trimmed) {
+                if base != trimmed {
+                    items.push(ContextMenuItem {
+                        label: "Copy filename".into(),
+                        action: ContextMenuAction::CopyText(base.clone()),
+                    });
+                    if app.focus == Focus::Prompt {
+                        items.push(ContextMenuItem {
+                            label: "Add filename to prompt".into(),
+                            action: ContextMenuAction::InsertAtPrompt(base),
+                        });
+                    }
+                }
+            }
+        }
+    } else if let Some(line) = line_text {
         items.push(ContextMenuItem {
             label: "Copy line".into(),
             action: ContextMenuAction::CopyText(line.clone()),
@@ -3663,6 +3778,28 @@ fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16
     });
 }
 
+/// Heuristic: if `text` looks like a filesystem path with a directory
+/// component, return its basename (the last `/`-separated segment).
+/// Returns `None` for values without a `/`, for values containing
+/// whitespace (unlikely to be a usable filename), or when the basename
+/// would be empty (trailing `/`).
+fn path_basename(text: &str) -> Option<String> {
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let looks_pathy = text.starts_with('/')
+        || text.starts_with("./")
+        || text.starts_with("../")
+        || text.starts_with("~/")
+        || text.contains('/');
+    if !looks_pathy {
+        return None;
+    }
+    let trimmed = text.trim_end_matches('/');
+    let base = trimmed.rsplit('/').next()?;
+    if base.is_empty() { None } else { Some(base.to_string()) }
+}
+
 /// Plain text for "Copy whole output". For byte-stream captures this is
 /// the raw stdout (pipeline NOT applied — users typically want the
 /// captured text, not the filtered view). For structured snapshot
@@ -3677,6 +3814,7 @@ fn shed_plain_output(session: &Session, id: ShedId) -> Option<String> {
             PipelineValue::Structured(value.clone()),
             usize::MAX,
             false,
+            &mut Vec::new(),
         );
         let mut out = String::new();
         for line in &lines {
@@ -4495,7 +4633,9 @@ fn jump_to_search(app: &mut App, forward: bool) {
 fn compute_shed_lines(shed: &Shed) -> Vec<Line<'static>> {
     match shed.capture.as_ref() {
         Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
-            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
+            Ok((value, _drops)) => {
+                render_pipeline_value_with_max(value, usize::MAX, false, &mut Vec::new())
+            }
             Err(e) => filter_error_lines(&e),
         },
         None => Vec::new(),
@@ -6335,7 +6475,9 @@ fn draw_shed_expand(f: &mut Frame, app: &App) {
     // Compute the full pipeline output (no row cap) and the lines to render.
     let all_lines: Vec<Line<'static>> = match shed.capture.as_ref() {
         Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
-            Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
+            Ok((value, _drops)) => {
+                render_pipeline_value_with_max(value, usize::MAX, false, &mut Vec::new())
+            }
             Err(e) => filter_error_lines(&e),
         },
         None => vec![Line::from(Span::styled(
@@ -6520,7 +6662,10 @@ fn draw_sheds(
     let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
 
     // Render each shed's interior content + record selection state.
-    let mut renders: Vec<(Vec<Line<'static>>, bool, bool)> = Vec::with_capacity(sheds.len());
+    // `cells` is the per-shed list of CellLayouts produced during render;
+    // draw_one_shed translates them to absolute Rects.
+    let mut renders: Vec<(Vec<Line<'static>>, bool, bool, Vec<CellLayout>)> =
+        Vec::with_capacity(sheds.len());
     for shed in &sheds {
         let selected = cursor_visible && cursor_id == Some(shed.id);
         let editing = selected && app.focus == Focus::EditShed;
@@ -6530,14 +6675,22 @@ fn draw_sheds(
             None
         };
         let command_focused = editing && app.command_focused;
-        let lines = render_shed(shed, selected, editing, pipeline_cursor, command_focused);
-        renders.push((lines, selected, editing));
+        let mut shed_cells: Vec<CellLayout> = Vec::new();
+        let lines = render_shed(
+            shed,
+            selected,
+            editing,
+            pipeline_cursor,
+            command_focused,
+            &mut shed_cells,
+        );
+        renders.push((lines, selected, editing, shed_cells));
     }
 
     // Box height = content lines + 2 (top + bottom border).
     let heights: Vec<u16> = renders
         .iter()
-        .map(|(l, _, _)| (l.len() as u16).saturating_add(2))
+        .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
         .collect();
 
     // Scratch box at the end: 3 lines (border + 1 content row + border).
@@ -6571,7 +6724,7 @@ fn draw_sheds(
         .constraints(constraints)
         .split(area);
 
-    for (i, (lines, selected, editing)) in visible.iter().enumerate() {
+    for (i, (lines, selected, editing, shed_cells)) in visible.iter().enumerate() {
         draw_one_shed(
             f,
             rects[i],
@@ -6581,6 +6734,7 @@ fn draw_sheds(
             *editing,
             regions,
             bodies,
+            shed_cells,
         );
     }
     let scratch_rect = rects[rects.len() - 1];
@@ -6680,6 +6834,7 @@ fn draw_one_shed(
     editing: bool,
     regions: &mut Vec<ClickRegion>,
     bodies: &mut Vec<BodyRegion>,
+    shed_cells: &[CellLayout],
 ) {
     let pinned = shed.name.is_some();
     let id_text = match &shed.name {
@@ -6747,10 +6902,37 @@ fn draw_one_shed(
 
     if inner.width > 0 && inner.height > 0 {
         let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
+        // Translate body-relative CellLayouts into absolute-coordinate
+        // CellRegions, clamping to the inner rect so cells past the
+        // visible bottom (rare; only happens if rendered lines exceed
+        // the box height somehow) don't escape.
+        let cell_regions: Vec<CellRegion> = shed_cells
+            .iter()
+            .filter_map(|cell| {
+                let abs_x = inner.x.checked_add(cell.x_offset)?;
+                let abs_y = inner.y.checked_add(cell.line_idx as u16)?;
+                if abs_x >= inner.x.saturating_add(inner.width) {
+                    return None;
+                }
+                if abs_y >= inner.y.saturating_add(inner.height) {
+                    return None;
+                }
+                let max_w = inner.x.saturating_add(inner.width).saturating_sub(abs_x);
+                let width = cell.width.min(max_w);
+                if width == 0 {
+                    return None;
+                }
+                Some(CellRegion {
+                    rect: Rect { x: abs_x, y: abs_y, width, height: 1 },
+                    value: cell.value.clone(),
+                })
+            })
+            .collect();
         bodies.push(BodyRegion {
             rect: inner,
             shed_id: shed.id,
             lines: plain,
+            cells: cell_regions,
         });
     }
 
@@ -6787,6 +6969,7 @@ fn render_shed(
     editing: bool,
     pipeline_cursor: Option<usize>,
     command_focused: bool,
+    cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -6872,7 +7055,18 @@ fn render_shed(
     // sheds keep the existing head behaviour.
     let tail = matches!(shed.state, ShedState::Running);
     match pipeline_outcome {
-        Some(Ok((value, _))) => lines.extend(render_pipeline_value(value, tail)),
+        Some(Ok((value, _))) => {
+            // render_pipeline_value's cells track line_idx relative to its
+            // own output (which is `render_table`'s line vector). Offset by
+            // the number of lines already in this shed body so cells end
+            // up in body-relative coordinates.
+            let body_offset = lines.len();
+            let before = cells.len();
+            lines.extend(render_pipeline_value(value, tail, cells));
+            for cell in &mut cells[before..] {
+                cell.line_idx += body_offset;
+            }
+        }
         Some(Err(e)) => lines.extend(filter_error_lines(&e)),
         None => {}
     }
@@ -7010,14 +7204,19 @@ fn render_raw_lines(bytes: &bytes::Bytes, max: usize, tail: bool) -> Vec<Line<'s
     out
 }
 
-fn render_pipeline_value(value: PipelineValue, tail: bool) -> Vec<Line<'static>> {
-    render_pipeline_value_with_max(value, PREVIEW_LINES, tail)
+fn render_pipeline_value(
+    value: PipelineValue,
+    tail: bool,
+    cells: &mut Vec<CellLayout>,
+) -> Vec<Line<'static>> {
+    render_pipeline_value_with_max(value, PREVIEW_LINES, tail, cells)
 }
 
 fn render_pipeline_value_with_max(
     value: PipelineValue,
     max: usize,
     tail: bool,
+    cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
     match value {
         PipelineValue::Bytes(b) => render_raw_lines(&b, max, tail),
@@ -7026,7 +7225,7 @@ fn render_pipeline_value_with_max(
             if columns.is_empty() {
                 render_scalar_list(&items, max, tail)
             } else {
-                render_table(&items, &columns, max, tail)
+                render_table(&items, &columns, max, tail, cells)
             }
         }
         PipelineValue::Structured(other) => vec![Line::from(vec![
@@ -7049,7 +7248,14 @@ fn render_table(
     columns: &[String],
     max_rows: usize,
     tail: bool,
+    cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
+    // Leading indent before the first column (matches `Span::raw("      ")`
+    // below). Used to compute x_offset for cell hit-testing.
+    const INDENT: u16 = 6;
+    // Width of the column separator (" │ "). Three display cells.
+    const SEP: u16 = 3;
+
     let widths = compute_column_widths(items, columns);
     let total = items.len();
     let dim = Style::default().fg(Color::DarkGray);
@@ -7091,6 +7297,18 @@ fn render_table(
         lines.push(more_line());
     }
 
+    // Precompute per-column x_offset (start column within the line) so
+    // each data row can register cell rects in one pass.
+    let mut col_x: Vec<u16> = Vec::with_capacity(columns.len());
+    let mut x = INDENT;
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(SEP);
+        }
+        col_x.push(x);
+        x = x.saturating_add(*w as u16);
+    }
+
     // Data rows: head or tail slice.
     let slice: Box<dyn Iterator<Item = &Value>> = if tail && truncated {
         Box::new(items.iter().skip(total - max_rows))
@@ -7098,16 +7316,24 @@ fn render_table(
         Box::new(items.iter().take(max_rows))
     };
     for item in slice {
+        let row_line_idx = lines.len();
         let mut row_spans = vec![Span::raw("      ")];
         for (i, col) in columns.iter().enumerate() {
             if i > 0 {
                 row_spans.push(Span::styled(" │ ", dim));
             }
-            let cell = match item {
-                Value::Record(r) => r.get(col).map(cell_string).unwrap_or_default(),
-                _ => String::new(),
+            let value = match item {
+                Value::Record(r) => r.get(col).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
             };
+            let cell = cell_string(&value);
             row_spans.push(Span::raw(pad_right(&cell, widths[i])));
+            cells.push(CellLayout {
+                line_idx: row_line_idx,
+                x_offset: col_x[i],
+                width: widths[i] as u16,
+                value,
+            });
         }
         lines.push(Line::from(row_spans));
     }
@@ -7328,7 +7554,9 @@ fn draw_preview_pane(
             "      (no capture)",
             Style::default().fg(Color::DarkGray),
         ))],
-        Some(Ok((value, _))) => render_pipeline_value_with_max(value.clone(), max, false),
+        Some(Ok((value, _))) => {
+            render_pipeline_value_with_max(value.clone(), max, false, &mut Vec::new())
+        }
         Some(Err(e)) => filter_error_lines(e),
     };
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -10305,7 +10533,7 @@ mod tests {
                 Value::Record(r)
             })
             .collect();
-        let lines = render_table(&items, &cols, 3, true);
+        let lines = render_table(&items, &cols, 3, true, &mut Vec::new());
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         // Header, separator, "… N more rows", then last 3 records (8, 9, 10).
         assert!(texts[0].contains("n"));
@@ -10399,6 +10627,7 @@ mod tests {
             rect: Rect { x: 2, y: 3, width: 40, height: lines.len() as u16 },
             shed_id,
             lines: lines.into_iter().map(|s| s.to_string()).collect(),
+            cells: Vec::new(),
         }
     }
 
@@ -10655,5 +10884,263 @@ mod tests {
         };
         handle_mouse(&mut app, me);
         assert!(app.context_menu.is_none());
+    }
+
+    // === cell-aware right-click (#2) ===
+
+    #[test]
+    fn path_basename_recognises_typical_paths() {
+        assert_eq!(path_basename("/etc/passwd"), Some("passwd".into()));
+        assert_eq!(path_basename("./foo.txt"), Some("foo.txt".into()));
+        assert_eq!(path_basename("../bar/baz.rs"), Some("baz.rs".into()));
+        assert_eq!(path_basename("~/devel/shed"), Some("shed".into()));
+        assert_eq!(path_basename("dir/file"), Some("file".into()));
+        // Trailing slashes are stripped before taking basename.
+        assert_eq!(path_basename("/var/log/"), Some("log".into()));
+    }
+
+    #[test]
+    fn path_basename_rejects_non_paths_and_text_with_spaces() {
+        assert!(path_basename("").is_none());
+        assert!(path_basename("nope").is_none(), "no slash");
+        assert!(path_basename("42").is_none());
+        assert!(path_basename("hello world").is_none(), "contains whitespace");
+        assert!(path_basename("/path with space/file").is_none(), "spaces disqualify");
+        assert!(path_basename("/").is_none(), "trim leaves empty");
+    }
+
+    #[test]
+    fn render_table_records_cell_layouts_per_row_per_column() {
+        use shed_core::Value;
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let mut row1 = indexmap::IndexMap::new();
+        row1.insert("a".into(), Value::String("x".into()));
+        row1.insert("b".into(), Value::String("yy".into()));
+        let mut row2 = indexmap::IndexMap::new();
+        row2.insert("a".into(), Value::String("zz".into()));
+        row2.insert("b".into(), Value::String("w".into()));
+        let items = vec![Value::Record(row1), Value::Record(row2)];
+        let mut cells = Vec::new();
+        let lines = render_table(&items, &cols, 10, false, &mut cells);
+        // 2 cols x 2 rows = 4 cells.
+        assert_eq!(cells.len(), 4);
+        // Header + separator = lines 0..1; data rows start at line 2.
+        assert_eq!(cells[0].line_idx, 2);
+        assert_eq!(cells[1].line_idx, 2);
+        assert_eq!(cells[2].line_idx, 3);
+        assert_eq!(cells[3].line_idx, 3);
+        // First column starts at the body's 6-char indent.
+        assert_eq!(cells[0].x_offset, 6);
+        // Second column starts after first col width (2) + separator (3) = 11.
+        assert_eq!(cells[1].x_offset, 11);
+        // Cell value preserved.
+        assert_eq!(cells[0].value, Value::String("x".into()));
+        // Sanity: lines actually rendered.
+        assert!(!lines.is_empty());
+    }
+
+    fn body_with_one_cell(shed_id: ShedId, value: Value) -> BodyRegion {
+        // A 1x1 cell located at (col 10, row 5) so tests can right-click
+        // precisely. Width 8 lets us hit columns 10..18.
+        BodyRegion {
+            rect: Rect { x: 6, y: 3, width: 40, height: 6 },
+            shed_id,
+            lines: vec![String::new(); 6],
+            cells: vec![CellRegion {
+                rect: Rect { x: 10, y: 5, width: 8, height: 1 },
+                value,
+            }],
+        }
+    }
+
+    #[test]
+    fn right_click_on_cell_offers_copy_cell_and_copy_filename_for_paths() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["ls".into()]);
+        app.body_regions
+            .push(body_with_one_cell(a, Value::String("/etc/passwd".into())));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let menu = app.context_menu.as_ref().expect("menu opened");
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"Copy cell"));
+        assert!(labels.contains(&"Copy filename"));
+        // Verify the filename payload is just the basename.
+        let filename = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Copy filename")
+            .unwrap();
+        match &filename.action {
+            ContextMenuAction::CopyText(s) => assert_eq!(s, "passwd"),
+            _ => panic!("expected CopyText"),
+        }
+    }
+
+    #[test]
+    fn right_click_on_non_path_cell_omits_copy_filename() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["echo".into()]);
+        app.body_regions
+            .push(body_with_one_cell(a, Value::Int(42)));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let labels: Vec<String> = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert!(labels.contains(&"Copy cell".to_string()));
+        assert!(!labels.contains(&"Copy filename".to_string()));
+    }
+
+    #[test]
+    fn shift_left_click_on_cell_adds_value_to_prompt_and_focuses_it() {
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::ShedCursor; // start somewhere other than Prompt
+        app.prompt = "echo ".into();
+        app.prompt_cursor = 5;
+        let a = app.session.add_shed(vec!["ls".into()]);
+        app.body_regions
+            .push(body_with_one_cell(a, Value::String("/etc/passwd".into())));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(&mut app, me);
+        assert_eq!(app.focus, Focus::Prompt, "focus jumps to Prompt");
+        assert_eq!(app.prompt, "echo /etc/passwd");
+        assert_eq!(app.prompt_cursor, "echo /etc/passwd".len());
+        assert!(app.context_menu.is_none(), "menu must not open");
+    }
+
+    #[test]
+    fn ctrl_left_click_works_the_same_as_shift_for_terminals_that_eat_shift() {
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::ShedCursor;
+        app.prompt = "cat ".into();
+        app.prompt_cursor = 4;
+        let a = app.session.add_shed(vec!["ls".into()]);
+        app.body_regions
+            .push(body_with_one_cell(a, Value::String("/var/log".into())));
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        handle_mouse(&mut app, me);
+        assert_eq!(app.focus, Focus::Prompt);
+        assert_eq!(app.prompt, "cat /var/log");
+    }
+
+    #[test]
+    fn shift_left_click_outside_cell_inserts_the_line_text() {
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::Prompt;
+        let a = app.session.add_shed(vec!["a".into()]);
+        let mut br = body_with_one_cell(a, Value::String("/etc/passwd".into()));
+        br.lines[0] = "hello world".into();
+        app.body_regions.push(br);
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 3, // first body line, no cell here
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(&mut app, me);
+        assert_eq!(app.prompt, "hello world");
+    }
+
+    #[test]
+    fn shift_left_click_outside_any_body_is_a_noop() {
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::ShedCursor;
+        app.prompt = "untouched".into();
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 99,
+            row: 99,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(&mut app, me);
+        assert_eq!(app.prompt, "untouched");
+        // No body region matched → focus shouldn't have changed either.
+        assert_eq!(app.focus, Focus::ShedCursor);
+    }
+
+    #[test]
+    fn shift_left_click_bypasses_delete_button() {
+        // Without Shift, clicking the [×] region would delete the shed.
+        // With Shift, the click should not delete — it should hit the
+        // body cell/line behind it instead (here: nothing to add, so no-op).
+        let mut app = App::new();
+        app.history.clear();
+        app.focus = Focus::Prompt;
+        let a = app.session.add_shed(vec!["a".into()]);
+        // Register a delete click region overlapping (10, 0); also a body
+        // region whose lines are all empty so no-op is expected.
+        app.click_regions.push(ClickRegion {
+            rect: Rect { x: 10, y: 0, width: 3, height: 1 },
+            action: ClickAction::DeleteBlock(a),
+        });
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 11,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        handle_mouse(&mut app, me);
+        assert!(app.session.shed(a).is_some(), "shed must not be deleted");
+    }
+
+    #[test]
+    fn right_click_on_line_outside_any_cell_uses_line_actions() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        // Body has a cell at row 5; clicking on row 3 hits the line, not
+        // any cell.
+        let mut br = body_with_one_cell(a, Value::String("/etc/passwd".into()));
+        br.lines[0] = "some text".into();
+        app.body_regions.push(br);
+        let me = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 3, // first line of body, no cell here
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        let labels: Vec<String> = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert!(labels.contains(&"Copy line".to_string()));
+        assert!(!labels.contains(&"Copy cell".to_string()));
     }
 }
