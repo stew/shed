@@ -78,7 +78,8 @@ use input::{
     InputOutcome, apply_readline_edit, handle_text_input, input_spans_with_cursor, render_input_bar,
 };
 use render::{
-    cell_string, describe_filter, filter_error_lines, render_pipeline_value_with_max, render_shed,
+    cell_string, describe_filter, draw_context_menu, draw_header, filter_error_lines,
+    render_pipeline_value_with_max, render_shed,
 };
 use tabs::{
     TabSlot, begin_rename_tab, draw_tab_bar, drive_all_tabs, handle_rename_tab_input_key,
@@ -148,15 +149,15 @@ struct CellLayout {
 /// shifts it inward if it would overflow the frame.
 #[derive(Debug, Clone)]
 struct ContextMenu {
-    pos: (u16, u16),
-    items: Vec<ContextMenuItem>,
-    selected: usize,
+    pub(crate) pos: (u16, u16),
+    pub(crate) items: Vec<ContextMenuItem>,
+    pub(crate) selected: usize,
 }
 
 #[derive(Debug, Clone)]
 struct ContextMenuItem {
-    label: String,
-    action: ContextMenuAction,
+    pub(crate) label: String,
+    pub(crate) action: ContextMenuAction,
 }
 
 #[derive(Debug, Clone)]
@@ -5594,71 +5595,6 @@ fn draw_note_edit(f: &mut Frame, app: &App) {
     draw_status(f, chunks[2], app);
 }
 
-/// Render the floating right-click context menu over the existing frame.
-/// Sized to the longest item label + padding; shifted inward if it would
-/// overflow the right or bottom edge.
-fn draw_context_menu(f: &mut Frame, app: &App) {
-    let Some(menu) = app.context_menu.as_ref() else {
-        return;
-    };
-    if menu.items.is_empty() {
-        return;
-    }
-    let frame = f.area();
-    let inner_width: u16 = menu
-        .items
-        .iter()
-        .map(|i| i.label.chars().count() as u16)
-        .max()
-        .unwrap_or(1);
-    // 2 borders + 2 padding cells on each side.
-    let width = (inner_width + 4).min(frame.width.max(1));
-    let height = (menu.items.len() as u16 + 2).min(frame.height.max(1));
-    let mut x = menu.pos.0;
-    let mut y = menu.pos.1;
-    if x + width > frame.x + frame.width {
-        x = frame.x + frame.width - width;
-    }
-    if y + height > frame.y + frame.height {
-        y = frame.y + frame.height - height;
-    }
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-
-    let block = TuiBlock::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
-    let inner = block.inner(area);
-    f.render_widget(ratatui::widgets::Clear, area);
-    f.render_widget(block, area);
-
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let normal = Style::default().fg(Color::White);
-    let lines: Vec<Line<'static>> = menu
-        .items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let style = if i == menu.selected {
-                highlight
-            } else {
-                normal
-            };
-            Line::from(Span::styled(format!(" {} ", item.label), style))
-        })
-        .collect();
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
-}
-
 /// Return the index of the menu item under (col, row), or `None` if the
 /// coordinates fall outside the menu's rendered rows.
 fn menu_item_at(app: &App, col: u16, row: u16) -> Option<usize> {
@@ -6134,23 +6070,6 @@ fn hypothetical_outcome(
         _ => {}
     }
     Some(apply_pipeline(capture, &hypothetical))
-}
-
-fn draw_header(f: &mut Frame, area: Rect, title: &str) {
-    let header = Paragraph::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "shed",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ·  {title}"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    f.render_widget(header, area);
 }
 
 fn draw_sheds(

@@ -15,14 +15,17 @@
 //! status bar, etc.) still live in `tui.rs`; they'll migrate here in
 //! subsequent commits.
 
+use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph};
 use shed_core::{
     CompareOp, FilterSpec, PipelineValue, Predicate, Shed, ShedState, SortDirection, Value,
 };
 
 use super::PREVIEW_LINES;
-use super::{CellLayout, ansi, apply_pipeline, delim_label};
+use super::{App, CellLayout, ansi, apply_pipeline, delim_label};
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
@@ -586,6 +589,91 @@ pub(super) fn describe_compare_value(v: &Value) -> String {
         Value::String(s) => format!("\"{s}\""),
         _ => format_scalar(v),
     }
+}
+
+/// One-line header shown at the top of every modal screen
+/// (FilterEdit, ShedExpand, EnvEdit, Palette, NoteEdit, AliasManage).
+/// Combines a `shed` banner with the screen's title.
+pub(super) fn draw_header(f: &mut Frame, area: Rect, title: &str) {
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "shed",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ·  {title}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    f.render_widget(header, area);
+}
+
+/// Render the floating right-click context menu over the existing
+/// frame. Sized to the longest item label + padding; shifted inward if
+/// it would overflow the right or bottom edge.
+pub(super) fn draw_context_menu(f: &mut Frame, app: &App) {
+    let Some(menu) = app.context_menu.as_ref() else {
+        return;
+    };
+    if menu.items.is_empty() {
+        return;
+    }
+    let frame = f.area();
+    let inner_width: u16 = menu
+        .items
+        .iter()
+        .map(|i| i.label.chars().count() as u16)
+        .max()
+        .unwrap_or(1);
+    // 2 borders + 2 padding cells on each side.
+    let width = (inner_width + 4).min(frame.width.max(1));
+    let height = (menu.items.len() as u16 + 2).min(frame.height.max(1));
+    let mut x = menu.pos.0;
+    let mut y = menu.pos.1;
+    if x + width > frame.x + frame.width {
+        x = frame.x + frame.width - width;
+    }
+    if y + height > frame.y + frame.height {
+        y = frame.y + frame.height - height;
+    }
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let block = TuiBlock::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(block, area);
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let lines: Vec<Line<'static>> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == menu.selected {
+                highlight
+            } else {
+                normal
+            };
+            Line::from(Span::styled(format!(" {} ", item.label), style))
+        })
+        .collect();
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
 }
 
 #[cfg(test)]
