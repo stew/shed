@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use std::time::Instant;
 
+use crate::value::Value;
+
 /// A snapshot of a command's output.
 ///
 /// Captures are produced by the binary crate's PTY-based exec module and
@@ -35,4 +37,11 @@ pub struct Capture {
     /// `true` if the user manually froze a streaming capture (planned
     /// feature; always `false` in v0).
     pub snapshotted: bool,
+    /// If set, this capture is a *structured snapshot* — typically taken
+    /// when a shed referenced another shed via `@name` or `%N`. The
+    /// pipeline applied to this shed starts from this value directly
+    /// instead of re-parsing `stdout`, preserving column order and
+    /// types across the boundary. PTY captures always have this as
+    /// `None`; only snapshot sheds populate it.
+    pub structured: Option<Value>,
 }

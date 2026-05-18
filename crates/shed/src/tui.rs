@@ -1432,7 +1432,13 @@ fn compute_schema_at(shed: &Shed, before_index: usize) -> Vec<String> {
     let Some(capture) = &shed.capture else {
         return Vec::new();
     };
-    let mut value = PipelineValue::Bytes(capture.stdout.clone());
+    // Inherited structured snapshots (typed @name / %N transport) carry
+    // their schema in `capture.structured`, so the filter form sees the
+    // columns immediately — no implicit `from-json` needed.
+    let mut value = match &capture.structured {
+        Some(v) => PipelineValue::Structured(v.clone()),
+        None => PipelineValue::Bytes(capture.stdout.clone()),
+    };
     for filter in shed.pipeline.iter().take(before_index) {
         match filter.apply(value) {
             Ok(v) => value = v,
@@ -2121,11 +2127,23 @@ fn advance_run_chain(app: &mut App) {
     app.chain_in_flight = None;
 }
 
+/// Output produced by [`snapshot_ref`]: either raw bytes (passthrough
+/// for byte-stream sources) or a structured [`Value`] (parsed rows from
+/// the source's pipeline, transported directly so downstream sheds
+/// inherit the schema and column order without re-parsing).
+#[derive(Debug, Clone)]
+enum SnapshotOutput {
+    Bytes(Vec<u8>),
+    Structured(Value),
+}
+
 /// Apply the referenced shed's pipeline to its current capture and
-/// serialize the result to bytes — JSON-pretty for structured values,
-/// raw passthrough for byte streams. Errors describe what went wrong
-/// so the caller can route them into a `Failed` shed state.
-fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<Vec<u8>, String> {
+/// return the result. Byte-stream sources pass through as
+/// [`SnapshotOutput::Bytes`]; structured sources pass through as
+/// [`SnapshotOutput::Structured`] so the downstream shed can start its
+/// own pipeline from the typed value (no JSON round-trip, column order
+/// preserved).
+fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<SnapshotOutput, String> {
     let label = shed_ref_display(r);
     let id =
         resolve_shed_ref(session, r).ok_or_else(|| format!("no shed at {label}"))?;
@@ -2137,39 +2155,40 @@ fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<Vec<u8>, String> {
         .as_ref()
         .ok_or_else(|| format!("{label} has no captured output yet"))?;
 
-    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
+    let value = match apply_pipeline(capture, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return Err(format!("{label} pipeline error: {e}")),
     };
 
-    let bytes = match value {
-        PipelineValue::Bytes(b) => b.to_vec(),
-        other @ PipelineValue::Structured(_) => {
-            let json = pipeline_value_to_json(other);
-            let mut out = serde_json::to_vec_pretty(&json)
-                .unwrap_or_else(|e| e.to_string().into_bytes());
-            out.push(b'\n');
-            out
-        }
-    };
-    Ok(bytes)
+    Ok(match value {
+        PipelineValue::Bytes(b) => SnapshotOutput::Bytes(b.to_vec()),
+        PipelineValue::Structured(v) => SnapshotOutput::Structured(v),
+    })
 }
 
 /// Run `snapshot_ref` and write the result onto `id` as a synthetic
 /// capture. Used both at create time (typing `@name` or `%N`) and on
-/// re-run (Space on a snapshot shed).
+/// re-run (Space on a snapshot shed). When the source produced
+/// structured rows the snapshot capture carries them in
+/// [`Capture::structured`] so the downstream pipeline starts from the
+/// typed value directly.
 fn populate_snapshot(app: &mut App, id: ShedId, r: &ShedRef) {
     let started_at = Instant::now();
     match snapshot_ref(&app.session, r) {
-        Ok(bytes) => {
+        Ok(output) => {
+            let (stdout, structured) = match output {
+                SnapshotOutput::Bytes(b) => (Bytes::from(b), None),
+                SnapshotOutput::Structured(v) => (Bytes::new(), Some(v)),
+            };
             let capture = Capture {
-                stdout: Bytes::from(bytes),
+                stdout,
                 stderr: Bytes::new(),
                 exit_code: Some(0),
                 started_at,
                 finished_at: Some(Instant::now()),
                 truncated: false,
                 snapshotted: true,
+                structured,
             };
             app.session.set_capture(id, capture);
             app.session.set_state(id, ShedState::Done(0));
@@ -2413,6 +2432,7 @@ fn drain_streams(app: &mut App) {
             finished_at: None,
             truncated: false,
             snapshotted: false,
+            structured: None,
         };
         app.session.set_capture(id, partial);
     }
@@ -3643,13 +3663,28 @@ fn open_body_context_menu(app: &mut App, region: &BodyRegion, col: u16, row: u16
     });
 }
 
-/// Plain UTF-8 stdout of a shed's capture, or `None` if the shed is
-/// missing or has no capture yet. The pipeline is *not* applied — users
-/// asking for "copy whole output" usually want the raw captured text,
-/// not the filtered view.
+/// Plain text for "Copy whole output". For byte-stream captures this is
+/// the raw stdout (pipeline NOT applied — users typically want the
+/// captured text, not the filtered view). For structured snapshot
+/// captures (no stdout bytes to copy), the inherited structured value
+/// is rendered the same way the shed body renders it, so the clipboard
+/// gets what the user sees.
 fn shed_plain_output(session: &Session, id: ShedId) -> Option<String> {
     let shed = session.shed(id)?;
     let capture = shed.capture.as_ref()?;
+    if let Some(value) = &capture.structured {
+        let lines = render_pipeline_value_with_max(
+            PipelineValue::Structured(value.clone()),
+            usize::MAX,
+            false,
+        );
+        let mut out = String::new();
+        for line in &lines {
+            out.push_str(&line_plain_text(line));
+            out.push('\n');
+        }
+        return Some(out);
+    }
     Some(String::from_utf8_lossy(&capture.stdout).into_owned())
 }
 
@@ -4196,7 +4231,7 @@ fn render_csv_bytes(shed: &Shed, delim: u8) -> Vec<u8> {
     let Some(capture) = shed.capture.as_ref() else {
         return Vec::new();
     };
-    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
+    let value = match apply_pipeline(capture, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
@@ -4246,7 +4281,7 @@ fn render_json_bytes(shed: &Shed) -> Vec<u8> {
     let Some(capture) = shed.capture.as_ref() else {
         return Vec::new();
     };
-    let value = match apply_pipeline(&capture.stdout, &shed.pipeline) {
+    let value = match apply_pipeline(capture, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
@@ -4459,7 +4494,7 @@ fn jump_to_search(app: &mut App, forward: bool) {
 
 fn compute_shed_lines(shed: &Shed) -> Vec<Line<'static>> {
     match shed.capture.as_ref() {
-        Some(capture) => match apply_pipeline(&capture.stdout, &shed.pipeline) {
+        Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
             Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
@@ -6299,7 +6334,7 @@ fn draw_shed_expand(f: &mut Frame, app: &App) {
 
     // Compute the full pipeline output (no row cap) and the lines to render.
     let all_lines: Vec<Line<'static>> = match shed.capture.as_ref() {
-        Some(capture) => match apply_pipeline(&capture.stdout, &shed.pipeline) {
+        Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
             Ok((value, _drops)) => render_pipeline_value_with_max(value, usize::MAX, false),
             Err(e) => filter_error_lines(&e),
         },
@@ -6453,7 +6488,7 @@ fn hypothetical_outcome(
         }
         _ => {}
     }
-    Some(apply_pipeline(&capture.stdout, &hypothetical))
+    Some(apply_pipeline(capture, &hypothetical))
 }
 
 fn draw_header(f: &mut Frame, area: Rect, title: &str) {
@@ -6763,7 +6798,7 @@ fn render_shed(
     let pipeline_outcome = shed
         .capture
         .as_ref()
-        .map(|c| apply_pipeline(&c.stdout, &shed.pipeline));
+        .map(|c| apply_pipeline(c, &shed.pipeline));
     let drops: Vec<usize> = pipeline_outcome
         .as_ref()
         .and_then(|r| r.as_ref().ok())
@@ -6925,10 +6960,13 @@ fn render_note_lines(text: &str) -> Vec<Line<'static>> {
 /// drop counts (rows silently filtered by a `where` due to type mismatch),
 /// indexed by filter position in the pipeline.
 fn apply_pipeline(
-    bytes: &bytes::Bytes,
+    capture: &Capture,
     pipeline: &[FilterSpec],
 ) -> Result<(PipelineValue, Vec<usize>), String> {
-    let mut value = PipelineValue::Bytes(bytes.clone());
+    let mut value = match &capture.structured {
+        Some(v) => PipelineValue::Structured(v.clone()),
+        None => PipelineValue::Bytes(capture.stdout.clone()),
+    };
     let mut drops: Vec<usize> = vec![0; pipeline.len()];
     for (i, filter) in pipeline.iter().enumerate() {
         match apply_with_notes(filter, value) {
@@ -8095,6 +8133,7 @@ mod tests {
                 finished_at: Some(Instant::now()),
                 truncated: false,
                 snapshotted: false,
+                structured: None,
             }),
             pipeline: Vec::new(),
             state: ShedState::Done(0),
@@ -9071,7 +9110,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_ref_renders_structured_as_json_for_pinned() {
+    fn snapshot_ref_returns_structured_when_source_pipeline_yields_rows() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         s.set_capture(src, Capture {
@@ -9082,21 +9121,29 @@ mod tests {
             finished_at: Some(Instant::now()),
             truncated: false,
             snapshotted: false,
+            structured: None,
         });
         s.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
         s.pin(src, "nums".into());
 
-        let bytes = snapshot_ref(&s, &ShedRef::Name("nums".into())).expect("snapshot");
-        let text = String::from_utf8(bytes).unwrap();
-        // from-lines yields a list of records {line: ...}. Pretty JSON.
-        assert!(text.contains("\"line\""));
-        assert!(text.contains("\"1\""));
-        assert!(text.contains("\"2\""));
-        assert!(text.contains("\"3\""));
+        let out = snapshot_ref(&s, &ShedRef::Name("nums".into())).expect("snapshot");
+        match out {
+            SnapshotOutput::Structured(Value::List(rows)) => {
+                assert_eq!(rows.len(), 3);
+                // Each row is a record with key "line".
+                for row in &rows {
+                    let Value::Record(rec) = row else {
+                        panic!("expected record, got {row:?}");
+                    };
+                    assert!(rec.contains_key("line"));
+                }
+            }
+            other => panic!("expected Structured(List), got {other:?}"),
+        }
     }
 
     #[test]
-    fn snapshot_ref_by_id_works_without_a_pinned_name() {
+    fn snapshot_ref_by_id_passes_bytes_through_when_source_has_no_pipeline() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["echo".into(), "hi".into()]);
         s.set_capture(src, Capture {
@@ -9107,10 +9154,14 @@ mod tests {
             finished_at: Some(Instant::now()),
             truncated: false,
             snapshotted: false,
+            structured: None,
         });
         // Unpinned: only the %N form can reach it.
-        let bytes = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
-        assert_eq!(bytes, b"hello\n");
+        let out = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
+        match out {
+            SnapshotOutput::Bytes(b) => assert_eq!(b, b"hello\n"),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9120,6 +9171,141 @@ mod tests {
         assert!(err.contains("@nope"), "got: {err}");
         let err = snapshot_ref(&s, &ShedRef::Id(ShedId(99))).unwrap_err();
         assert!(err.contains("%99"), "got: {err}");
+    }
+
+    /// Build a source shed with `from-json` of a deliberately
+    /// non-alphabetical key order, then verify that a downstream
+    /// snapshot shed inherits the structured value, NOT a JSON
+    /// round-trip — column order must match the source exactly.
+    #[test]
+    fn snapshot_carries_structured_value_with_column_order_preserved() {
+        use indexmap::IndexMap;
+        let mut s = Session::new();
+        // Two records with columns in z/a/m order — alphabetic sorting
+        // (or naive JSON object reordering) would shuffle them.
+        let mut row1 = IndexMap::new();
+        row1.insert("z".to_string(), Value::Int(1));
+        row1.insert("a".to_string(), Value::Int(2));
+        row1.insert("m".to_string(), Value::Int(3));
+        let src = s.add_shed(vec!["mksrc".into()]);
+        s.set_capture(src, Capture {
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+            structured: Some(Value::List(vec![Value::Record(row1)])),
+        });
+
+        let out = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
+        match out {
+            SnapshotOutput::Structured(Value::List(rows)) => {
+                let Value::Record(rec) = &rows[0] else { panic!("expected record") };
+                let cols: Vec<&str> = rec.keys().map(|s| s.as_str()).collect();
+                assert_eq!(cols, vec!["z", "a", "m"], "column order preserved");
+            }
+            other => panic!("expected Structured(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn populate_snapshot_writes_structured_when_source_yields_rows() {
+        let mut app = App::new();
+        app.history.clear();
+        let src = app.session.add_shed(vec!["seq".into()]);
+        app.session.set_capture(src, Capture {
+            stdout: Bytes::from_static(b"1\n2\n"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+            structured: None,
+        });
+        app.session.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
+
+        let dst = app.session.add_shed(vec![format!("%{}", src.0)]);
+        populate_snapshot(&mut app, dst, &ShedRef::Id(src));
+
+        let cap = app.session.shed(dst).unwrap().capture.as_ref().unwrap();
+        assert!(cap.stdout.is_empty(), "structured snapshot leaves stdout empty");
+        let structured = cap.structured.as_ref().expect("structured populated");
+        let Value::List(rows) = structured else { panic!("expected list") };
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn populate_snapshot_writes_bytes_when_source_has_no_parser() {
+        let mut app = App::new();
+        app.history.clear();
+        let src = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_capture(src, Capture {
+            stdout: Bytes::from_static(b"hello\n"),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+            structured: None,
+        });
+        let dst = app.session.add_shed(vec![format!("%{}", src.0)]);
+        populate_snapshot(&mut app, dst, &ShedRef::Id(src));
+
+        let cap = app.session.shed(dst).unwrap().capture.as_ref().unwrap();
+        assert_eq!(cap.stdout.as_ref(), b"hello\n");
+        assert!(cap.structured.is_none());
+    }
+
+    #[test]
+    fn compute_schema_at_zero_reads_inherited_structured_columns() {
+        let mut s = Session::new();
+        let id = s.add_shed(vec!["dst".into()]);
+        use indexmap::IndexMap;
+        let mut row = IndexMap::new();
+        row.insert("foo".to_string(), Value::Int(1));
+        row.insert("bar".to_string(), Value::Int(2));
+        s.set_capture(id, Capture {
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: true,
+            structured: Some(Value::List(vec![Value::Record(row)])),
+        });
+        let shed = s.shed(id).unwrap();
+        // No filters: schema should reflect the inherited structured value.
+        assert_eq!(compute_schema_at(shed, 0), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn apply_pipeline_starts_from_structured_when_capture_has_it() {
+        // Source-of-truth check: a capture with structured + empty stdout
+        // + empty pipeline produces PipelineValue::Structured(...), not
+        // PipelineValue::Bytes(empty).
+        use indexmap::IndexMap;
+        let mut row = IndexMap::new();
+        row.insert("x".to_string(), Value::Int(42));
+        let cap = Capture {
+            stdout: Bytes::new(),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: true,
+            structured: Some(Value::List(vec![Value::Record(row)])),
+        };
+        let (out, _) = apply_pipeline(&cap, &[]).expect("apply");
+        match out {
+            PipelineValue::Structured(Value::List(rows)) => assert_eq!(rows.len(), 1),
+            other => panic!("expected structured list, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9285,6 +9471,7 @@ mod tests {
             finished_at: Some(Instant::now()),
             truncated: false,
             snapshotted: false,
+            structured: None,
         });
         app.session.set_cursor(Some(id));
 
@@ -10243,6 +10430,7 @@ mod tests {
                 finished_at: Some(Instant::now()),
                 truncated: false,
                 snapshotted: false,
+                structured: None,
             });
         }
         app.body_regions.push(make_body_region(a, vec!["hello", "world"]));
@@ -10278,6 +10466,7 @@ mod tests {
                 finished_at: Some(Instant::now()),
                 truncated: false,
                 snapshotted: false,
+                structured: None,
             });
         }
         // Empty line at row 3.
@@ -10409,6 +10598,7 @@ mod tests {
                 finished_at: Some(Instant::now()),
                 truncated: false,
                 snapshotted: false,
+                structured: None,
             });
         }
         app.body_regions.push(make_body_region(a, vec!["hello"]));

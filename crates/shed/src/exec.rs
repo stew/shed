@@ -240,6 +240,7 @@ fn run_blocking(
         finished_at: Some(finished_at),
         truncated,
         snapshotted: false,
+        structured: None,
     }))
 }
 

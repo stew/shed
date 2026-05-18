@@ -228,6 +228,7 @@ mod tests {
             finished_at: Some(Instant::now()),
             truncated: false,
             snapshotted: false,
+            structured: None,
         }
     }
 

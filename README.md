@@ -191,12 +191,13 @@ need real shell semantics.
 
 ### Pinned references (`@name`)
 
-A pinned shed (`p` to pin) gets a name. Type `@name` at the prompt and
-shed creates a new shed whose capture is a *snapshot* of `@name`'s
-current pipeline output:
+A pinned shed (`p` to pin) gets a name. Type `@name` (or `%N` for any
+shed by id, pinned or not) at the prompt and shed creates a new shed
+whose capture is a *snapshot* of the source's current pipeline output:
 
-- structured output (rows from a parser) is rendered as pretty JSON, so
-  the snapshot shed typically starts with `from-json`
+- structured output (rows from a parser) carries over as typed rows —
+  the downstream shed's pipeline sees the columns immediately, in the
+  source's original order, with no explicit `from-json` needed
 - raw bytes are passed through unchanged
 
 The snapshot is taken at create time. It does *not* re-evaluate when the
