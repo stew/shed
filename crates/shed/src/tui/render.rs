@@ -27,8 +27,8 @@ use shed_core::{
 use super::PREVIEW_LINES;
 use super::{
     App, BodyRegion, CellLayout, CellRegion, ClickAction, ClickRegion, EditMode, EnvInputMode,
-    ExitPrompt, FilterEditState, Focus, FormField, MAX_SORT_KEYS, NotePosition, WhereOp, ansi,
-    apply_pipeline, delim_label, filter_edit_field_hints, find_matches_regex,
+    ExitPrompt, FilterEditState, Focus, FormField, InputKind, MAX_SORT_KEYS, NotePosition, WhereOp,
+    ansi, apply_pipeline, delim_label, filter_edit_field_hints, find_matches_regex,
     highlight_matches_in_line, input_spans_with_cursor, line_plain_text, matches_for_input,
     render_input_bar, tabs::draw_tab_bar, try_compile,
 };
@@ -1495,51 +1495,56 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         }
         // AwaitingPath falls through; the save_input_mode bar takes over.
     }
-    if app.save_input_mode {
+    if app.is_input(InputKind::Save) {
         f.render_widget(
-            render_input_bar("save to: ", Color::Green, &app.save_input, app.save_cursor),
+            render_input_bar(
+                "save to: ",
+                Color::Green,
+                app.input_text(),
+                app.input_cursor(),
+            ),
             area,
         );
         return;
     }
-    if app.open_input_mode {
+    if app.is_input(InputKind::Open) {
         f.render_widget(
-            render_input_bar("open: ", Color::Green, &app.open_input, app.open_cursor),
+            render_input_bar("open: ", Color::Green, app.input_text(), app.input_cursor()),
             area,
         );
         return;
     }
-    if app.rerun_input_mode {
+    if app.is_input(InputKind::Rerun) {
         f.render_widget(
             render_input_bar(
                 "rerun: ",
                 Color::LightCyan,
-                &app.rerun_input,
-                app.rerun_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
         return;
     }
-    if app.cmd_edit_input_mode {
+    if app.is_input(InputKind::CmdEdit) {
         f.render_widget(
             render_input_bar(
                 "edit cmd: ",
                 Color::LightMagenta,
-                &app.cmd_edit_input,
-                app.cmd_edit_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
         return;
     }
-    if app.rename_tab_input_mode {
+    if app.is_input(InputKind::RenameTab) {
         f.render_widget(
             render_input_bar(
                 "tab name: ",
                 Color::Cyan,
-                &app.rename_tab_input,
-                app.rename_tab_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
@@ -1571,45 +1576,45 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(widget, area);
         return;
     }
-    if app.alias_name_input_mode {
+    if app.is_input(InputKind::AliasName) {
         f.render_widget(
             render_input_bar(
                 "alias name: ",
                 Color::LightMagenta,
-                &app.alias_name_input,
-                app.alias_name_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
         return;
     }
-    if app.pin_input_mode {
+    if app.is_input(InputKind::Pin) {
         f.render_widget(
             render_input_bar(
                 "pin name: ",
                 Color::LightMagenta,
-                &app.pin_input,
-                app.pin_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
         return;
     }
-    if app.write_input_mode {
+    if app.is_input(InputKind::Write) {
         f.render_widget(
             render_input_bar(
                 "write to: ",
                 Color::Yellow,
-                &app.write_input,
-                app.write_cursor,
+                app.input_text(),
+                app.input_cursor(),
             ),
             area,
         );
         return;
     }
-    if app.search_input_mode {
-        let invalid = !app.search_input.is_empty()
-            && try_compile(&app.search_input, app.search_case_insensitive).is_none();
+    if app.is_input(InputKind::Search) {
+        let invalid = !app.input_text().is_empty()
+            && try_compile(app.input_text(), app.search_case_insensitive).is_none();
         let prefix = if app.search_input_backward { "?" } else { "/" };
         let mut spans = vec![
             Span::raw(" ".to_string()),
@@ -1621,8 +1626,8 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ),
         ];
         spans.extend(input_spans_with_cursor(
-            &app.search_input,
-            app.search_cursor,
+            app.input_text(),
+            app.input_cursor(),
             Color::Yellow,
         ));
         if app.search_case_insensitive {

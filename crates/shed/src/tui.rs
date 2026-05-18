@@ -164,6 +164,44 @@ enum ContextMenuAction {
     InsertAtPrompt(String),
 }
 
+/// Which single-line input bar is currently open. At most one input
+/// bar is active at a time across the whole app, so they all share one
+/// state slot ([`App::input_bar`]) rather than the historical 9-way
+/// `*_input_mode/text/cursor` field tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputKind {
+    /// Save-as path bar (Ctrl-S without a bound notebook path).
+    Save,
+    /// Open-notebook path bar (Ctrl-O).
+    Open,
+    /// Pin-shed name bar (`p` on a shed).
+    Pin,
+    /// Rerun argv bar (`r` on a shed). Pairs with `App::rerun_source_id`.
+    Rerun,
+    /// Write-output-to-file path bar (`w` on a shed).
+    Write,
+    /// In-place command editor (`e`/`f` on a shed's argv).
+    CmdEdit,
+    /// Alias-name bar (`A` on a shed).
+    AliasName,
+    /// Pager search bar (`/` or `?` in ShedExpand). Pairs with
+    /// `App::search_input_backward` and `App::search_case_insensitive`.
+    Search,
+    /// Rename-tab bar (F2).
+    RenameTab,
+}
+
+/// The single-line input bar's typed state. Lives on `App` as
+/// `input_bar: Option<InputBar>`. Helper methods on `App`
+/// (`open_input`, `close_input`, `is_input`, `input_text(_mut)`,
+/// `input_cursor(_mut)`) hide the Option matching at the call site.
+#[derive(Debug, Clone)]
+pub(crate) struct InputBar {
+    pub(crate) kind: InputKind,
+    pub(crate) text: String,
+    pub(crate) cursor: usize,
+}
+
 struct RunningCommand {
     handle: CommandTask,
     killer: Killer,
@@ -472,9 +510,7 @@ const ACTIONS: &[Action] = &[
         enabled: shed_selected,
         handler: |app| {
             app.focus = Focus::ShedCursor;
-            app.write_input_mode = true;
-            app.write_input.clear();
-            app.write_cursor = 0;
+            app.open_input(InputKind::Write, String::new());
         },
     },
     Action {
@@ -488,9 +524,7 @@ const ACTIONS: &[Action] = &[
                     .shed(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
-                app.pin_cursor = existing.len();
-                app.pin_input = existing;
-                app.pin_input_mode = true;
+                app.open_input(InputKind::Pin, existing);
                 app.focus = Focus::ShedCursor;
             }
         },
@@ -524,9 +558,7 @@ const ACTIONS: &[Action] = &[
                 if let Some(shed) = app.session.shed(id) {
                     let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
                         .unwrap_or_else(|_| shed.argv.join(" "));
-                    app.rerun_cursor = joined.len();
-                    app.rerun_input = joined;
-                    app.rerun_input_mode = true;
+                    app.open_input(InputKind::Rerun, joined);
                     app.rerun_source_id = Some(id);
                 }
             }
@@ -1578,24 +1610,12 @@ struct App {
     /// since the last edit. Cleared on any non-Tab key in a completion
     /// context. See [`cycle_completion`].
     pub(crate) completion: Option<CompletionState>,
-    pub(crate) write_input_mode: bool,
-    pub(crate) write_input: String,
-    pub(crate) write_cursor: usize,
-    pub(crate) pin_input_mode: bool,
-    pub(crate) pin_input: String,
-    pub(crate) pin_cursor: usize,
-    pub(crate) rerun_input_mode: bool,
-    pub(crate) rerun_input: String,
-    pub(crate) rerun_cursor: usize,
     pub(crate) rerun_source_id: Option<ShedId>,
     pub(crate) pending_rerun: Option<RerunRequest>,
     /// True when the ShedCursor's "filter cursor" has been pulled left
     /// past the first filter onto the command itself. Visually highlights
     /// the argv span; Enter opens the in-place command editor.
     pub(crate) command_focused: bool,
-    pub(crate) cmd_edit_input_mode: bool,
-    pub(crate) cmd_edit_input: String,
-    pub(crate) cmd_edit_cursor: usize,
     pub(crate) last_cwd: Option<PathBuf>,
     pub(crate) env_edit: Option<EnvEditState>,
     pub(crate) note_edit: Option<NoteEditState>,
@@ -1606,9 +1626,6 @@ struct App {
     pub(crate) pipeline_cursor: usize,
     pub(crate) expand_scroll: usize,
     pub(crate) search_query: String,
-    pub(crate) search_input: String,
-    pub(crate) search_cursor: usize,
-    pub(crate) search_input_mode: bool,
     pub(crate) search_anchor_scroll: usize,
     pub(crate) search_input_backward: bool,
     pub(crate) search_case_insensitive: bool,
@@ -1625,9 +1642,6 @@ struct App {
     /// from `aliases_path` on startup, rewritten on every change.
     pub(crate) aliases: AliasFile,
     pub(crate) aliases_path: Option<PathBuf>,
-    pub(crate) alias_name_input_mode: bool,
-    pub(crate) alias_name_input: String,
-    pub(crate) alias_name_cursor: usize,
     /// Pending overwrite confirmation when `A` collides with an existing
     /// alias name. Holds the would-be entry; user resolves with y/n/c.
     pub(crate) alias_overwrite: Option<Alias>,
@@ -1659,14 +1673,11 @@ struct App {
     /// structural mutation so redo only chains forward through actual
     /// undos.
     pub(crate) redo_stack: Vec<Session>,
-    /// Save-as input bar (Ctrl-S without a bound path).
-    pub(crate) save_input_mode: bool,
-    pub(crate) save_input: String,
-    pub(crate) save_cursor: usize,
-    /// Open input bar (Ctrl-O).
-    pub(crate) open_input_mode: bool,
-    pub(crate) open_input: String,
-    pub(crate) open_cursor: usize,
+    /// The single-line input bar at the bottom of the screen, when one
+    /// is open. At most one is open at a time (save / open / pin /
+    /// rerun / write / cmd-edit / alias-name / search / rename-tab —
+    /// see [`InputKind`]).
+    pub(crate) input_bar: Option<InputBar>,
     /// "Save before quitting?" exit prompt. Showing while non-None;
     /// keys map to y / n / c (cancel).
     pub(crate) exit_prompt: Option<ExitPrompt>,
@@ -1684,10 +1695,6 @@ struct App {
     /// per-tab persistent state in `stashed`.
     pub(crate) tabs: Vec<TabSlot>,
     pub(crate) active_tab: usize,
-    /// True while the tab-rename input bar is open.
-    pub(crate) rename_tab_input_mode: bool,
-    pub(crate) rename_tab_input: String,
-    pub(crate) rename_tab_cursor: usize,
 }
 
 /// Disposition of the save-on-quit prompt. `AwaitingPath` is the rare
@@ -1730,21 +1737,9 @@ impl App {
             history: load_history_from_default_path().unwrap_or_default(),
             history_cursor: None,
             completion: None,
-            write_input_mode: false,
-            write_input: String::new(),
-            write_cursor: 0,
-            pin_input_mode: false,
-            pin_input: String::new(),
-            pin_cursor: 0,
-            rerun_input_mode: false,
-            rerun_input: String::new(),
-            rerun_cursor: 0,
             rerun_source_id: None,
             pending_rerun: None,
             command_focused: false,
-            cmd_edit_input_mode: false,
-            cmd_edit_input: String::new(),
-            cmd_edit_cursor: 0,
             last_cwd: None,
             env_edit: None,
             note_edit: None,
@@ -1755,9 +1750,6 @@ impl App {
             pipeline_cursor: 0,
             expand_scroll: 0,
             search_query: String::new(),
-            search_input: String::new(),
-            search_cursor: 0,
-            search_input_mode: false,
             search_anchor_scroll: 0,
             search_input_backward: false,
             search_case_insensitive: false,
@@ -1768,9 +1760,6 @@ impl App {
             notebook_path: None,
             aliases: load_aliases_from_default_path().unwrap_or_default(),
             aliases_path: aliases_file_path(),
-            alias_name_input_mode: false,
-            alias_name_input: String::new(),
-            alias_name_cursor: 0,
             alias_overwrite: None,
             alias_manage: None,
             dirty: false,
@@ -1779,21 +1768,63 @@ impl App {
             chain_in_flight: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            save_input_mode: false,
-            save_input: String::new(),
-            save_cursor: 0,
-            open_input_mode: false,
-            open_input: String::new(),
-            open_cursor: 0,
+            input_bar: None,
             exit_prompt: None,
             click_regions: Vec::new(),
             body_regions: Vec::new(),
             context_menu: None,
             tabs: vec![TabSlot::new_active(None)],
             active_tab: 0,
-            rename_tab_input_mode: false,
-            rename_tab_input: String::new(),
-            rename_tab_cursor: 0,
+        }
+    }
+
+    /// Open an input bar. Replaces any currently-open bar — only one
+    /// can be active at a time. `initial` pre-fills the text; the
+    /// cursor lands at the end.
+    pub(crate) fn open_input(&mut self, kind: InputKind, initial: String) {
+        let cursor = initial.len();
+        self.input_bar = Some(InputBar {
+            kind,
+            text: initial,
+            cursor,
+        });
+    }
+
+    /// Close any open input bar.
+    pub(crate) fn close_input(&mut self) {
+        self.input_bar = None;
+    }
+
+    /// `true` when the currently-open input bar is of `kind`.
+    pub(crate) fn is_input(&self, kind: InputKind) -> bool {
+        self.input_bar.as_ref().map(|b| b.kind) == Some(kind)
+    }
+
+    pub(crate) fn input_text(&self) -> &str {
+        self.input_bar
+            .as_ref()
+            .map(|b| b.text.as_str())
+            .unwrap_or("")
+    }
+
+    pub(crate) fn input_cursor(&self) -> usize {
+        self.input_bar.as_ref().map(|b| b.cursor).unwrap_or(0)
+    }
+
+    /// Mutable handles to the open bar's text + cursor for readline
+    /// editing helpers. Returns `None` if no bar is open.
+    pub(crate) fn input_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        self.input_bar
+            .as_mut()
+            .map(|b| (&mut b.text, &mut b.cursor))
+    }
+
+    /// Take the open bar's text out, replacing it with empty and
+    /// closing the bar. Used by commit handlers that consume the input.
+    pub(crate) fn take_input_text(&mut self) -> String {
+        match self.input_bar.take() {
+            Some(b) => b.text,
+            None => String::new(),
         }
     }
 
@@ -2200,17 +2231,13 @@ fn open_cmd_edit(app: &mut App) {
     }
     let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| shed.argv.join(" "));
-    app.cmd_edit_cursor = joined.len();
-    app.cmd_edit_input = joined;
-    app.cmd_edit_input_mode = true;
+    app.open_input(InputKind::CmdEdit, joined);
 }
 
 /// Apply the edited command to the cursor shed in place, then queue
 /// the shed plus any pinned-name dependents for re-run.
 fn commit_cmd_edit(app: &mut App) {
-    let input = std::mem::take(&mut app.cmd_edit_input);
-    app.cmd_edit_input_mode = false;
-    app.cmd_edit_cursor = 0;
+    let input = app.take_input_text();
     let trimmed = input.trim();
     if trimmed.is_empty() {
         app.flash = Some("command required".into());
@@ -2660,15 +2687,15 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     // Notebook save/open input bars are overlaid on top of any focus.
-    if app.save_input_mode {
+    if app.is_input(InputKind::Save) {
         handle_save_input_key(app, key);
         return;
     }
-    if app.open_input_mode {
+    if app.is_input(InputKind::Open) {
         handle_open_input_key(app, key);
         return;
     }
-    if app.rename_tab_input_mode {
+    if app.is_input(InputKind::RenameTab) {
         handle_rename_tab_input_key(app, key);
         return;
     }
@@ -2853,20 +2880,17 @@ fn begin_save(app: &mut App) {
         save_to_path(app, &path);
         return;
     }
-    app.save_input.clear();
-    app.save_cursor = 0;
-    app.save_input_mode = true;
+    app.open_input(InputKind::Save, String::new());
 }
 
 /// Always open the input bar; the user must type or paste a path.
 fn begin_open(app: &mut App) {
-    app.open_input = app
+    let initial = app
         .notebook_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    app.open_cursor = app.open_input.len();
-    app.open_input_mode = true;
+    app.open_input(InputKind::Open, initial);
 }
 
 fn save_to_path(app: &mut App, path: &std::path::Path) {
@@ -2919,11 +2943,13 @@ fn load_from_path(app: &mut App, path: &std::path::Path) {
 }
 
 fn handle_save_input_key(app: &mut App, key: KeyEvent) {
-    match handle_text_input(&mut app.save_input, &mut app.save_cursor, &key) {
+    let outcome = {
+        let (t, c) = app.input_mut().expect("input bar open");
+        handle_text_input(t, c, &key)
+    };
+    match outcome {
         InputOutcome::Cancel => {
-            app.save_input_mode = false;
-            app.save_input.clear();
-            app.save_cursor = 0;
+            app.close_input();
             // If the save was triggered by the exit prompt and the user
             // bailed out, drop the exit prompt rather than continuing to
             // hold them hostage.
@@ -2932,9 +2958,7 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
             }
         }
         InputOutcome::Commit => {
-            let path_str = std::mem::take(&mut app.save_input);
-            app.save_input_mode = false;
-            app.save_cursor = 0;
+            let path_str = app.take_input_text();
             let trimmed = path_str.trim();
             if trimmed.is_empty() {
                 app.flash = Some("path required".into());
@@ -2955,16 +2979,16 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_open_input_key(app: &mut App, key: KeyEvent) {
-    match handle_text_input(&mut app.open_input, &mut app.open_cursor, &key) {
+    let outcome = {
+        let (t, c) = app.input_mut().expect("input bar open");
+        handle_text_input(t, c, &key)
+    };
+    match outcome {
         InputOutcome::Cancel => {
-            app.open_input_mode = false;
-            app.open_input.clear();
-            app.open_cursor = 0;
+            app.close_input();
         }
         InputOutcome::Commit => {
-            let path_str = std::mem::take(&mut app.open_input);
-            app.open_input_mode = false;
-            app.open_cursor = 0;
+            let path_str = app.take_input_text();
             let trimmed = path_str.trim();
             if trimmed.is_empty() {
                 app.flash = Some("path required".into());
@@ -3000,9 +3024,7 @@ fn handle_exit_prompt_key(app: &mut App, key: KeyEvent) {
                 }
             } else {
                 app.exit_prompt = Some(ExitPrompt::AwaitingPath);
-                app.save_input.clear();
-                app.save_cursor = 0;
-                app.save_input_mode = true;
+                app.open_input(InputKind::Save, String::new());
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -3494,44 +3516,50 @@ fn history_step(app: &mut App, delta: i32) {
 }
 
 fn handle_cursor_key(app: &mut App, key: KeyEvent) {
-    if app.rerun_input_mode {
-        match handle_text_input(&mut app.rerun_input, &mut app.rerun_cursor, &key) {
+    if app.is_input(InputKind::Rerun) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_rerun(app),
             InputOutcome::Cancel => {
-                app.rerun_input_mode = false;
-                app.rerun_input.clear();
-                app.rerun_cursor = 0;
+                app.close_input();
                 app.rerun_source_id = None;
             }
             InputOutcome::Continue => {}
         }
         return;
     }
-    if app.pin_input_mode {
-        match handle_text_input(&mut app.pin_input, &mut app.pin_cursor, &key) {
+    if app.is_input(InputKind::Pin) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_pin(app),
             InputOutcome::Cancel => {
-                app.pin_input_mode = false;
-                app.pin_input.clear();
-                app.pin_cursor = 0;
+                app.close_input();
             }
             InputOutcome::Continue => {}
         }
         return;
     }
-    if app.write_input_mode {
-        match handle_text_input(&mut app.write_input, &mut app.write_cursor, &key) {
+    if app.is_input(InputKind::Write) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_write(app),
             InputOutcome::Cancel => {
-                app.write_input_mode = false;
-                app.write_input.clear();
-                app.write_cursor = 0;
+                app.close_input();
             }
             InputOutcome::Continue => {}
         }
         return;
     }
-    if app.cmd_edit_input_mode {
+    if app.is_input(InputKind::CmdEdit) {
         let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
         if !is_tab {
             app.completion = None;
@@ -3547,12 +3575,14 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
-        match handle_text_input(&mut app.cmd_edit_input, &mut app.cmd_edit_cursor, &key) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_cmd_edit(app),
             InputOutcome::Cancel => {
-                app.cmd_edit_input_mode = false;
-                app.cmd_edit_input.clear();
-                app.cmd_edit_cursor = 0;
+                app.close_input();
             }
             InputOutcome::Continue => {}
         }
@@ -3570,13 +3600,15 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    if app.alias_name_input_mode {
-        match handle_text_input(&mut app.alias_name_input, &mut app.alias_name_cursor, &key) {
+    if app.is_input(InputKind::AliasName) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_alias_save(app),
             InputOutcome::Cancel => {
-                app.alias_name_input_mode = false;
-                app.alias_name_input.clear();
-                app.alias_name_cursor = 0;
+                app.close_input();
             }
             InputOutcome::Continue => {}
         }
@@ -3631,9 +3663,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('w') => {
             if app.session.cursor().is_some() {
-                app.write_input_mode = true;
-                app.write_input.clear();
-                app.write_cursor = 0;
+                app.open_input(InputKind::Write, String::new());
             }
         }
         KeyCode::Char('p') => {
@@ -3643,9 +3673,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                     .shed(id)
                     .and_then(|b| b.name.clone())
                     .unwrap_or_default();
-                app.pin_cursor = existing.len();
-                app.pin_input = existing;
-                app.pin_input_mode = true;
+                app.open_input(InputKind::Pin, existing);
             }
         }
         KeyCode::Char('u') => {
@@ -3666,9 +3694,7 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 if let Some(shed) = app.session.shed(id) {
                     let joined = shlex::try_join(shed.argv.iter().map(String::as_str))
                         .unwrap_or_else(|_| shed.argv.join(" "));
-                    app.rerun_cursor = joined.len();
-                    app.rerun_input = joined;
-                    app.rerun_input_mode = true;
+                    app.open_input(InputKind::Rerun, joined);
                     app.rerun_source_id = Some(id);
                 }
             }
@@ -3690,7 +3716,7 @@ fn enter_edit_shed(app: &mut App) {
 /// (run, delete, pin, etc.) live one focus up in ShedCursor. Esc returns
 /// to ShedCursor.
 fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
-    if app.cmd_edit_input_mode {
+    if app.is_input(InputKind::CmdEdit) {
         let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
         if !is_tab {
             app.completion = None;
@@ -3706,12 +3732,14 @@ fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         }
-        match handle_text_input(&mut app.cmd_edit_input, &mut app.cmd_edit_cursor, &key) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Commit => commit_cmd_edit(app),
             InputOutcome::Cancel => {
-                app.cmd_edit_input_mode = false;
-                app.cmd_edit_input.clear();
-                app.cmd_edit_cursor = 0;
+                app.close_input();
             }
             InputOutcome::Continue => {}
         }
@@ -3742,9 +3770,7 @@ fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
 }
 
 fn commit_rerun(app: &mut App) {
-    let input = std::mem::take(&mut app.rerun_input);
-    app.rerun_input_mode = false;
-    app.rerun_cursor = 0;
+    let input = app.take_input_text();
     let source_id = app.rerun_source_id.take();
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -3774,9 +3800,7 @@ fn commit_rerun(app: &mut App) {
 }
 
 fn commit_pin(app: &mut App) {
-    let name = std::mem::take(&mut app.pin_input).trim().to_string();
-    app.pin_input_mode = false;
-    app.pin_cursor = 0;
+    let name = app.take_input_text().trim().to_string();
     let Some(id) = app.session.cursor() else {
         return;
     };
@@ -3841,9 +3865,7 @@ impl WriteFormat {
 }
 
 fn commit_write(app: &mut App) {
-    let path = std::mem::take(&mut app.write_input);
-    app.write_input_mode = false;
-    app.write_cursor = 0;
+    let path = app.take_input_text();
     let path = path.trim();
     if path.is_empty() {
         app.flash = Some("path required".into());
@@ -3999,17 +4021,19 @@ fn value_to_field_string(v: &Value) -> String {
 }
 
 fn handle_shed_expand_key(app: &mut App, key: KeyEvent) {
-    if app.search_input_mode {
-        match handle_text_input(&mut app.search_input, &mut app.search_cursor, &key) {
+    if app.is_input(InputKind::Search) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
             InputOutcome::Cancel => {
-                app.search_input_mode = false;
-                app.search_input.clear();
-                app.search_cursor = 0;
+                app.close_input();
                 app.search_query.clear();
                 app.expand_scroll = app.search_anchor_scroll;
             }
             InputOutcome::Commit => {
-                app.search_input_mode = false;
+                app.close_input();
                 // search_query is already in sync via update_search; nothing to do.
             }
             InputOutcome::Continue => {
@@ -4035,18 +4059,14 @@ fn handle_shed_expand_key(app: &mut App, key: KeyEvent) {
             app.focus = Focus::ShedCursor;
         }
         KeyCode::Char('/') => {
-            app.search_input_mode = true;
+            app.open_input(InputKind::Search, String::new());
             app.search_input_backward = false;
-            app.search_input.clear();
-            app.search_cursor = 0;
             app.search_query.clear();
             app.search_anchor_scroll = app.expand_scroll;
         }
         KeyCode::Char('?') => {
-            app.search_input_mode = true;
+            app.open_input(InputKind::Search, String::new());
             app.search_input_backward = true;
-            app.search_input.clear();
-            app.search_cursor = 0;
             app.search_query.clear();
             app.search_anchor_scroll = app.expand_scroll;
         }
@@ -4085,7 +4105,7 @@ fn handle_shed_expand_key(app: &mut App, key: KeyEvent) {
 /// error — the input bar just shows "(invalid regex)" until the user
 /// finishes typing.
 fn update_search(app: &mut App) {
-    app.search_query = app.search_input.clone();
+    app.search_query = app.input_text().to_string();
     if app.search_query.is_empty() {
         app.expand_scroll = app.search_anchor_scroll;
         return;
@@ -5344,15 +5364,11 @@ fn open_alias_save(app: &mut App) {
         app.flash = Some("no shed selected".into());
         return;
     }
-    app.alias_name_input.clear();
-    app.alias_name_cursor = 0;
-    app.alias_name_input_mode = true;
+    app.open_input(InputKind::AliasName, String::new());
 }
 
 fn commit_alias_save(app: &mut App) {
-    let raw = std::mem::take(&mut app.alias_name_input);
-    app.alias_name_input_mode = false;
-    app.alias_name_cursor = 0;
+    let raw = app.take_input_text();
     let name = match validate_alias_name(&raw) {
         Ok(n) => n,
         Err(e) => {
@@ -5404,9 +5420,7 @@ fn spawn_alias(app: &mut App, alias: &Alias) {
 
     let joined = shlex::try_join(alias.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| alias.argv.join(" "));
-    app.cmd_edit_input = format!("{joined} ");
-    app.cmd_edit_cursor = app.cmd_edit_input.len();
-    app.cmd_edit_input_mode = true;
+    app.open_input(InputKind::CmdEdit, format!("{joined} "));
 }
 
 /// Return the index of the menu item under (col, row), or `None` if the
@@ -7084,11 +7098,10 @@ mod tests {
         app.session.set_state(dep, ShedState::Done(0));
 
         app.session.set_cursor(Some(src));
-        app.cmd_edit_input = "seq 1 5".into();
-        app.cmd_edit_input_mode = true;
+        app.open_input(InputKind::CmdEdit, "seq 1 5".into());
         commit_cmd_edit(&mut app);
 
-        assert!(!app.cmd_edit_input_mode);
+        assert!(!app.is_input(InputKind::CmdEdit));
         assert_eq!(app.session.shed(src).unwrap().argv, vec!["seq", "1", "5"]);
         // Both source (re-run) and dependent (re-snapshot) queued.
         let queued: Vec<_> = app.pending_run_chain.iter().copied().collect();
@@ -7101,8 +7114,7 @@ mod tests {
         app.history.clear();
         let id = app.session.add_shed(vec!["echo".into()]);
         app.session.set_cursor(Some(id));
-        app.cmd_edit_input = r#"echo "unclosed"#.into();
-        app.cmd_edit_input_mode = true;
+        app.open_input(InputKind::CmdEdit, r#"echo "unclosed"#.into());
         commit_cmd_edit(&mut app);
         // argv unchanged, flash set, mode cleared.
         assert_eq!(app.session.shed(id).unwrap().argv, vec!["echo"]);
@@ -7151,11 +7163,10 @@ mod tests {
         app.aliases_path = None;
         let id = app.session.add_shed(vec!["ls".into()]);
         app.session.set_cursor(Some(id));
-        app.alias_name_input = "list".into();
-        app.alias_name_input_mode = true;
+        app.open_input(InputKind::AliasName, "list".into());
 
         commit_alias_save(&mut app);
-        assert!(!app.alias_name_input_mode);
+        assert!(!app.is_input(InputKind::AliasName));
         assert!(app.aliases.lookup("list").is_some());
         assert!(app.alias_overwrite.is_none());
     }
@@ -7172,8 +7183,7 @@ mod tests {
             argv: vec!["echo".into()],
             pipeline: Vec::new(),
         });
-        app.alias_name_input = "list".into();
-        app.alias_name_input_mode = true;
+        app.open_input(InputKind::AliasName, "list".into());
 
         commit_alias_save(&mut app);
         assert!(app.alias_overwrite.is_some());
@@ -7221,10 +7231,10 @@ mod tests {
         assert_eq!(shed.pipeline.len(), 1);
         assert!(matches!(shed.state, ShedState::Idle));
         assert!(app.command_focused);
-        assert!(app.cmd_edit_input_mode);
+        assert!(app.is_input(InputKind::CmdEdit));
         // Pre-fill ends with a trailing space for easy arg appending.
-        assert!(app.cmd_edit_input.ends_with(' '));
-        assert!(app.cmd_edit_input.starts_with("ls"));
+        assert!(app.input_text().ends_with(' '));
+        assert!(app.input_text().starts_with("ls"));
     }
 
     #[test]

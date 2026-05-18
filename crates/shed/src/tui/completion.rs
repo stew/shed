@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use shed_core::{AliasFile, Session};
 
-use super::{App, Focus};
+use super::{App, Focus, InputKind};
 
 const COMPLETION_BUILTINS: &[&str] = &["cd", "exit", "quit", "export", "unset"];
 const COMPLETION_SLASH: &[&str] = &["/aliases"];
@@ -333,8 +333,8 @@ fn path_or_carapace_completions(base: &str, token: &str) -> Vec<String> {
 fn current_input_state(app: &App) -> Option<(String, usize)> {
     match app.focus {
         Focus::Prompt => Some((app.prompt.clone(), app.prompt_cursor)),
-        Focus::EditShed if app.cmd_edit_input_mode => {
-            Some((app.cmd_edit_input.clone(), app.cmd_edit_cursor))
+        Focus::EditShed if app.is_input(InputKind::CmdEdit) => {
+            Some((app.input_text().to_string(), app.input_cursor()))
         }
         _ => None,
     }
@@ -346,9 +346,11 @@ fn set_current_input(app: &mut App, text: String, cursor: usize) {
             app.prompt = text;
             app.prompt_cursor = cursor;
         }
-        Focus::EditShed if app.cmd_edit_input_mode => {
-            app.cmd_edit_input = text;
-            app.cmd_edit_cursor = cursor;
+        Focus::EditShed if app.is_input(InputKind::CmdEdit) => {
+            if let Some((t, c)) = app.input_mut() {
+                *t = text;
+                *c = cursor;
+            }
         }
         _ => {}
     }

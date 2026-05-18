@@ -26,7 +26,7 @@ use shed_core::{Session, ShedId};
 
 use super::input::handle_text_input;
 use super::{
-    App, ClickAction, ClickRegion, Focus, HandoverRequest, RerunRequest, RunningCommand,
+    App, ClickAction, ClickRegion, Focus, HandoverRequest, InputKind, RerunRequest, RunningCommand,
     collapse_home_in_path, drain_streams, pinned_entries_json, reap_completed,
 };
 
@@ -169,20 +169,9 @@ impl App {
     /// handled by [`App::stash_active`] / [`App::restore_stashed`].
     pub(super) fn close_transient_state(&mut self) {
         self.completion = None;
-        self.write_input_mode = false;
-        self.write_input.clear();
-        self.write_cursor = 0;
-        self.pin_input_mode = false;
-        self.pin_input.clear();
-        self.pin_cursor = 0;
-        self.rerun_input_mode = false;
-        self.rerun_input.clear();
-        self.rerun_cursor = 0;
+        self.input_bar = None;
         self.rerun_source_id = None;
         self.command_focused = false;
-        self.cmd_edit_input_mode = false;
-        self.cmd_edit_input.clear();
-        self.cmd_edit_cursor = 0;
         self.env_edit = None;
         self.note_edit = None;
         self.palette_state = None;
@@ -191,27 +180,12 @@ impl App {
         self.pipeline_cursor = 0;
         self.expand_scroll = 0;
         self.search_query.clear();
-        self.search_input.clear();
-        self.search_cursor = 0;
-        self.search_input_mode = false;
         self.search_anchor_scroll = 0;
         self.search_input_backward = false;
-        self.alias_name_input_mode = false;
-        self.alias_name_input.clear();
-        self.alias_name_cursor = 0;
         self.alias_overwrite = None;
         self.alias_manage = None;
-        self.save_input_mode = false;
-        self.save_input.clear();
-        self.save_cursor = 0;
-        self.open_input_mode = false;
-        self.open_input.clear();
-        self.open_cursor = 0;
         self.exit_prompt = None;
         self.context_menu = None;
-        self.rename_tab_input_mode = false;
-        self.rename_tab_input.clear();
-        self.rename_tab_cursor = 0;
     }
 
     /// Switch the active tab to `idx`. No-op if `idx` is already active
@@ -370,9 +344,7 @@ pub(super) fn begin_rename_tab(app: &mut App) {
         .get(app.active_tab)
         .and_then(|s| s.title.clone())
         .unwrap_or_default();
-    app.rename_tab_cursor = initial.len();
-    app.rename_tab_input = initial;
-    app.rename_tab_input_mode = true;
+    app.open_input(InputKind::RenameTab, initial);
 }
 
 /// Dispatch a key while the rename-tab input bar is open. Enter commits;
@@ -380,18 +352,16 @@ pub(super) fn begin_rename_tab(app: &mut App) {
 pub(super) fn handle_rename_tab_input_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
-            let new_name = std::mem::take(&mut app.rename_tab_input);
-            app.rename_tab_input_mode = false;
-            app.rename_tab_cursor = 0;
+            let new_name = app.take_input_text();
             app.rename_active_tab(new_name);
         }
         KeyCode::Esc => {
-            app.rename_tab_input_mode = false;
-            app.rename_tab_input.clear();
-            app.rename_tab_cursor = 0;
+            app.close_input();
         }
         _ => {
-            let _ = handle_text_input(&mut app.rename_tab_input, &mut app.rename_tab_cursor, &key);
+            if let Some((t, c)) = app.input_mut() {
+                let _ = handle_text_input(t, c, &key);
+            }
         }
     }
 }
@@ -699,7 +669,7 @@ mod tests {
         app.tabs[0].title = Some("oldname".into());
         let key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
         assert!(try_handle_tab_key(&mut app, key));
-        assert!(app.rename_tab_input_mode);
-        assert_eq!(app.rename_tab_input, "oldname");
+        assert!(app.is_input(InputKind::RenameTab));
+        assert_eq!(app.input_text(), "oldname");
     }
 }
