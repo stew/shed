@@ -27,6 +27,7 @@ use shed_core::{
 use super::PREVIEW_LINES;
 use super::{
     App, CellLayout, EnvInputMode, NotePosition, ansi, apply_pipeline, delim_label, draw_status,
+    find_matches_regex, highlight_matches_in_line, matches_for_input, try_compile,
 };
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
@@ -954,6 +955,172 @@ pub(super) fn draw_env_edit(f: &mut Frame, app: &App) {
         }
         EnvInputMode::None => draw_status(f, chunks[2], app),
     }
+}
+
+pub(super) fn draw_palette(f: &mut Frame, app: &App) {
+    let Some(state) = app.palette_state.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    draw_header(f, chunks[0], "command palette");
+
+    let input_box = TuiBlock::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let input_widget = Paragraph::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "› ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(state.input.clone()),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]))
+    .block(input_box);
+    f.render_widget(input_widget, chunks[1]);
+
+    let matches = matches_for_input(&state.input, app);
+    let body_area = chunks[2];
+    let visible = body_area.height as usize;
+    let cursor = state.cursor.min(matches.len().saturating_sub(1));
+    let scroll_offset = if cursor >= visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("  (no matches)", dim)));
+    } else {
+        for (i, action) in matches.iter().enumerate().skip(scroll_offset).take(visible) {
+            let selected = i == cursor;
+            let prefix = if selected { "▸ " } else { "  " };
+            let name_style = if selected {
+                highlight
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let desc_style = if selected { highlight } else { dim };
+            lines.push(Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(action.name, name_style),
+                Span::raw("  "),
+                Span::styled(action.description, desc_style),
+            ]));
+        }
+    }
+    let list_widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(list_widget, body_area);
+
+    draw_status(f, chunks[3], app);
+}
+
+pub(super) fn draw_shed_expand(f: &mut Frame, app: &App) {
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let all_lines: Vec<Line<'static>> = match shed.capture.as_ref() {
+        Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
+            Ok((value, _drops)) => {
+                render_pipeline_value_with_max(value, usize::MAX, false, &mut Vec::new())
+            }
+            Err(e) => filter_error_lines(&e),
+        },
+        None => vec![Line::from(Span::styled(
+            "      (no capture)",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let total = all_lines.len();
+    let body_area = chunks[1];
+    let visible = body_area.height as usize;
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.expand_scroll.min(max_scroll);
+    let visible_end = (scroll + visible).min(total);
+
+    let mut title = if total == 0 {
+        format!("inspect  %{}  {}", shed.id.0, shed.argv.join(" "))
+    } else {
+        format!(
+            "inspect  %{}  {}    lines {}-{} of {}",
+            shed.id.0,
+            shed.argv.join(" "),
+            scroll + 1,
+            visible_end,
+            total,
+        )
+    };
+    let regex = try_compile(&app.search_query, app.search_case_insensitive);
+    if !app.search_query.is_empty() {
+        let flags = if app.search_case_insensitive {
+            " (i)"
+        } else {
+            ""
+        };
+        let suffix = match &regex {
+            Some(r) => {
+                let count = find_matches_regex(&all_lines, r).len();
+                format!(
+                    "    /{}{flags}  ({} match{})",
+                    app.search_query,
+                    count,
+                    if count == 1 { "" } else { "es" },
+                )
+            }
+            None => format!("    /{}{flags}  (invalid regex)", app.search_query),
+        };
+        title.push_str(&suffix);
+    }
+    draw_header(f, chunks[0], &title);
+
+    let visible_lines: Vec<Line<'static>> = all_lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|line| match &regex {
+            Some(r) => highlight_matches_in_line(line, r),
+            None => line,
+        })
+        .collect();
+    let para = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+    f.render_widget(para, body_area);
+
+    draw_status(f, chunks[2], app);
 }
 
 #[cfg(test)]
