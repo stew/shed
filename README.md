@@ -94,8 +94,14 @@ tab with activity since you last viewed it.
 
 Tab title defaults to the notebook basename when one is loaded,
 otherwise `tab N`. A user-set title (via F2 or the palette's "Rename
-tab") wins over both. Closing the last tab is refused — Ctrl-D still
-quits.
+tab") wins over both.
+
+With more than one tab open, **Ctrl-D**, `exit`, and `quit` close the
+active tab rather than quitting the program — tabs are independent
+sessions, so the shell-style "close this view" behaviour applies. The
+last tab does quit (or prompts to save unsaved pinned changes). To
+preserve a tab's pinned-shed work before closing it, Ctrl-S first;
+closing an earlier tab is otherwise a deliberate discard.
 
 Background semantics: drain + reap run for every tab each tick, so
 output streams in and finished children get reaped no matter which tab
@@ -210,7 +216,8 @@ itself:
   commands inherit the new cwd. Without an argument, `cd` goes to
   `$HOME`. `cd -` swaps with the previous cwd. `~` and `~/path` are
   expanded. The cwd shows in the header bar (`shed  ·  ~/devel/shed`).
-- **`exit`** / **`quit`** — quit shed (same as Ctrl-D).
+- **`exit`** / **`quit`** — close the active tab; quits shed when only
+  one tab is open. Same semantics as Ctrl-D.
 - **`export KEY=VALUE [KEY=VALUE ...]`** — set environment variables in
   shed's process; subsequent spawned commands inherit them. `export`
   with no args, or a bare key without `=`, is rejected.

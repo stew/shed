@@ -2843,7 +2843,18 @@ fn sanitize_after_restore(app: &mut App) {
 /// Quit if clean; otherwise show the save-changes confirmation. "Dirty"
 /// here means *the pinned sheds have changed since the last save/load*
 /// — unpinned-shed edits are scratch work the user can lose silently.
+///
+/// When more than one tab is open this closes the active tab instead of
+/// quitting — Ctrl-D / `exit` / `quit` is shell-style "close this view",
+/// and tabs are independent views. The save-changes prompt only fires
+/// for the last tab (where there's nowhere else to land); closing an
+/// earlier tab is a deliberate discard, like closing a shell session in
+/// a multiplexer.
 fn request_quit(app: &mut App) {
+    if app.tabs.len() > 1 {
+        app.close_active_tab();
+        return;
+    }
     if has_unsaved_pinned_changes(app) {
         app.exit_prompt = Some(ExitPrompt::Confirm);
     } else {
@@ -4905,7 +4916,10 @@ fn run_cd_builtin(app: &mut App, argv: &[String]) {
 }
 
 fn run_exit_builtin(app: &mut App) {
-    app.quit = true;
+    // Route through request_quit so `exit` / `quit` follow the same
+    // multi-tab semantics as Ctrl-D: close the active tab when more
+    // than one is open, otherwise prompt / quit.
+    request_quit(app);
 }
 
 /// Open the note editor for the cursor shed at `position`. Pre-fills
@@ -8194,5 +8208,49 @@ mod tests {
         request_quit(&mut app);
         assert_eq!(app.exit_prompt, Some(ExitPrompt::Confirm));
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn request_quit_with_multiple_tabs_closes_active_tab_not_app() {
+        let mut app = App::new();
+        app.history.clear();
+        // Pin a shed in tab 0 so the prompt would fire if we hit the
+        // single-tab path — this test verifies that path is skipped.
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.pin(id, "logs".into());
+        let _ = app.new_tab(); // now on tab 1
+        assert_eq!(app.tabs.len(), 2);
+        request_quit(&mut app);
+        // App must NOT quit and must NOT prompt; the active tab closes.
+        assert!(!app.quit);
+        assert!(app.exit_prompt.is_none());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn request_quit_on_last_tab_falls_through_to_quit_prompt_logic() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["ls".into()]);
+        app.session.pin(id, "logs".into());
+        // Only one tab — should prompt for save.
+        assert_eq!(app.tabs.len(), 1);
+        request_quit(&mut app);
+        assert_eq!(app.exit_prompt, Some(ExitPrompt::Confirm));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn run_exit_builtin_closes_active_tab_when_multi_tab() {
+        let mut app = App::new();
+        app.history.clear();
+        let _ = app.new_tab();
+        let _ = app.new_tab();
+        assert_eq!(app.tabs.len(), 3);
+        run_exit_builtin(&mut app);
+        // Closed one tab, didn't quit.
+        assert!(!app.quit);
+        assert_eq!(app.tabs.len(), 2);
     }
 }
