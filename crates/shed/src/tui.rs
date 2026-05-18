@@ -7023,27 +7023,22 @@ fn draw_repl(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // tab bar
+            Constraint::Length(1), // tab bar (now also holds cwd on the right)
             Constraint::Min(1),    // sheds
             Constraint::Length(1), // status
         ])
         .split(f.area());
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| collapse_home_in_path(&p))
-        .unwrap_or_else(|| "?".into());
-    draw_header(f, chunks[0], &cwd);
-    draw_tab_bar(f, chunks[1], app, regions);
-    draw_sheds(f, chunks[2], app, regions, bodies);
-    draw_status(f, chunks[3], app);
+    draw_tab_bar(f, chunks[0], app, regions);
+    draw_sheds(f, chunks[1], app, regions, bodies);
+    draw_status(f, chunks[2], app);
 }
 
 /// Render the tab bar across `area` and register click regions for
-/// per-tab switching plus the `+` new-tab affordance.
+/// per-tab switching plus the `+` new-tab affordance. The current
+/// working directory is rendered right-justified on the same row; tabs
+/// truncate from the right before the cwd does.
 fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
-    let buf = f.buffer_mut();
     let active_style = Style::default()
         .fg(Color::Black)
         .bg(Color::Cyan)
@@ -7055,11 +7050,29 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickReg
     let plus_style = Style::default()
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
+    let cwd_style = Style::default().fg(Color::DarkGray);
 
+    // Build the cwd suffix string first so we can reserve its width
+    // before laying out tabs. One leading space for visual breathing room.
+    let cwd_text = std::env::current_dir()
+        .ok()
+        .map(|p| collapse_home_in_path(&p))
+        .unwrap_or_else(|| "?".into());
+    let cwd_label = format!(" {cwd_text} ");
+    let cwd_width = cwd_label.chars().count() as u16;
+
+    let area_end = area.x.saturating_add(area.width);
+    // Reserve cwd_width on the right (if it fits); tabs lay out up to that.
+    let tab_limit = if cwd_width < area.width {
+        area_end.saturating_sub(cwd_width)
+    } else {
+        area_end
+    };
+
+    let buf = f.buffer_mut();
     let mut x = area.x;
-    let limit = area.x.saturating_add(area.width);
     for (i, slot) in app.tabs.iter().enumerate() {
-        if x >= limit {
+        if x >= tab_limit {
             break;
         }
         let label = format!(" {} {} ", i + 1, slot.display_title(i));
@@ -7071,7 +7084,7 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickReg
             normal_style
         };
         let label_width = label.chars().count() as u16;
-        let drawn_width = label_width.min(limit.saturating_sub(x));
+        let drawn_width = label_width.min(tab_limit.saturating_sub(x));
         if drawn_width == 0 {
             break;
         }
@@ -7081,19 +7094,23 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickReg
             action: ClickAction::SwitchTab(i),
         });
         x = x.saturating_add(drawn_width);
-        if x < limit {
-            // Faint separator between tabs.
+        if x < tab_limit {
             buf.set_string(x, area.y, "│", normal_style);
             x = x.saturating_add(1);
         }
     }
-    // `+` new-tab affordance at the right edge of what's drawn.
-    if x.saturating_add(3) <= limit {
+    // `+` new-tab affordance.
+    if x.saturating_add(3) <= tab_limit {
         buf.set_string(x, area.y, " + ", plus_style);
         regions.push(ClickRegion {
             rect: Rect { x, y: area.y, width: 3, height: 1 },
             action: ClickAction::NewTab,
         });
+    }
+    // cwd, right-justified.
+    if cwd_width <= area.width {
+        let cwd_x = area_end.saturating_sub(cwd_width);
+        buf.set_string(cwd_x, area.y, &cwd_label, cwd_style);
     }
 }
 
