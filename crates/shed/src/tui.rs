@@ -68,7 +68,9 @@ use crate::ansi;
 use crate::exec::{self, CaptureOutcome, ExecError, Killer};
 
 mod clipboard;
+mod completion;
 use clipboard::write_clipboard_osc52;
+use completion::{CompletionState, cycle_completion};
 
 type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
 
@@ -1628,127 +1630,127 @@ fn compute_schema_at(shed: &Shed, before_index: usize) -> Vec<String> {
 }
 
 struct App {
-    session: Session,
-    prompt: String,
+    pub(crate) session: Session,
+    pub(crate) prompt: String,
     /// Byte offset of the insertion caret in [`App::prompt`]. Always a
     /// char boundary in `[0, prompt.len()]`.
-    prompt_cursor: usize,
-    history: Vec<String>,
-    history_cursor: Option<usize>,
+    pub(crate) prompt_cursor: usize,
+    pub(crate) history: Vec<String>,
+    pub(crate) history_cursor: Option<usize>,
     /// Active tab-completion cycle, or `None` if Tab hasn't been pressed
     /// since the last edit. Cleared on any non-Tab key in a completion
     /// context. See [`cycle_completion`].
-    completion: Option<CompletionState>,
-    write_input_mode: bool,
-    write_input: String,
-    write_cursor: usize,
-    pin_input_mode: bool,
-    pin_input: String,
-    pin_cursor: usize,
-    rerun_input_mode: bool,
-    rerun_input: String,
-    rerun_cursor: usize,
-    rerun_source_id: Option<ShedId>,
-    pending_rerun: Option<RerunRequest>,
+    pub(crate) completion: Option<CompletionState>,
+    pub(crate) write_input_mode: bool,
+    pub(crate) write_input: String,
+    pub(crate) write_cursor: usize,
+    pub(crate) pin_input_mode: bool,
+    pub(crate) pin_input: String,
+    pub(crate) pin_cursor: usize,
+    pub(crate) rerun_input_mode: bool,
+    pub(crate) rerun_input: String,
+    pub(crate) rerun_cursor: usize,
+    pub(crate) rerun_source_id: Option<ShedId>,
+    pub(crate) pending_rerun: Option<RerunRequest>,
     /// True when the ShedCursor's "filter cursor" has been pulled left
     /// past the first filter onto the command itself. Visually highlights
     /// the argv span; Enter opens the in-place command editor.
-    command_focused: bool,
-    cmd_edit_input_mode: bool,
-    cmd_edit_input: String,
-    cmd_edit_cursor: usize,
-    last_cwd: Option<PathBuf>,
-    env_edit: Option<EnvEditState>,
-    note_edit: Option<NoteEditState>,
-    palette_state: Option<PaletteState>,
-    palette_prev_focus: Option<Focus>,
-    focus: Focus,
-    filter_edit: Option<FilterEditState>,
-    pipeline_cursor: usize,
-    expand_scroll: usize,
-    search_query: String,
-    search_input: String,
-    search_cursor: usize,
-    search_input_mode: bool,
-    search_anchor_scroll: usize,
-    search_input_backward: bool,
-    search_case_insensitive: bool,
-    flash: Option<String>,
-    quit: bool,
-    running: HashMap<ShedId, RunningCommand>,
-    pending_handover: Option<HandoverRequest>,
+    pub(crate) command_focused: bool,
+    pub(crate) cmd_edit_input_mode: bool,
+    pub(crate) cmd_edit_input: String,
+    pub(crate) cmd_edit_cursor: usize,
+    pub(crate) last_cwd: Option<PathBuf>,
+    pub(crate) env_edit: Option<EnvEditState>,
+    pub(crate) note_edit: Option<NoteEditState>,
+    pub(crate) palette_state: Option<PaletteState>,
+    pub(crate) palette_prev_focus: Option<Focus>,
+    pub(crate) focus: Focus,
+    pub(crate) filter_edit: Option<FilterEditState>,
+    pub(crate) pipeline_cursor: usize,
+    pub(crate) expand_scroll: usize,
+    pub(crate) search_query: String,
+    pub(crate) search_input: String,
+    pub(crate) search_cursor: usize,
+    pub(crate) search_input_mode: bool,
+    pub(crate) search_anchor_scroll: usize,
+    pub(crate) search_input_backward: bool,
+    pub(crate) search_case_insensitive: bool,
+    pub(crate) flash: Option<String>,
+    pub(crate) quit: bool,
+    pub(crate) running: HashMap<ShedId, RunningCommand>,
+    pub(crate) pending_handover: Option<HandoverRequest>,
     /// Path the notebook is bound to (set by `--open`, by Ctrl-O, or by
     /// the first Ctrl-S that prompted for a path). Subsequent Ctrl-S
     /// saves silently to this path.
-    notebook_path: Option<PathBuf>,
+    pub(crate) notebook_path: Option<PathBuf>,
     /// Cross-session aliases: typing the alias name at the prompt
     /// materialises a shed with the saved argv + pipeline. Loaded once
     /// from `aliases_path` on startup, rewritten on every change.
-    aliases: AliasFile,
-    aliases_path: Option<PathBuf>,
-    alias_name_input_mode: bool,
-    alias_name_input: String,
-    alias_name_cursor: usize,
+    pub(crate) aliases: AliasFile,
+    pub(crate) aliases_path: Option<PathBuf>,
+    pub(crate) alias_name_input_mode: bool,
+    pub(crate) alias_name_input: String,
+    pub(crate) alias_name_cursor: usize,
     /// Pending overwrite confirmation when `A` collides with an existing
     /// alias name. Holds the would-be entry; user resolves with y/n/c.
-    alias_overwrite: Option<Alias>,
+    pub(crate) alias_overwrite: Option<Alias>,
     /// Manage view state (Focus::AliasManage). `None` outside the view.
-    alias_manage: Option<AliasManageState>,
+    pub(crate) alias_manage: Option<AliasManageState>,
     /// `true` when the session has unsaved changes. Set whenever a shed
     /// is added, edited, pinned/unpinned, re-run, or its pipeline mutated.
     /// Cleared on save/load.
-    dirty: bool,
+    pub(crate) dirty: bool,
     /// JSON-serialised snapshot of the *pinned* sheds at the last save
     /// or load. The exit prompt fires only when the current pinned JSON
     /// differs from this — unpinned-shed edits are scratch work and
     /// don't nag the user on quit.
-    saved_pinned_json: String,
+    pub(crate) saved_pinned_json: String,
     /// Queue of sheds to run in sequence (head first). Built by walking
     /// `@-ref` deps so a snapshot shed runs its source before itself.
     /// The event loop kicks off one at a time and gates on terminal state.
-    pending_run_chain: VecDeque<ShedId>,
+    pub(crate) pending_run_chain: VecDeque<ShedId>,
     /// Shed currently being processed by the run-in-place machinery.
     /// While `Some`, the next chain item won't start. Cleared once the
     /// shed reaches a terminal state.
-    chain_in_flight: Option<ShedId>,
+    pub(crate) chain_in_flight: Option<ShedId>,
     /// Snapshots taken before each structural mutation. Bounded; oldest
     /// drops first when full. Captures are shared via `bytes::Bytes`
     /// refcounting so the memory cost is roughly one BTreeMap clone per
     /// entry.
-    undo_stack: Vec<Session>,
+    pub(crate) undo_stack: Vec<Session>,
     /// Snapshots that were undone past. Cleared on every fresh
     /// structural mutation so redo only chains forward through actual
     /// undos.
-    redo_stack: Vec<Session>,
+    pub(crate) redo_stack: Vec<Session>,
     /// Save-as input bar (Ctrl-S without a bound path).
-    save_input_mode: bool,
-    save_input: String,
-    save_cursor: usize,
+    pub(crate) save_input_mode: bool,
+    pub(crate) save_input: String,
+    pub(crate) save_cursor: usize,
     /// Open input bar (Ctrl-O).
-    open_input_mode: bool,
-    open_input: String,
-    open_cursor: usize,
+    pub(crate) open_input_mode: bool,
+    pub(crate) open_input: String,
+    pub(crate) open_cursor: usize,
     /// "Save before quitting?" exit prompt. Showing while non-None;
     /// keys map to y / n / c (cancel).
-    exit_prompt: Option<ExitPrompt>,
+    pub(crate) exit_prompt: Option<ExitPrompt>,
     /// Clickable screen regions registered by the last draw pass.
     /// Rebuilt every frame; hit-tested when a mouse click arrives.
-    click_regions: Vec<ClickRegion>,
+    pub(crate) click_regions: Vec<ClickRegion>,
     /// Per-shed body regions captured during the last draw pass. Right
     /// clicks hit-test these to open the line-targeted context menu.
-    body_regions: Vec<BodyRegion>,
+    pub(crate) body_regions: Vec<BodyRegion>,
     /// Open right-click context menu, if any. While `Some`, all mouse
     /// and key events route to the menu before normal focus handling.
-    context_menu: Option<ContextMenu>,
+    pub(crate) context_menu: Option<ContextMenu>,
     /// Tabs. Always non-empty; `tabs[active_tab]` corresponds to the
     /// fields above (its `stashed` is `None`). Other entries hold their
     /// per-tab persistent state in `stashed`.
-    tabs: Vec<TabSlot>,
-    active_tab: usize,
+    pub(crate) tabs: Vec<TabSlot>,
+    pub(crate) active_tab: usize,
     /// True while the tab-rename input bar is open.
-    rename_tab_input_mode: bool,
-    rename_tab_input: String,
-    rename_tab_cursor: usize,
+    pub(crate) rename_tab_input_mode: bool,
+    pub(crate) rename_tab_input: String,
+    pub(crate) rename_tab_cursor: usize,
 }
 
 /// Disposition of the save-on-quit prompt. `AwaitingPath` is the rare
@@ -3784,392 +3786,6 @@ fn cancel_at_cursor(app: &mut App) -> bool {
         .set_state(id, ShedState::Failed("cancelled".into()));
     app.flash = Some(format!("cancelled %{}", id.0));
     true
-}
-
-// === Tab completion =========================================================
-//
-// Two surfaces: the main Prompt and the in-place cmd-edit input bar.
-// Both append-only Strings (no mid-string cursor), so completion always
-// operates on the final whitespace-separated token. Tab cycles forward,
-// Shift-Tab cycles backward; any non-Tab key clears the cycle.
-//
-// Completion source by token shape (in order):
-//   $...   env var names
-//   @...   pinned shed names  (only when the token starts with @)
-//   /...   slash commands       (Prompt focus, argv0 only)
-//   .../...    path completion  (anywhere with a path-shape)
-//   <argv0>    commands ∪ aliases ∪ builtins
-//   <argv1+>   path completion
-
-const COMPLETION_BUILTINS: &[&str] = &["cd", "exit", "quit", "export", "unset"];
-const COMPLETION_SLASH: &[&str] = &["/aliases"];
-
-#[derive(Debug, Clone)]
-struct CompletionState {
-    /// The unchanged prefix of the input (before the token being
-    /// completed). Each cycle re-renders the input as
-    /// `base_text + matches[idx] + suffix`.
-    base_text: String,
-    /// The unchanged suffix of the input (everything after the cursor
-    /// at the moment Tab was first pressed).
-    suffix: String,
-    matches: Vec<String>,
-    idx: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompletionContext {
-    EnvVar,
-    Pinned,
-    ShedId,
-    Slash,
-    Argv0,
-    Path,
-}
-
-/// Split `text` into (everything before the final token, the final
-/// token). The final token starts after the last whitespace char.
-fn split_last_token(text: &str) -> (&str, &str) {
-    match text.rfind(char::is_whitespace) {
-        Some(idx) => {
-            let after = idx + text[idx..].chars().next().unwrap().len_utf8();
-            (&text[..after], &text[after..])
-        }
-        None => ("", text),
-    }
-}
-
-fn classify_completion(focus: Focus, base: &str, token: &str) -> CompletionContext {
-    if token.starts_with('$') {
-        return CompletionContext::EnvVar;
-    }
-    if token.starts_with('@') {
-        return CompletionContext::Pinned;
-    }
-    if token.starts_with('%') {
-        return CompletionContext::ShedId;
-    }
-    let argv0 = base.trim().is_empty();
-    if argv0 {
-        if focus == Focus::Prompt && token.starts_with('/') {
-            return CompletionContext::Slash;
-        }
-        if token.starts_with('/')
-            || token.starts_with("./")
-            || token.starts_with("../")
-            || token.starts_with("~/")
-        {
-            return CompletionContext::Path;
-        }
-        return CompletionContext::Argv0;
-    }
-    CompletionContext::Path
-}
-
-fn env_completions(token: &str) -> Vec<String> {
-    let prefix = &token[1..]; // strip $
-    let mut names: Vec<String> = std::env::vars()
-        .map(|(k, _)| k)
-        .filter(|k| k.starts_with(prefix))
-        .collect();
-    names.sort();
-    names.dedup();
-    names.into_iter().map(|n| format!("${n}")).collect()
-}
-
-fn id_completions(session: &Session, token: &str) -> Vec<String> {
-    let prefix = &token[1..]; // strip %
-    let mut matches: Vec<String> = session
-        .sheds()
-        .map(|b| format!("%{}", b.id.0))
-        .filter(|s| s.starts_with(&format!("%{prefix}")))
-        .collect();
-    matches.sort();
-    matches.dedup();
-    matches
-}
-
-fn pinned_completions(session: &Session, token: &str) -> Vec<String> {
-    let prefix = &token[1..]; // strip @
-    let mut names: Vec<String> = session
-        .sheds()
-        .filter_map(|b| b.name.clone())
-        .filter(|n| n.starts_with(prefix))
-        .collect();
-    names.sort();
-    names.dedup();
-    names.into_iter().map(|n| format!("@{n}")).collect()
-}
-
-fn slash_completions(token: &str) -> Vec<String> {
-    COMPLETION_SLASH
-        .iter()
-        .filter(|cmd| cmd.starts_with(token))
-        .map(|s| (*s).to_string())
-        .collect()
-}
-
-fn argv0_completions(aliases: &AliasFile, token: &str) -> Vec<String> {
-    use std::collections::BTreeSet;
-    let mut all: BTreeSet<String> = BTreeSet::new();
-    for b in COMPLETION_BUILTINS {
-        if b.starts_with(token) {
-            all.insert((*b).to_string());
-        }
-    }
-    for alias in &aliases.aliases {
-        if alias.name.starts_with(token) {
-            all.insert(alias.name.clone());
-        }
-    }
-    for cmd in path_executables(token) {
-        all.insert(cmd);
-    }
-    all.into_iter().collect()
-}
-
-/// Shell out to `carapace <argv0> export <argv0> <tokens...>` to get
-/// rich completions for the current argument position. Returns `None`
-/// when carapace isn't installed, when the spawn fails, or when its
-/// output isn't valid export JSON — in all of those cases the caller
-/// falls back to filesystem path completion.
-///
-/// Carapace's `export` format is a JSON object whose top-level
-/// `values` array holds `{value, display, description, style, tag}`
-/// records; we surface just `value` strings here. The carapace docs
-/// claim sub-10ms response on warm cache, which is well within
-/// interactive Tab-press latency.
-fn run_carapace_export(argv0: &str, tokens: &[String]) -> Option<Vec<u8>> {
-    let output = std::process::Command::new("carapace")
-        .arg(argv0)
-        .arg("export")
-        .arg(argv0)
-        .args(tokens)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout)
-}
-
-/// Parse a carapace `export`-format JSON document into a sorted, deduped
-/// list of completion values that start with `token`. Carapace's own
-/// completers usually return only matching values for the partial, but
-/// we filter defensively so we behave the same regardless.
-fn carapace_completions_from_export(json: &[u8], token: &str) -> Vec<String> {
-    let Ok(root) = serde_json::from_slice::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(values) = root.get("values").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = values
-        .iter()
-        .filter_map(|item| item.get("value").and_then(|v| v.as_str()).map(String::from))
-        .filter(|v| v.starts_with(token))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn carapace_completions(argv0: &str, tokens: &[String], token: &str) -> Vec<String> {
-    let Some(json) = run_carapace_export(argv0, tokens) else {
-        return Vec::new();
-    };
-    carapace_completions_from_export(&json, token)
-}
-
-fn path_executables(prefix: &str) -> Vec<String> {
-    let Some(path) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::new();
-    for dir in std::env::split_paths(&path) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if !name.starts_with(prefix) {
-                continue;
-            }
-            if !is_executable_entry(&entry) {
-                continue;
-            }
-            if seen.insert(name.clone()) {
-                out.push(name);
-            }
-        }
-    }
-    out
-}
-
-#[cfg(unix)]
-fn is_executable_entry(entry: &std::fs::DirEntry) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    entry
-        .metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_entry(_entry: &std::fs::DirEntry) -> bool {
-    true
-}
-
-fn path_completions(token: &str) -> Vec<String> {
-    // dir_str is what we keep in the displayed match (so `~/` stays
-    // `~/`), dir_lookup is the actual filesystem path.
-    let (dir_str, prefix) = match token.rfind('/') {
-        Some(idx) => (&token[..=idx], &token[idx + 1..]),
-        None => ("", token),
-    };
-    let dir_lookup: PathBuf = if dir_str.is_empty() {
-        PathBuf::from(".")
-    } else if let Some(rest) = dir_str.strip_prefix("~/") {
-        match std::env::var_os("HOME") {
-            Some(home) => {
-                let mut p = PathBuf::from(home);
-                p.push(rest);
-                p
-            }
-            None => PathBuf::from(dir_str),
-        }
-    } else {
-        PathBuf::from(dir_str)
-    };
-
-    let Ok(entries) = std::fs::read_dir(&dir_lookup) else {
-        return Vec::new();
-    };
-    let show_hidden = prefix.starts_with('.');
-    let mut rows: Vec<(String, bool)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            if !name.starts_with(prefix) {
-                return None;
-            }
-            if !show_hidden && name.starts_with('.') {
-                return None;
-            }
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            Some((name, is_dir))
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows.into_iter()
-        .map(|(name, is_dir)| {
-            let suffix = if is_dir { "/" } else { "" };
-            format!("{dir_str}{name}{suffix}")
-        })
-        .collect()
-}
-
-/// Compute the (base_text, matches) pair for completing `text` at the
-/// final token.
-fn compute_completions(
-    session: &Session,
-    aliases: &AliasFile,
-    focus: Focus,
-    text: &str,
-) -> (String, Vec<String>) {
-    let (base, token) = split_last_token(text);
-    let ctx = classify_completion(focus, base, token);
-    let matches = match ctx {
-        CompletionContext::EnvVar => env_completions(token),
-        CompletionContext::Pinned => pinned_completions(session, token),
-        CompletionContext::ShedId => id_completions(session, token),
-        CompletionContext::Slash => slash_completions(token),
-        CompletionContext::Argv0 => argv0_completions(aliases, token),
-        CompletionContext::Path => path_or_carapace_completions(base, token),
-    };
-    (base.to_string(), matches)
-}
-
-/// For an argv1+ position, ask carapace first (if installed) for
-/// command-aware completions like git branch names, kubectl flags,
-/// docker image tags, etc. Fall back to filesystem path completion if
-/// carapace isn't available or returns no matches.
-fn path_or_carapace_completions(base: &str, token: &str) -> Vec<String> {
-    let prior: Vec<String> = base.split_whitespace().map(String::from).collect();
-    if let Some(argv0) = prior.first() {
-        let mut spans = prior.clone();
-        spans.push(token.to_string());
-        let from_carapace = carapace_completions(argv0, &spans, token);
-        if !from_carapace.is_empty() {
-            return from_carapace;
-        }
-    }
-    path_completions(token)
-}
-
-fn current_input_state(app: &App) -> Option<(String, usize)> {
-    match app.focus {
-        Focus::Prompt => Some((app.prompt.clone(), app.prompt_cursor)),
-        Focus::EditShed if app.cmd_edit_input_mode => {
-            Some((app.cmd_edit_input.clone(), app.cmd_edit_cursor))
-        }
-        _ => None,
-    }
-}
-
-fn set_current_input(app: &mut App, text: String, cursor: usize) {
-    match app.focus {
-        Focus::Prompt => {
-            app.prompt = text;
-            app.prompt_cursor = cursor;
-        }
-        Focus::EditShed if app.cmd_edit_input_mode => {
-            app.cmd_edit_input = text;
-            app.cmd_edit_cursor = cursor;
-        }
-        _ => {}
-    }
-}
-
-/// Handle a Tab (dir = +1) or Shift-Tab (dir = -1) press in a
-/// completion context. On the first press, builds a fresh match list
-/// and applies the first match. Subsequent presses cycle through
-/// `app.completion.matches`.
-fn cycle_completion(app: &mut App, dir: i32) {
-    if app.completion.is_none() {
-        let Some((text, cursor)) = current_input_state(app) else {
-            return;
-        };
-        let prefix = &text[..cursor];
-        let suffix = text[cursor..].to_string();
-        let focus = app.focus;
-        let (base, matches) = compute_completions(&app.session, &app.aliases, focus, prefix);
-        if matches.is_empty() {
-            app.flash = Some("no completions".into());
-            return;
-        }
-        let new_cursor = base.len() + matches[0].len();
-        set_current_input(app, format!("{base}{}{suffix}", matches[0]), new_cursor);
-        app.completion = Some(CompletionState {
-            base_text: base,
-            suffix,
-            matches,
-            idx: 0,
-        });
-        return;
-    }
-    let state = app.completion.as_mut().unwrap();
-    let n = state.matches.len() as isize;
-    state.idx = ((state.idx as isize + dir as isize).rem_euclid(n)) as usize;
-    let new_cursor = state.base_text.len() + state.matches[state.idx].len();
-    let new_text = format!(
-        "{}{}{}",
-        state.base_text, state.matches[state.idx], state.suffix
-    );
-    set_current_input(app, new_text, new_cursor);
 }
 
 /// Dispatch a mouse event by hit-testing the click regions registered
@@ -10701,150 +10317,6 @@ mod tests {
         assert_eq!(app.pending_run_chain.front().copied(), Some(id));
     }
 
-    // === tab completion ===
-
-    #[test]
-    fn split_last_token_handles_empty_and_whitespace() {
-        assert_eq!(split_last_token(""), ("", ""));
-        assert_eq!(split_last_token("git"), ("", "git"));
-        assert_eq!(split_last_token("git "), ("git ", ""));
-        assert_eq!(split_last_token("git ch"), ("git ", "ch"));
-        assert_eq!(split_last_token("a b c"), ("a b ", "c"));
-        assert_eq!(split_last_token("  ls"), ("  ", "ls"));
-    }
-
-    #[test]
-    fn classify_completion_picks_each_context() {
-        // env var anywhere
-        assert_eq!(
-            classify_completion(Focus::Prompt, "echo ", "$HO"),
-            CompletionContext::EnvVar
-        );
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "$HO"),
-            CompletionContext::EnvVar
-        );
-        // pinned anywhere a token starts with @
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "@lo"),
-            CompletionContext::Pinned
-        );
-        assert_eq!(
-            classify_completion(Focus::Prompt, "cat ", "@log"),
-            CompletionContext::Pinned
-        );
-        // slash only at argv0 in Prompt
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "/al"),
-            CompletionContext::Slash
-        );
-        // / outside Prompt at argv0 → path (cmd-edit can be /usr/bin/foo)
-        assert_eq!(
-            classify_completion(Focus::EditShed, "", "/usr"),
-            CompletionContext::Path
-        );
-        // ./ at argv0 → path
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "./bu"),
-            CompletionContext::Path
-        );
-        // bare argv0
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "gi"),
-            CompletionContext::Argv0
-        );
-        // argv1+
-        assert_eq!(
-            classify_completion(Focus::Prompt, "git ", "ch"),
-            CompletionContext::Path
-        );
-    }
-
-    #[test]
-    fn pinned_completions_filters_by_prefix() {
-        let mut s = Session::new();
-        let a = s.add_shed(vec!["a".into()]);
-        let b = s.add_shed(vec!["b".into()]);
-        let c = s.add_shed(vec!["c".into()]);
-        s.pin(a, "logs".into());
-        s.pin(b, "long".into());
-        s.pin(c, "other".into());
-        let got = pinned_completions(&s, "@lo");
-        assert_eq!(got, vec!["@logs".to_string(), "@long".to_string()]);
-        let none = pinned_completions(&s, "@zzz");
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn id_completions_returns_all_shed_ids_matching_prefix() {
-        let mut s = Session::new();
-        for _ in 0..15 {
-            s.add_shed(vec!["x".into()]);
-        }
-        // `%1` matches %1, %10..%15 (string prefix).
-        let got = id_completions(&s, "%1");
-        assert!(got.contains(&"%1".to_string()));
-        assert!(got.contains(&"%10".to_string()));
-        assert!(got.contains(&"%15".to_string()));
-        assert!(!got.contains(&"%2".to_string()));
-        // Bare `%` yields every shed.
-        let all = id_completions(&s, "%");
-        assert_eq!(all.len(), 15);
-    }
-
-    #[test]
-    fn classify_completion_recognises_percent_prefix() {
-        assert_eq!(
-            classify_completion(Focus::Prompt, "", "%5"),
-            CompletionContext::ShedId
-        );
-        assert_eq!(
-            classify_completion(Focus::Prompt, "cat ", "%5"),
-            CompletionContext::ShedId
-        );
-    }
-
-    #[test]
-    fn slash_completions_returns_known_commands() {
-        let got = slash_completions("/al");
-        assert_eq!(got, vec!["/aliases".to_string()]);
-        let got = slash_completions("/x");
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn argv0_completions_includes_builtins_and_aliases() {
-        let mut aliases = AliasFile::default();
-        aliases.upsert(Alias {
-            name: "exalt".into(),
-            argv: vec!["echo".into()],
-            pipeline: vec![],
-        });
-        // Use a prefix that overlaps a builtin and the alias.
-        let got = argv0_completions(&aliases, "ex");
-        assert!(got.iter().any(|s| s == "exit"), "got={got:?}");
-        assert!(got.iter().any(|s| s == "exalt"), "got={got:?}");
-        assert!(got.iter().any(|s| s == "export"), "got={got:?}");
-    }
-
-    #[test]
-    fn env_completions_pulls_from_environment() {
-        // SAFETY: test-only mutation; tests run on a single thread by
-        // default in cargo, but env mutation is racy if other tests
-        // read $TAB_COMPLETION_TEST_VAR concurrently. The name is
-        // unique enough that we accept the risk.
-        unsafe {
-            std::env::set_var("TAB_COMPLETION_TEST_VAR", "1");
-        }
-        let got = env_completions("$TAB_COMPLETION_TEST");
-        assert!(
-            got.iter().any(|s| s == "$TAB_COMPLETION_TEST_VAR"),
-            "got={got:?}"
-        );
-        unsafe {
-            std::env::remove_var("TAB_COMPLETION_TEST_VAR");
-        }
-    }
 
     #[test]
     fn cycle_completion_advances_and_wraps() {
@@ -11140,55 +10612,6 @@ mod tests {
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
         );
         assert_eq!(app.focus, Focus::Prompt);
-    }
-
-    // === carapace integration ===
-
-    #[test]
-    fn carapace_export_parser_extracts_values_matching_prefix() {
-        let json = br#"{
-            "version": "unknown",
-            "messages": [],
-            "values": [
-                {"value": "main", "display": "main", "description": "branch"},
-                {"value": "master", "display": "master"},
-                {"value": "develop", "display": "develop"}
-            ]
-        }"#;
-        let got = carapace_completions_from_export(json, "ma");
-        assert_eq!(got, vec!["main".to_string(), "master".to_string()]);
-    }
-
-    #[test]
-    fn carapace_export_parser_empty_token_returns_all_values_sorted() {
-        let json = br#"{
-            "values": [
-                {"value": "zeta"},
-                {"value": "alpha"},
-                {"value": "alpha"}
-            ]
-        }"#;
-        let got = carapace_completions_from_export(json, "");
-        assert_eq!(got, vec!["alpha".to_string(), "zeta".to_string()]);
-    }
-
-    #[test]
-    fn carapace_export_parser_missing_values_returns_empty() {
-        let got = carapace_completions_from_export(b"{\"version\":\"x\"}", "");
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn carapace_export_parser_handles_invalid_json() {
-        let got = carapace_completions_from_export(b"not json at all", "");
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn carapace_export_parser_ignores_records_without_value_field() {
-        let json = br#"{"values": [{"display": "x"}, {"value": "real"}]}"#;
-        let got = carapace_completions_from_export(json, "");
-        assert_eq!(got, vec!["real".to_string()]);
     }
 
     #[test]
