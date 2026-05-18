@@ -41,12 +41,7 @@ use vte::{Params, Parser, Perform};
 /// the first `max_lines` are kept (head); with `tail = true` the *last*
 /// `max_lines` are kept — useful for streaming output where the user
 /// wants the most recent lines visible.
-pub fn parse_to_lines(
-    bytes: &[u8],
-    indent: &str,
-    max_lines: usize,
-    tail: bool,
-) -> ParsedPreview {
+pub fn parse_to_lines(bytes: &[u8], indent: &str, max_lines: usize, tail: bool) -> ParsedPreview {
     let mut performer = AnsiToLines::new(indent.to_string());
     let mut parser = Parser::new();
     for &b in bytes {
@@ -57,7 +52,11 @@ pub fn parse_to_lines(
     let total = performer.lines.len();
     let truncated = total > max_lines;
     let lines: Vec<Line<'static>> = if tail && truncated {
-        performer.lines.into_iter().skip(total - max_lines).collect()
+        performer
+            .lines
+            .into_iter()
+            .skip(total - max_lines)
+            .collect()
     } else {
         performer.lines.into_iter().take(max_lines).collect()
     };
@@ -198,8 +197,7 @@ impl AnsiToLines {
                         }
                     }
                     Some(2) => {
-                        if let (Some(r), Some(g), Some(b)) =
-                            (iter.next(), iter.next(), iter.next())
+                        if let (Some(r), Some(g), Some(b)) = (iter.next(), iter.next(), iter.next())
                         {
                             self.current_style =
                                 self.current_style.fg(Color::Rgb(r as u8, g as u8, b as u8));
@@ -217,8 +215,7 @@ impl AnsiToLines {
                         }
                     }
                     Some(2) => {
-                        if let (Some(r), Some(g), Some(b)) =
-                            (iter.next(), iter.next(), iter.next())
+                        if let (Some(r), Some(g), Some(b)) = (iter.next(), iter.next(), iter.next())
                         {
                             self.current_style =
                                 self.current_style.bg(Color::Rgb(r as u8, g as u8, b as u8));
@@ -359,9 +356,10 @@ mod tests {
     fn sgr_red_emits_styled_span() {
         let p = parse_to_lines(b"\x1b[31mred\x1b[0m\n", "", 10, false);
         assert_eq!(p.total, 1);
-        let any_red = p.lines.iter().any(|l| {
-            l.spans.iter().any(|s| s.style.fg == Some(Color::Red))
-        });
+        let any_red = p
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.style.fg == Some(Color::Red)));
         assert!(any_red, "expected a red span");
     }
 
@@ -387,8 +385,7 @@ mod tests {
 
     #[test]
     fn cargo_style_progress_bar_collapses_to_final_state() {
-        let input =
-            b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
+        let input = b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
         let p = parse_to_lines(input, "", 10, false);
         assert_eq!(p.total, 2);
         assert_eq!(line_text(&p.lines[0]), "Building (100%)");

@@ -24,9 +24,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::shed::ShedState;
 use crate::filter::FilterSpec;
 use crate::session::Session;
+use crate::shed::ShedState;
 
 /// On-disk schema version. Bumped whenever the file format changes in a
 /// non-backwards-compatible way.
@@ -197,7 +197,10 @@ mod tests {
         nb2.apply_to_session(&mut s2);
 
         let sheds: Vec<_> = s2.sheds().collect();
-        assert_eq!(sheds[0].pre_text.as_deref(), Some("## Section\nthis lists things"));
+        assert_eq!(
+            sheds[0].pre_text.as_deref(),
+            Some("## Section\nthis lists things")
+        );
         assert_eq!(sheds[0].post_text.as_deref(), Some("output looked normal"));
     }
 

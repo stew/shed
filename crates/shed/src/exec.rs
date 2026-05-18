@@ -69,11 +69,7 @@ pub enum CaptureOutcome {
     NeededFullscreen,
 }
 
-const ALT_SCREEN_PATTERNS: &[&[u8]] = &[
-    b"\x1b[?1049h",
-    b"\x1b[?1047h",
-    b"\x1b[?47h",
-];
+const ALT_SCREEN_PATTERNS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 
 /// Search a byte slice for any alt-screen-enter sequence.
 pub fn contains_alt_screen(haystack: &[u8]) -> bool {
@@ -257,12 +253,10 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code() {
-        let (handle, _killer, _chunks) = spawn_command(
-            vec!["printf".into(), "a\nb\nc\n".into()],
-            1024,
-        )
-        .await
-        .unwrap();
+        let (handle, _killer, _chunks) =
+            spawn_command(vec!["printf".into(), "a\nb\nc\n".into()], 1024)
+                .await
+                .unwrap();
         let capture = unwrap_captured(handle.await.unwrap().unwrap());
         let s = String::from_utf8_lossy(&capture.stdout);
         assert!(s.contains("a") && s.contains("b") && s.contains("c"));
@@ -280,12 +274,10 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_marks_capture_and_drains_child() {
-        let (handle, _killer, _chunks) = spawn_command(
-            vec!["seq".into(), "1".into(), "100000".into()],
-            64,
-        )
-        .await
-        .unwrap();
+        let (handle, _killer, _chunks) =
+            spawn_command(vec!["seq".into(), "1".into(), "100000".into()], 64)
+                .await
+                .unwrap();
         let capture = unwrap_captured(handle.await.unwrap().unwrap());
         assert!(capture.truncated);
         assert_eq!(capture.stdout.len(), 64);
@@ -296,12 +288,10 @@ mod tests {
     async fn alt_screen_detected_in_output_triggers_handover_signal() {
         // printf emits a literal alt-screen-enter sequence; the reader
         // should detect it and return NeededFullscreen.
-        let (handle, _killer, _chunks) = spawn_command(
-            vec!["printf".into(), "\\x1b[?1049hhello".into()],
-            1024,
-        )
-        .await
-        .unwrap();
+        let (handle, _killer, _chunks) =
+            spawn_command(vec!["printf".into(), "\\x1b[?1049hhello".into()], 1024)
+                .await
+                .unwrap();
         let outcome = handle.await.unwrap().unwrap();
         assert!(matches!(outcome, CaptureOutcome::NeededFullscreen));
     }
@@ -318,23 +308,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_program_returns_spawn_error() {
-        let err = spawn_command(
-            vec!["definitely-not-a-real-command-xyzzy".into()],
-            1024,
-        )
-        .await
-        .unwrap_err();
+        let err = spawn_command(vec!["definitely-not-a-real-command-xyzzy".into()], 1024)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExecError::Spawn { .. }));
     }
 
     #[tokio::test]
     async fn streams_chunks_through_receiver_while_running() {
-        let (handle, _killer, mut chunks) = spawn_command(
-            vec!["printf".into(), "hello\n".into()],
-            1024,
-        )
-        .await
-        .unwrap();
+        let (handle, _killer, mut chunks) =
+            spawn_command(vec!["printf".into(), "hello\n".into()], 1024)
+                .await
+                .unwrap();
         // Wait for the command to finish so all chunks are sent and
         // the channel is closed.
         let outcome = handle.await.unwrap().unwrap();
@@ -352,12 +337,10 @@ mod tests {
     async fn streamed_chunks_respect_capture_cap() {
         // 64-byte cap: streaming should also stop after 64 bytes, even
         // though the child produces far more.
-        let (handle, _killer, mut chunks) = spawn_command(
-            vec!["seq".into(), "1".into(), "100000".into()],
-            64,
-        )
-        .await
-        .unwrap();
+        let (handle, _killer, mut chunks) =
+            spawn_command(vec!["seq".into(), "1".into(), "100000".into()], 64)
+                .await
+                .unwrap();
         let _ = handle.await.unwrap().unwrap();
         let mut total = 0usize;
         while let Some(chunk) = chunks.recv().await {
@@ -368,12 +351,9 @@ mod tests {
 
     #[tokio::test]
     async fn killer_cancels_a_long_running_child() {
-        let (handle, mut killer, _chunks) = spawn_command(
-            vec!["sleep".into(), "30".into()],
-            1024,
-        )
-        .await
-        .unwrap();
+        let (handle, mut killer, _chunks) = spawn_command(vec!["sleep".into(), "30".into()], 1024)
+            .await
+            .unwrap();
         // Kill it; the blocking task should finish quickly because the slave closes.
         killer.kill().unwrap();
         // The task may finish with success or wait error depending on timing;

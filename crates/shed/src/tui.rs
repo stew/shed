@@ -58,8 +58,8 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Paragraph, Wrap},
 };
 use shed_core::{
-    Alias, AliasFile, Shed, ShedId, ShedState, Capture, CompareOp, Filter, FilterSpec,
-    Notebook, NotebookEntry, PipelineValue, Predicate, Session, SortDirection, SortKey, Value,
+    Alias, AliasFile, Capture, CompareOp, Filter, FilterSpec, Notebook, NotebookEntry,
+    PipelineValue, Predicate, Session, Shed, ShedId, ShedState, SortDirection, SortKey, Value,
     apply_with_notes,
 };
 use tokio::task::JoinHandle;
@@ -257,16 +257,48 @@ struct RerunRequest {
 const MAX_SORT_KEYS: usize = 5;
 
 const FULLSCREEN_PROGRAMS: &[&str] = &[
-    "top", "htop", "btop", "atop", "glances", "iotop", "iftop", "ncdu",
-    "vi", "vim", "nvim", "emacs", "emacsclient", "nano", "pico",
-    "helix", "hx", "micro", "kak",
-    "less", "more", "most", "view",
-    "man", "info", "pinfo",
-    "tmux", "screen", "byobu", "zellij",
-    "ssh", "mosh", "telnet", "rlogin",
-    "tig", "lazygit", "gitui",
-    "ranger", "nnn", "lf",
-    "fzf", "sk",
+    "top",
+    "htop",
+    "btop",
+    "atop",
+    "glances",
+    "iotop",
+    "iftop",
+    "ncdu",
+    "vi",
+    "vim",
+    "nvim",
+    "emacs",
+    "emacsclient",
+    "nano",
+    "pico",
+    "helix",
+    "hx",
+    "micro",
+    "kak",
+    "less",
+    "more",
+    "most",
+    "view",
+    "man",
+    "info",
+    "pinfo",
+    "tmux",
+    "screen",
+    "byobu",
+    "zellij",
+    "ssh",
+    "mosh",
+    "telnet",
+    "rlogin",
+    "tig",
+    "lazygit",
+    "gitui",
+    "ranger",
+    "nnn",
+    "lf",
+    "fzf",
+    "sk",
 ];
 
 fn needs_fullscreen(argv: &[String]) -> bool {
@@ -789,10 +821,11 @@ impl FilterKind {
             FilterKind::Count => "collapse to a single row with the row count",
             FilterKind::Rename => "rename columns (leave a row blank to keep its current name)",
             FilterKind::Split => "split each row's column value by a delimiter, one row per piece",
-            FilterKind::Join => "concatenate every row's column value with a delimiter into one row",
+            FilterKind::Join => {
+                "concatenate every row's column value with a delimiter into one row"
+            }
         }
     }
-
 }
 
 const DELIM_CHOICES: &[(char, &str)] = &[
@@ -1001,12 +1034,10 @@ fn collect_chain(
 ) -> bool {
     match p {
         Predicate::And(a, b) if is_and => {
-            collect_chain(a, clauses, columns, is_and)
-                && collect_chain(b, clauses, columns, is_and)
+            collect_chain(a, clauses, columns, is_and) && collect_chain(b, clauses, columns, is_and)
         }
         Predicate::Or(a, b) if !is_and => {
-            collect_chain(a, clauses, columns, is_and)
-                && collect_chain(b, clauses, columns, is_and)
+            collect_chain(a, clauses, columns, is_and) && collect_chain(b, clauses, columns, is_and)
         }
         leaf => match leaf_to_clause(leaf, columns) {
             Some(c) => {
@@ -1338,7 +1369,6 @@ impl FilterEditState {
         self.csv_delim = DELIM_CHOICES[new_i].0;
     }
 
-
     fn cycle_field(&mut self, delta: i32) {
         let fs = self.fields();
         let idx = fs.iter().position(|f| *f == self.field).unwrap_or(0) as i32;
@@ -1361,7 +1391,10 @@ impl FilterEditState {
     }
 
     fn cycle_kind(&mut self, delta: i32) {
-        let i = FilterKind::ALL.iter().position(|k| *k == self.kind).unwrap_or(0) as i32;
+        let i = FilterKind::ALL
+            .iter()
+            .position(|k| *k == self.kind)
+            .unwrap_or(0) as i32;
         let new_i = (i + delta).rem_euclid(FilterKind::ALL.len() as i32) as usize;
         self.kind = FilterKind::ALL[new_i];
         self.ensure_field_valid();
@@ -1380,7 +1413,10 @@ impl FilterEditState {
 
     fn cycle_clause_op(&mut self, delta: i32) {
         if let Some(clause) = self.active_clause_mut() {
-            let i = WhereOp::ALL.iter().position(|o| *o == clause.op).unwrap_or(0) as i32;
+            let i = WhereOp::ALL
+                .iter()
+                .position(|o| *o == clause.op)
+                .unwrap_or(0) as i32;
             let new_i = (i + delta).rem_euclid(WhereOp::ALL.len() as i32) as usize;
             clause.op = WhereOp::ALL[new_i];
         }
@@ -1392,11 +1428,15 @@ impl FilterEditState {
     }
 
     fn active_op(&self) -> WhereOp {
-        self.active_clause().map(|c| c.op).unwrap_or(WhereOp::Matches)
+        self.active_clause()
+            .map(|c| c.op)
+            .unwrap_or(WhereOp::Matches)
     }
 
     fn active_pattern(&self) -> &str {
-        self.active_clause().map(|c| c.pattern.as_str()).unwrap_or("")
+        self.active_clause()
+            .map(|c| c.pattern.as_str())
+            .unwrap_or("")
     }
 
     fn selected_columns(&self) -> Vec<String> {
@@ -2316,7 +2356,11 @@ fn is_terminal_state(state: &ShedState) -> bool {
 /// `Done`/`Failed` sources are not re-run — the snapshot will use the
 /// existing capture or fail with a clear error. Cycles are guarded via
 /// `visited`.
-fn build_run_chain(session: &Session, target: ShedId, visited: &mut HashSet<ShedId>) -> Vec<ShedId> {
+fn build_run_chain(
+    session: &Session,
+    target: ShedId,
+    visited: &mut HashSet<ShedId>,
+) -> Vec<ShedId> {
     if !visited.insert(target) {
         return Vec::new();
     }
@@ -2415,7 +2459,9 @@ fn open_cmd_edit(app: &mut App) {
         app.flash = Some("no shed selected".into());
         return;
     };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     if shed.argv.is_empty() {
         app.flash = Some("nothing to edit".into());
         return;
@@ -2445,7 +2491,9 @@ fn commit_cmd_edit(app: &mut App) {
     if argv.is_empty() {
         return;
     }
-    let Some(id) = app.session.cursor() else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
     if app.session.shed(id).is_none() {
         return;
     }
@@ -2464,7 +2512,10 @@ fn queue_run_chain(app: &mut App, target: ShedId) {
     if n > 1 {
         let dep_count = n - 1;
         let label = if dep_count == 1 { "1 dep" } else { "deps" };
-        app.flash = Some(format!("running {dep_count} {label} first, then %{}", target.0));
+        app.flash = Some(format!(
+            "running {dep_count} {label} first, then %{}",
+            target.0
+        ));
     }
     for id in chain {
         if app.chain_in_flight != Some(id) && !app.pending_run_chain.contains(&id) {
@@ -2477,7 +2528,9 @@ fn queue_run_chain(app: &mut App, target: ShedId) {
 /// now terminal, clear the slot. If it failed, abort the rest of the
 /// chain since dependents would just see a stale or missing source.
 fn advance_run_chain(app: &mut App) {
-    let Some(id) = app.chain_in_flight else { return };
+    let Some(id) = app.chain_in_flight else {
+        return;
+    };
     let state = app.session.shed(id).map(|b| b.state.clone());
     let terminal = match &state {
         Some(s) => is_terminal_state(s),
@@ -2514,8 +2567,7 @@ enum SnapshotOutput {
 /// preserved).
 fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<SnapshotOutput, String> {
     let label = shed_ref_display(r);
-    let id =
-        resolve_shed_ref(session, r).ok_or_else(|| format!("no shed at {label}"))?;
+    let id = resolve_shed_ref(session, r).ok_or_else(|| format!("no shed at {label}"))?;
     let shed = session
         .shed(id)
         .ok_or_else(|| format!("{label} missing from session"))?;
@@ -2614,12 +2666,15 @@ fn delete_shed(app: &mut App, id: ShedId) {
     }
     let was_cursor = app.session.cursor() == Some(id);
     let ids = app.shed_ids_in_order();
-    let next_cursor = ids
-        .iter()
-        .position(|x| *x == id)
-        .and_then(|i| ids.get(i + 1).copied().or_else(|| {
-            if i == 0 { None } else { ids.get(i - 1).copied() }
-        }));
+    let next_cursor = ids.iter().position(|x| *x == id).and_then(|i| {
+        ids.get(i + 1).copied().or_else(|| {
+            if i == 0 {
+                None
+            } else {
+                ids.get(i - 1).copied()
+            }
+        })
+    });
     let removed = app.session.remove_shed(id);
     if removed.is_none() {
         return;
@@ -2661,7 +2716,9 @@ async fn perform_run_in_place(app: &mut App, id: ShedId) {
     if app.running.contains_key(&id) {
         return;
     }
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     let argv = shed.argv.clone();
     if argv.is_empty() {
         return;
@@ -3067,11 +3124,7 @@ fn handle_rename_tab_input_key(app: &mut App, key: KeyEvent) {
             app.rename_tab_cursor = 0;
         }
         _ => {
-            let _ = handle_text_input(
-                &mut app.rename_tab_input,
-                &mut app.rename_tab_cursor,
-                &key,
-            );
+            let _ = handle_text_input(&mut app.rename_tab_input, &mut app.rename_tab_cursor, &key);
         }
     }
 }
@@ -3289,8 +3342,7 @@ fn handle_save_input_key(app: &mut App, key: KeyEvent) {
             save_to_path(app, &path);
             // If we were saving on exit, complete the quit now that the
             // file is on disk (or fall through if save failed).
-            if app.exit_prompt == Some(ExitPrompt::AwaitingPath)
-                && !has_unsaved_pinned_changes(app)
+            if app.exit_prompt == Some(ExitPrompt::AwaitingPath) && !has_unsaved_pinned_changes(app)
             {
                 app.exit_prompt = None;
                 app.quit = true;
@@ -3450,7 +3502,11 @@ fn tf_backspace(text: &mut String, cursor: &mut usize) {
     if *cursor == 0 {
         return;
     }
-    let prev = text[..*cursor].chars().next_back().expect("non-empty prefix").len_utf8();
+    let prev = text[..*cursor]
+        .chars()
+        .next_back()
+        .expect("non-empty prefix")
+        .len_utf8();
     *cursor -= prev;
     text.replace_range(*cursor..*cursor + prev, "");
 }
@@ -3459,7 +3515,11 @@ fn tf_delete(text: &mut String, cursor: &mut usize) {
     if *cursor >= text.len() {
         return;
     }
-    let next = text[*cursor..].chars().next().expect("non-empty suffix").len_utf8();
+    let next = text[*cursor..]
+        .chars()
+        .next()
+        .expect("non-empty suffix")
+        .len_utf8();
     text.replace_range(*cursor..*cursor + next, "");
 }
 
@@ -3467,7 +3527,11 @@ fn tf_left(text: &str, cursor: &mut usize) {
     if *cursor == 0 {
         return;
     }
-    let prev = text[..*cursor].chars().next_back().expect("non-empty prefix").len_utf8();
+    let prev = text[..*cursor]
+        .chars()
+        .next_back()
+        .expect("non-empty prefix")
+        .len_utf8();
     *cursor -= prev;
 }
 
@@ -3475,7 +3539,11 @@ fn tf_right(text: &str, cursor: &mut usize) {
     if *cursor >= text.len() {
         return;
     }
-    let next = text[*cursor..].chars().next().expect("non-empty suffix").len_utf8();
+    let next = text[*cursor..]
+        .chars()
+        .next()
+        .expect("non-empty suffix")
+        .len_utf8();
     *cursor += next;
 }
 
@@ -3662,12 +3730,7 @@ fn apply_readline_edit(text: &mut String, cursor: &mut usize, key: &KeyEvent) ->
 /// Render a status-bar style input prompt as a [`Paragraph`]: a label
 /// in `accent`, then `text` with the cursor visualised inline. Used for
 /// every single-line input bar in the bottom status row.
-fn render_input_bar(
-    label: &str,
-    accent: Color,
-    text: &str,
-    cursor: usize,
-) -> Paragraph<'static> {
+fn render_input_bar(label: &str, accent: Color, text: &str, cursor: usize) -> Paragraph<'static> {
     let mut spans = vec![
         Span::raw(" ".to_string()),
         Span::styled(
@@ -3788,7 +3851,9 @@ fn classify_completion(focus: Focus, base: &str, token: &str) -> CompletionConte
         if focus == Focus::Prompt && token.starts_with('/') {
             return CompletionContext::Slash;
         }
-        if token.starts_with('/') || token.starts_with("./") || token.starts_with("../")
+        if token.starts_with('/')
+            || token.starts_with("./")
+            || token.starts_with("../")
             || token.starts_with("~/")
         {
             return CompletionContext::Path;
@@ -4084,11 +4149,7 @@ fn cycle_completion(app: &mut App, dir: i32) {
             return;
         }
         let new_cursor = base.len() + matches[0].len();
-        set_current_input(
-            app,
-            format!("{base}{}{suffix}", matches[0]),
-            new_cursor,
-        );
+        set_current_input(app, format!("{base}{}{suffix}", matches[0]), new_cursor);
         app.completion = Some(CompletionState {
             base_text: base,
             suffix,
@@ -4318,7 +4379,11 @@ fn path_basename(text: &str) -> Option<String> {
     }
     let trimmed = text.trim_end_matches('/');
     let base = trimmed.rsplit('/').next()?;
-    if base.is_empty() { None } else { Some(base.to_string()) }
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
 }
 
 /// Plain text for "Copy whole output". For byte-stream captures this is
@@ -4403,9 +4468,7 @@ async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
 fn history_file_path() -> Option<PathBuf> {
     let cache_dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache"))
-        })?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
     Some(cache_dir.join("shed").join("history"))
 }
 
@@ -4565,8 +4628,10 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
     if app.alias_overwrite.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => confirm_alias_overwrite(app, true),
-            KeyCode::Char('n') | KeyCode::Char('N')
-            | KeyCode::Char('c') | KeyCode::Char('C')
+            KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('c')
+            | KeyCode::Char('C')
             | KeyCode::Esc => confirm_alias_overwrite(app, false),
             _ => {}
         }
@@ -4779,7 +4844,9 @@ fn commit_pin(app: &mut App) {
     let name = std::mem::take(&mut app.pin_input).trim().to_string();
     app.pin_input_mode = false;
     app.pin_cursor = 0;
-    let Some(id) = app.session.cursor() else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
 
     if name.is_empty() {
         app.savepoint();
@@ -4849,8 +4916,12 @@ fn commit_write(app: &mut App) {
         app.flash = Some("path required".into());
         return;
     }
-    let Some(id) = app.session.cursor() else { return };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
 
     let format = WriteFormat::from_path(path);
     let bytes = match format {
@@ -4945,8 +5016,7 @@ fn render_json_bytes(shed: &Shed) -> Vec<u8> {
         Err(e) => return e.into_bytes(),
     };
     let json = pipeline_value_to_json(value);
-    let mut out =
-        serde_json::to_vec_pretty(&json).unwrap_or_else(|e| e.to_string().into_bytes());
+    let mut out = serde_json::to_vec_pretty(&json).unwrap_or_else(|e| e.to_string().into_bytes());
     out.push(b'\n');
     out
 }
@@ -4969,9 +5039,7 @@ fn value_to_json(v: Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::String(s) => serde_json::Value::String(s),
-        Value::Bytes(b) => {
-            serde_json::Value::String(String::from_utf8_lossy(&b).to_string())
-        }
+        Value::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(&b).to_string()),
         Value::List(items) => {
             serde_json::Value::Array(items.into_iter().map(value_to_json).collect())
         }
@@ -5092,8 +5160,12 @@ fn update_search(app: &mut App) {
     let Some(regex) = try_compile(&app.search_query, app.search_case_insensitive) else {
         return;
     };
-    let Some(id) = app.session.cursor() else { return };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     let lines = compute_shed_lines(shed);
     let matches = find_matches_regex(&lines, &regex);
     if matches.is_empty() {
@@ -5125,8 +5197,12 @@ fn jump_to_search(app: &mut App, forward: bool) {
         app.flash = Some(format!("invalid regex: {}", app.search_query));
         return;
     };
-    let Some(id) = app.session.cursor() else { return };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     let lines = compute_shed_lines(shed);
     let matches = find_matches_regex(&lines, &regex);
     if matches.is_empty() {
@@ -5236,10 +5312,7 @@ fn highlight_matches_in_line(line: Line<'static>, regex: &regex::Regex) -> Line<
             local_pos = m_local_end;
         }
         if local_pos < span_len {
-            new_spans.push(Span::styled(
-                span_text[local_pos..].to_string(),
-                span_style,
-            ));
+            new_spans.push(Span::styled(span_text[local_pos..].to_string(), span_style));
         }
         byte_offset = span_end;
     }
@@ -5270,8 +5343,12 @@ fn move_filter_cursor(app: &mut App, delta: i32) {
 }
 
 fn open_filter_edit(app: &mut App) {
-    let Some(id) = app.session.cursor() else { return };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     if shed.capture.is_none() {
         let msg = match shed.state {
             ShedState::Running => "still running — no capture yet",
@@ -5290,8 +5367,12 @@ fn open_filter_edit(app: &mut App) {
 }
 
 fn open_filter_insert(app: &mut App) {
-    let Some(id) = app.session.cursor() else { return };
-    let Some(shed) = app.session.shed(id) else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
     if shed.capture.is_none() {
         let msg = match shed.state {
             ShedState::Running => "still running — no capture yet",
@@ -5437,7 +5518,11 @@ fn handle_sort_keys_key(state: &mut FilterEditState, key: KeyEvent) {
         return;
     }
     let n = state.sort_keys.len();
-    let last_visible = if n < MAX_SORT_KEYS { n } else { n.saturating_sub(1) };
+    let last_visible = if n < MAX_SORT_KEYS {
+        n
+    } else {
+        n.saturating_sub(1)
+    };
 
     match key.code {
         KeyCode::Up => {
@@ -5449,7 +5534,11 @@ fn handle_sort_keys_key(state: &mut FilterEditState, key: KeyEvent) {
         KeyCode::Left | KeyCode::Right => {
             if state.sort_keys_cursor < n {
                 let cols = state.available_columns.len() as i32;
-                let delta: i32 = if matches!(key.code, KeyCode::Right) { 1 } else { -1 };
+                let delta: i32 = if matches!(key.code, KeyCode::Right) {
+                    1
+                } else {
+                    -1
+                };
                 let cur = state.sort_keys[state.sort_keys_cursor].0 as i32;
                 let new = (cur + delta).rem_euclid(cols) as usize;
                 state.sort_keys[state.sort_keys_cursor].0 = new;
@@ -5649,7 +5738,9 @@ fn apply_filter_edit(app: &mut App) {
 }
 
 fn move_filter_in_pipeline(app: &mut App, delta: i32) {
-    let Some(id) = app.session.cursor() else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
     let pos = app.pipeline_cursor;
     let len = match app.session.shed(id) {
         Some(b) => b.pipeline.len(),
@@ -5671,7 +5762,9 @@ fn move_filter_in_pipeline(app: &mut App, delta: i32) {
 }
 
 fn drop_filter_at_cursor(app: &mut App) {
-    let Some(id) = app.session.cursor() else { return };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
     let cursor = app.pipeline_cursor;
     let pipeline_empty = app
         .session
@@ -5699,11 +5792,7 @@ fn drop_filter_at_cursor(app: &mut App) {
         app.undo_stack.pop();
         app.flash = Some("no filters to drop".into());
     }
-    let new_len = app
-        .session
-        .shed(id)
-        .map(|b| b.pipeline.len())
-        .unwrap_or(0);
+    let new_len = app.session.shed(id).map(|b| b.pipeline.len()).unwrap_or(0);
     if app.pipeline_cursor > new_len {
         app.pipeline_cursor = new_len;
     }
@@ -5816,8 +5905,7 @@ async fn spawn_prompt(app: &mut App) {
             );
         }
         Err(e) => {
-            app.session
-                .set_state(id, ShedState::Failed(e.to_string()));
+            app.session.set_state(id, ShedState::Failed(e.to_string()));
         }
     }
 }
@@ -5844,7 +5932,11 @@ fn run_cd_builtin(app: &mut App, argv: &[String]) {
             .ok_or_else(|| "$HOME not set".into()),
     };
 
-    let result = target.and_then(|t| std::env::set_current_dir(&t).map(|_| t).map_err(|e| e.to_string()));
+    let result = target.and_then(|t| {
+        std::env::set_current_dir(&t)
+            .map(|_| t)
+            .map_err(|e| e.to_string())
+    });
 
     match result {
         Ok(new_path) => {
@@ -5887,10 +5979,13 @@ fn commit_note_edit(app: &mut App) {
     };
     let text = state.buffer_string();
     let new_value = if text.is_empty() { None } else { Some(text) };
-    let prev_value = app.session.shed(state.shed_id).and_then(|b| match state.position {
-        NotePosition::Pre => b.pre_text.clone(),
-        NotePosition::Post => b.post_text.clone(),
-    });
+    let prev_value = app
+        .session
+        .shed(state.shed_id)
+        .and_then(|b| match state.position {
+            NotePosition::Pre => b.pre_text.clone(),
+            NotePosition::Post => b.post_text.clone(),
+        });
     if prev_value != new_value {
         app.savepoint();
         if let Some(shed) = app.session.shed_mut(state.shed_id) {
@@ -6189,8 +6284,10 @@ fn run_export_builtin(app: &mut App, argv: &[String]) {
             app.flash = Some(format!("export {}", set.join(", ")));
         }
     } else {
-        app.session
-            .set_state(id, ShedState::Failed(format!("export: {}", errors.join("; "))));
+        app.session.set_state(
+            id,
+            ShedState::Failed(format!("export: {}", errors.join("; "))),
+        );
     }
 }
 
@@ -6227,12 +6324,7 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn draw(
-    f: &mut Frame,
-    app: &App,
-    regions: &mut Vec<ClickRegion>,
-    bodies: &mut Vec<BodyRegion>,
-) {
+fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>, bodies: &mut Vec<BodyRegion>) {
     match app.focus {
         Focus::FilterEdit => draw_filter_edit(f, app),
         Focus::ShedExpand => draw_shed_expand(f, app),
@@ -6397,7 +6489,10 @@ fn validate_alias_name(raw: &str) -> Result<String, String> {
         return Err("name can't contain whitespace".into());
     }
     if name.starts_with('@') || name.starts_with('/') || name.starts_with('!') {
-        return Err(format!("name can't start with `{}`", name.chars().next().unwrap()));
+        return Err(format!(
+            "name can't start with `{}`",
+            name.chars().next().unwrap()
+        ));
     }
     Ok(name.to_string())
 }
@@ -6453,7 +6548,9 @@ fn commit_alias_save(app: &mut App) {
 }
 
 fn confirm_alias_overwrite(app: &mut App, accept: bool) {
-    let Some(alias) = app.alias_overwrite.take() else { return };
+    let Some(alias) = app.alias_overwrite.take() else {
+        return;
+    };
     if accept {
         let name = alias.name.clone();
         app.aliases.upsert(alias);
@@ -6520,10 +6617,7 @@ fn draw_note_edit(f: &mut Frame, app: &App) {
     let mut cursor_emitted = false;
 
     let push_line = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
-        let mut prefixed = vec![Span::styled(
-            "▎ ",
-            Style::default().fg(Color::DarkGray),
-        )];
+        let mut prefixed = vec![Span::styled("▎ ", Style::default().fg(Color::DarkGray))];
         prefixed.extend(spans);
         lines.push(Line::from(prefixed));
     };
@@ -6592,7 +6686,12 @@ fn draw_context_menu(f: &mut Frame, app: &App) {
     if y + height > frame.y + frame.height {
         y = frame.y + frame.height - height;
     }
-    let area = Rect { x, y, width, height };
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     let block = TuiBlock::default()
         .borders(Borders::ALL)
@@ -6612,7 +6711,11 @@ fn draw_context_menu(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let style = if i == menu.selected { highlight } else { normal };
+            let style = if i == menu.selected {
+                highlight
+            } else {
+                normal
+            };
             Line::from(Span::styled(format!(" {} ", item.label), style))
         })
         .collect();
@@ -6746,8 +6849,7 @@ fn write_clipboard_osc52(text: &str) -> io::Result<()> {
 /// streaming or url-safe variants, so a 40-line implementation is
 /// cheaper than pulling in a dep.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in &mut chunks {
@@ -6843,7 +6945,9 @@ fn draw_palette(f: &mut Frame, app: &App) {
             let name_style = if selected {
                 highlight
             } else {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             };
             let desc_style = if selected { highlight } else { dim };
             lines.push(Line::from(vec![
@@ -7028,7 +7132,11 @@ fn draw_shed_expand(f: &mut Frame, app: &App) {
     };
     let regex = try_compile(&app.search_query, app.search_case_insensitive);
     if !app.search_query.is_empty() {
-        let flags = if app.search_case_insensitive { " (i)" } else { "" };
+        let flags = if app.search_case_insensitive {
+            " (i)"
+        } else {
+            ""
+        };
         let suffix = match &regex {
             Some(r) => {
                 let count = find_matches_regex(&all_lines, r).len();
@@ -7136,7 +7244,12 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickReg
         }
         buf.set_string(x, area.y, &label, style);
         regions.push(ClickRegion {
-            rect: Rect { x, y: area.y, width: drawn_width, height: 1 },
+            rect: Rect {
+                x,
+                y: area.y,
+                width: drawn_width,
+                height: 1,
+            },
             action: ClickAction::SwitchTab(i),
         });
         x = x.saturating_add(drawn_width);
@@ -7149,7 +7262,12 @@ fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickReg
     if x.saturating_add(3) <= tab_limit {
         buf.set_string(x, area.y, " + ", plus_style);
         regions.push(ClickRegion {
-            rect: Rect { x, y: area.y, width: 3, height: 1 },
+            rect: Rect {
+                x,
+                y: area.y,
+                width: 3,
+                height: 1,
+            },
             action: ClickAction::NewTab,
         });
     }
@@ -7348,9 +7466,7 @@ fn draw_scratch_box(f: &mut Frame, area: Rect, app: &App) {
     // ShedCursor but the user hasn't activated it yet (cyan, matching
     // the ShedCursor selection look on real sheds). Distinct from
     // active (green) so it's clear what mode keystrokes go to.
-    let selected = !active
-        && app.focus == Focus::ShedCursor
-        && app.session.cursor().is_none();
+    let selected = !active && app.focus == Focus::ShedCursor && app.session.cursor().is_none();
 
     let title_style = if active {
         Style::default()
@@ -7520,7 +7636,12 @@ fn draw_one_shed(
                     return None;
                 }
                 Some(CellRegion {
-                    rect: Rect { x: abs_x, y: abs_y, width, height: 1 },
+                    rect: Rect {
+                        x: abs_x,
+                        y: abs_y,
+                        width,
+                        height: 1,
+                    },
                     value: cell.value.clone(),
                 })
             })
@@ -7541,9 +7662,7 @@ fn draw_one_shed(
     if area.width >= min_room {
         let close_x = area.right().saturating_sub(close_width + 1);
         let buf = f.buffer_mut();
-        let close_style = Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD);
+        let close_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         // Repaint the three cells over the top border with `[×]` (or
         // ` × ` for a softer look). Picking `[×]` so it visually
         // reads as a button.
@@ -7606,7 +7725,11 @@ fn render_shed(
         // Each filter on its own line. When command_focused is true the
         // pipeline cursor is treated as None so no filter wears the
         // active-magenta highlight and the `+ add` slot is suppressed.
-        let effective_cursor = if command_focused { None } else { pipeline_cursor };
+        let effective_cursor = if command_focused {
+            None
+        } else {
+            pipeline_cursor
+        };
         let highlight = Style::default()
             .fg(Color::Black)
             .bg(Color::Magenta)
@@ -7707,7 +7830,9 @@ fn render_shed(
             Span::raw(" "),
             Span::styled(
                 "▸ ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "Space",
@@ -7716,10 +7841,7 @@ fn render_shed(
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " to run",
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(" to run", Style::default().fg(Color::Cyan)),
         ]));
     }
 
@@ -8033,7 +8155,6 @@ fn schema_of(items: &[Value]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-
 fn format_scalar(v: &Value) -> String {
     match v {
         Value::Null => "null".into(),
@@ -8102,7 +8223,11 @@ fn describe_predicate(p: &Predicate) -> String {
         Predicate::Matches { column, pattern } => format!("{column} matches {pattern}"),
         Predicate::Contains { column, substring } => format!("{column} contains {substring}"),
         Predicate::Compare { column, op, value } => {
-            format!("{column} {} {}", describe_compare_op(*op), describe_compare_value(value))
+            format!(
+                "{column} {} {}",
+                describe_compare_op(*op),
+                describe_compare_value(value)
+            )
         }
         Predicate::And(a, b) => format!("({} && {})", describe_predicate(a), describe_predicate(b)),
         Predicate::Or(a, b) => format!("({} || {})", describe_predicate(a), describe_predicate(b)),
@@ -8201,16 +8326,10 @@ fn draw_stack_pane(
             let mut spans = vec![
                 Span::styled("  ▸ ", edit_style),
                 Span::styled(active_label.clone(), edit_style),
-                Span::styled(
-                    format!("  ← inserting before {}", circled(i + 1)),
-                    dim,
-                ),
+                Span::styled(format!("  ← inserting before {}", circled(i + 1)), dim),
             ];
             if n > 0 {
-                spans.push(Span::styled(
-                    format!("  ⓘ -{n} (type mismatch)"),
-                    warn,
-                ));
+                spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
             }
             lines.push(Line::from(spans));
         }
@@ -8236,10 +8355,7 @@ fn draw_stack_pane(
         };
         let n = drops.get(drops_idx).copied().unwrap_or(0);
         if n > 0 {
-            spans.push(Span::styled(
-                format!("  ⓘ -{n} (type mismatch)"),
-                warn,
-            ));
+            spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
         }
         lines.push(Line::from(spans));
     }
@@ -8254,10 +8370,7 @@ fn draw_stack_pane(
         ];
         let n = drops.get(shed.pipeline.len()).copied().unwrap_or(0);
         if n > 0 {
-            spans.push(Span::styled(
-                format!("  ⓘ -{n} (type mismatch)"),
-                warn,
-            ));
+            spans.push(Span::styled(format!("  ⓘ -{n} (type mismatch)"), warn));
         }
         lines.push(Line::from(spans));
     }
@@ -8481,11 +8594,7 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
     let label_span = Span::styled(format!("  {label:>8}: "), label_style);
 
     let value_spans: Vec<Span<'static>> = match field {
-        FormField::Kind => render_select_value(
-            state.kind.name(),
-            state.kind.description(),
-            active,
-        ),
+        FormField::Kind => render_select_value(state.kind.name(), state.kind.description(), active),
         FormField::Column => {
             if state.available_columns.is_empty() {
                 vec![Span::styled(
@@ -8513,7 +8622,11 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::Columns => render_columns_field(state, active),
         FormField::CsvDelim => render_select_value(delim_label(state.csv_delim), "", active),
         FormField::CsvHasHeader => render_select_value(
-            if state.csv_has_header { "true" } else { "false" },
+            if state.csv_has_header {
+                "true"
+            } else {
+                "false"
+            },
             if state.csv_has_header {
                 "first row is column names"
             } else {
@@ -8530,16 +8643,14 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             // Multi-line — handled separately.
             return Line::from("");
         }
-        FormField::WhereCombine => {
-            render_select_value(state.where_combine.name(), state.where_combine.description(), active)
-        }
+        FormField::WhereCombine => render_select_value(
+            state.where_combine.name(),
+            state.where_combine.description(),
+            active,
+        ),
         FormField::WhereClauseSelect => {
             let total = state.where_clauses.len();
-            let label = format!(
-                "{} of {}",
-                circled(state.where_active_clause + 1),
-                total,
-            );
+            let label = format!("{} of {}", circled(state.where_active_clause + 1), total,);
             let desc = if active {
                 "←→ select  a add  x remove"
             } else {
@@ -8608,7 +8719,11 @@ fn render_columns_field(state: &FilterEditState, active: bool) -> Vec<Span<'stat
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let check = if state.column_selections[i] { "☑" } else { "☐" };
+        let check = if state.column_selections[i] {
+            "☑"
+        } else {
+            "☐"
+        };
         let on_cursor = active && i == state.column_cursor;
         let style = if on_cursor {
             Style::default()
@@ -8667,7 +8782,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  "),
                 Span::styled(
                     "[y]es",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -8677,7 +8794,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  "),
                 Span::styled(
                     "[c]ancel",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]))
             .style(Style::default().bg(Color::DarkGray));
@@ -8748,7 +8867,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled(
                 "[y]es",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
@@ -8815,10 +8936,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             Color::Yellow,
         ));
         if app.search_case_insensitive {
-            spans.push(Span::styled(
-                "  (i)",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled("  (i)", Style::default().fg(Color::DarkGray)));
         }
         if invalid {
             spans.push(Span::styled(
@@ -8826,8 +8944,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::Red),
             ));
         }
-        let widget = Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(Color::DarkGray));
+        let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
         f.render_widget(widget, area);
         return;
     }
@@ -8872,11 +8989,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ("Esc", "prompt"),
             ("Ctrl-D", "quit"),
         ],
-        Focus::EditShed if app.command_focused => vec![
-            ("↓", "filters"),
-            ("f / Enter", "edit cmd"),
-            ("Esc", "back"),
-        ],
+        Focus::EditShed if app.command_focused => {
+            vec![("↓", "filters"), ("f / Enter", "edit cmd"), ("Esc", "back")]
+        }
         Focus::EditShed => vec![
             ("↑↓", "cmd / filters"),
             ("f / Enter", "edit"),
@@ -8945,8 +9060,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         ));
         spans.push(Span::raw(format!(" {label}")));
     }
-    let widget = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(Color::DarkGray));
+    let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     f.render_widget(widget, area);
 }
 
@@ -9082,7 +9196,11 @@ mod tests {
         let r = regex::Regex::new("ell").unwrap();
         let highlighted = highlight_matches_in_line(line, &r);
         // We expect: "h" (red), "ell" (red+REVERSED), "o " (red), "world" (blue)
-        let texts: Vec<String> = highlighted.spans.iter().map(|s| s.content.to_string()).collect();
+        let texts: Vec<String> = highlighted
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(texts.join(""), "hello world");
         // The "ell" span has the REVERSED modifier set.
         let ell = highlighted
@@ -9123,7 +9241,12 @@ mod tests {
         let r = regex::Regex::new("xyz").unwrap();
         let result = highlight_matches_in_line(line, &r);
         assert_eq!(result.spans.len(), 1);
-        assert!(!result.spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            !result.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -9227,11 +9350,26 @@ mod tests {
 
     #[test]
     fn write_format_inferred_from_extension() {
-        assert!(matches!(WriteFormat::from_path("foo.csv"), WriteFormat::Csv(b',')));
-        assert!(matches!(WriteFormat::from_path("foo.CSV"), WriteFormat::Csv(b',')));
-        assert!(matches!(WriteFormat::from_path("foo.tsv"), WriteFormat::Csv(b'\t')));
-        assert!(matches!(WriteFormat::from_path("foo.json"), WriteFormat::Json));
-        assert!(matches!(WriteFormat::from_path("foo.txt"), WriteFormat::Plain));
+        assert!(matches!(
+            WriteFormat::from_path("foo.csv"),
+            WriteFormat::Csv(b',')
+        ));
+        assert!(matches!(
+            WriteFormat::from_path("foo.CSV"),
+            WriteFormat::Csv(b',')
+        ));
+        assert!(matches!(
+            WriteFormat::from_path("foo.tsv"),
+            WriteFormat::Csv(b'\t')
+        ));
+        assert!(matches!(
+            WriteFormat::from_path("foo.json"),
+            WriteFormat::Json
+        ));
+        assert!(matches!(
+            WriteFormat::from_path("foo.txt"),
+            WriteFormat::Plain
+        ));
         assert!(matches!(WriteFormat::from_path("foo"), WriteFormat::Plain));
     }
 
@@ -9245,10 +9383,8 @@ mod tests {
         let mut rec2 = indexmap::IndexMap::new();
         rec2.insert("name".to_string(), Value::String("bob".into()));
         rec2.insert("age".to_string(), Value::Int(25));
-        let v = PipelineValue::Structured(Value::List(vec![
-            Value::Record(rec1),
-            Value::Record(rec2),
-        ]));
+        let v =
+            PipelineValue::Structured(Value::List(vec![Value::Record(rec1), Value::Record(rec2)]));
         let json = pipeline_value_to_json(v);
         let s = serde_json::to_string(&json).unwrap();
         // Structure check via round-trip.
@@ -9268,10 +9404,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", "/tmp/shed-tilde-test");
         }
-        assert_eq!(
-            expand_tilde("~"),
-            PathBuf::from("/tmp/shed-tilde-test")
-        );
+        assert_eq!(expand_tilde("~"), PathBuf::from("/tmp/shed-tilde-test"));
         assert_eq!(
             expand_tilde("~/foo"),
             PathBuf::from("/tmp/shed-tilde-test/foo")
@@ -9586,7 +9719,9 @@ mod tests {
         state.where_clauses[0].op = WhereOp::Matches;
         state.where_clauses[0].pattern = "abc".into();
         match state.build_filter() {
-            Some(FilterSpec::Where { predicate: Predicate::Matches { pattern, .. } }) => {
+            Some(FilterSpec::Where {
+                predicate: Predicate::Matches { pattern, .. },
+            }) => {
                 assert_eq!(pattern, "abc");
             }
             _ => panic!("expected Matches"),
@@ -9594,7 +9729,9 @@ mod tests {
 
         state.where_clauses[0].op = WhereOp::Contains;
         match state.build_filter() {
-            Some(FilterSpec::Where { predicate: Predicate::Contains { substring, .. } }) => {
+            Some(FilterSpec::Where {
+                predicate: Predicate::Contains { substring, .. },
+            }) => {
                 assert_eq!(substring, "abc");
             }
             _ => panic!("expected Contains"),
@@ -9809,7 +9946,11 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let id = app.session.add_shed(vec!["echo".into(), "hi".into()]);
-        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session
+            .shed_mut(id)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromLines);
         app.dirty = true;
         assert!(app.dirty);
 
@@ -9935,10 +10076,7 @@ mod tests {
 
     #[test]
     fn parse_shed_ref_recognizes_both_forms() {
-        assert_eq!(
-            parse_shed_ref("@logs"),
-            Some(ShedRef::Name("logs".into()))
-        );
+        assert_eq!(parse_shed_ref("@logs"), Some(ShedRef::Name("logs".into())));
         assert_eq!(parse_shed_ref("%7"), Some(ShedRef::Id(ShedId(7))));
         assert_eq!(parse_shed_ref("@"), None);
         assert_eq!(parse_shed_ref("%"), None);
@@ -9950,17 +10088,23 @@ mod tests {
     fn snapshot_ref_returns_structured_when_source_pipeline_yields_rows() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
-        s.set_capture(src, Capture {
-            stdout: Bytes::from_static(b"1\n2\n3\n"),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: None,
-        });
-        s.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
+        s.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::from_static(b"1\n2\n3\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
+        s.shed_mut(src)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromLines);
         s.pin(src, "nums".into());
 
         let out = snapshot_ref(&s, &ShedRef::Name("nums".into())).expect("snapshot");
@@ -9983,16 +10127,19 @@ mod tests {
     fn snapshot_ref_by_id_passes_bytes_through_when_source_has_no_pipeline() {
         let mut s = Session::new();
         let src = s.add_shed(vec!["echo".into(), "hi".into()]);
-        s.set_capture(src, Capture {
-            stdout: Bytes::from_static(b"hello\n"),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: None,
-        });
+        s.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::from_static(b"hello\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
         // Unpinned: only the %N form can reach it.
         let out = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
         match out {
@@ -10025,21 +10172,26 @@ mod tests {
         row1.insert("a".to_string(), Value::Int(2));
         row1.insert("m".to_string(), Value::Int(3));
         let src = s.add_shed(vec!["mksrc".into()]);
-        s.set_capture(src, Capture {
-            stdout: Bytes::new(),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: Some(Value::List(vec![Value::Record(row1)])),
-        });
+        s.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::new(),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: Some(Value::List(vec![Value::Record(row1)])),
+            },
+        );
 
         let out = snapshot_ref(&s, &ShedRef::Id(src)).expect("snapshot");
         match out {
             SnapshotOutput::Structured(Value::List(rows)) => {
-                let Value::Record(rec) = &rows[0] else { panic!("expected record") };
+                let Value::Record(rec) = &rows[0] else {
+                    panic!("expected record")
+                };
                 let cols: Vec<&str> = rec.keys().map(|s| s.as_str()).collect();
                 assert_eq!(cols, vec!["z", "a", "m"], "column order preserved");
             }
@@ -10052,25 +10204,37 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let src = app.session.add_shed(vec!["seq".into()]);
-        app.session.set_capture(src, Capture {
-            stdout: Bytes::from_static(b"1\n2\n"),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: None,
-        });
-        app.session.shed_mut(src).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::from_static(b"1\n2\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
+        app.session
+            .shed_mut(src)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromLines);
 
         let dst = app.session.add_shed(vec![format!("%{}", src.0)]);
         populate_snapshot(&mut app, dst, &ShedRef::Id(src));
 
         let cap = app.session.shed(dst).unwrap().capture.as_ref().unwrap();
-        assert!(cap.stdout.is_empty(), "structured snapshot leaves stdout empty");
+        assert!(
+            cap.stdout.is_empty(),
+            "structured snapshot leaves stdout empty"
+        );
         let structured = cap.structured.as_ref().expect("structured populated");
-        let Value::List(rows) = structured else { panic!("expected list") };
+        let Value::List(rows) = structured else {
+            panic!("expected list")
+        };
         assert_eq!(rows.len(), 2);
     }
 
@@ -10079,16 +10243,19 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let src = app.session.add_shed(vec!["echo".into()]);
-        app.session.set_capture(src, Capture {
-            stdout: Bytes::from_static(b"hello\n"),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: None,
-        });
+        app.session.set_capture(
+            src,
+            Capture {
+                stdout: Bytes::from_static(b"hello\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
         let dst = app.session.add_shed(vec![format!("%{}", src.0)]);
         populate_snapshot(&mut app, dst, &ShedRef::Id(src));
 
@@ -10105,16 +10272,19 @@ mod tests {
         let mut row = IndexMap::new();
         row.insert("foo".to_string(), Value::Int(1));
         row.insert("bar".to_string(), Value::Int(2));
-        s.set_capture(id, Capture {
-            stdout: Bytes::new(),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: true,
-            structured: Some(Value::List(vec![Value::Record(row)])),
-        });
+        s.set_capture(
+            id,
+            Capture {
+                stdout: Bytes::new(),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: true,
+                structured: Some(Value::List(vec![Value::Record(row)])),
+            },
+        );
         let shed = s.shed(id).unwrap();
         // No filters: schema should reflect the inherited structured value.
         assert_eq!(compute_schema_at(shed, 0), vec!["foo", "bar"]);
@@ -10299,22 +10469,31 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
-        let id = app.session.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
-        app.session.set_capture(id, Capture {
-            stdout: Bytes::from_static(b"1\n2\n3\n"),
-            stderr: Bytes::new(),
-            exit_code: Some(0),
-            started_at: Instant::now(),
-            finished_at: Some(Instant::now()),
-            truncated: false,
-            snapshotted: false,
-            structured: None,
-        });
+        let id = app
+            .session
+            .add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        app.session.set_capture(
+            id,
+            Capture {
+                stdout: Bytes::from_static(b"1\n2\n3\n"),
+                stderr: Bytes::new(),
+                exit_code: Some(0),
+                started_at: Instant::now(),
+                finished_at: Some(Instant::now()),
+                truncated: false,
+                snapshotted: false,
+                structured: None,
+            },
+        );
         app.session.set_cursor(Some(id));
 
         // Simulate adding a filter via savepoint + mutation.
         app.savepoint();
-        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session
+            .shed_mut(id)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromLines);
 
         assert_eq!(app.session.shed(id).unwrap().pipeline.len(), 1);
 
@@ -10370,7 +10549,11 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let id = app.session.add_shed(vec!["ls".into()]);
-        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromLines);
+        app.session
+            .shed_mut(id)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromLines);
         app.session.set_cursor(Some(id));
         app.pipeline_cursor = 0;
         app.command_focused = false;
@@ -10409,7 +10592,9 @@ mod tests {
     fn commit_cmd_edit_updates_argv_and_queues_self_plus_dependents() {
         let mut app = App::new();
         app.history.clear();
-        let src = app.session.add_shed(vec!["seq".into(), "1".into(), "3".into()]);
+        let src = app
+            .session
+            .add_shed(vec!["seq".into(), "1".into(), "3".into()]);
         app.session.set_state(src, ShedState::Done(0));
         app.session.pin(src, "src".into());
 
@@ -10422,10 +10607,7 @@ mod tests {
         commit_cmd_edit(&mut app);
 
         assert!(!app.cmd_edit_input_mode);
-        assert_eq!(
-            app.session.shed(src).unwrap().argv,
-            vec!["seq", "1", "5"]
-        );
+        assert_eq!(app.session.shed(src).unwrap().argv, vec!["seq", "1", "5"]);
         // Both source (re-run) and dependent (re-snapshot) queued.
         let queued: Vec<_> = app.pending_run_chain.iter().copied().collect();
         assert_eq!(queued, vec![src, dep]);
@@ -10455,7 +10637,10 @@ mod tests {
         assert!(validate_alias_name("!bad").is_err());
         assert_eq!(validate_alias_name("list").unwrap(), "list");
         assert_eq!(validate_alias_name("  ls-l  ").unwrap(), "ls-l");
-        assert_eq!(validate_alias_name("name_with_underscore").unwrap(), "name_with_underscore");
+        assert_eq!(
+            validate_alias_name("name_with_underscore").unwrap(),
+            "name_with_underscore"
+        );
     }
 
     #[test]
@@ -10463,7 +10648,11 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let id = app.session.add_shed(vec!["ls".into(), "-lat".into()]);
-        app.session.shed_mut(id).unwrap().pipeline.push(FilterSpec::FromFields);
+        app.session
+            .shed_mut(id)
+            .unwrap()
+            .pipeline
+            .push(FilterSpec::FromFields);
         app.session.set_cursor(Some(id));
 
         let alias = build_alias_from_cursor(&app, "list".into()).expect("built");
@@ -10727,7 +10916,10 @@ mod tests {
 
         cycle_completion(&mut app, 1);
         let first = app.prompt.clone();
-        assert!(first == "cat @alpha" || first == "cat @alphabet", "first={first}");
+        assert!(
+            first == "cat @alpha" || first == "cat @alphabet",
+            "first={first}"
+        );
         assert!(app.completion.is_some());
 
         cycle_completion(&mut app, 1);
@@ -10869,7 +11061,11 @@ mod tests {
     fn apply_readline_handles_basic_keys() {
         let mut t = String::from("ab");
         let mut c = 2;
-        assert!(apply_readline_edit(&mut t, &mut c, &key(KeyCode::Char('c'))));
+        assert!(apply_readline_edit(
+            &mut t,
+            &mut c,
+            &key(KeyCode::Char('c'))
+        ));
         assert_eq!(t, "abc");
         assert_eq!(c, 3);
 
@@ -10979,7 +11175,10 @@ mod tests {
         let _ = app.session.add_shed(vec!["a".into()]);
         app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
-        handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        handle_cursor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
         assert_eq!(app.focus, Focus::Prompt);
         assert!(app.pending_run_chain.is_empty());
     }
@@ -10991,7 +11190,10 @@ mod tests {
         let _ = app.session.add_shed(vec!["a".into()]);
         app.focus = Focus::ShedCursor;
         app.session.set_cursor(None);
-        handle_cursor_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        handle_cursor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
         assert_eq!(app.focus, Focus::Prompt);
     }
 
@@ -11078,7 +11280,12 @@ mod tests {
         // Pretend the renderer placed a delete region for shed b at
         // (10, 5) - 3 cells wide, 1 cell tall.
         app.click_regions.push(ClickRegion {
-            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            rect: Rect {
+                x: 10,
+                y: 5,
+                width: 3,
+                height: 1,
+            },
             action: ClickAction::DeleteBlock(b),
         });
         let me = MouseEvent {
@@ -11098,7 +11305,12 @@ mod tests {
         app.history.clear();
         let a = app.session.add_shed(vec!["a".into()]);
         app.click_regions.push(ClickRegion {
-            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            rect: Rect {
+                x: 10,
+                y: 5,
+                width: 3,
+                height: 1,
+            },
             action: ClickAction::DeleteBlock(a),
         });
         let me = MouseEvent {
@@ -11117,7 +11329,12 @@ mod tests {
         app.history.clear();
         let a = app.session.add_shed(vec!["a".into()]);
         app.click_regions.push(ClickRegion {
-            rect: Rect { x: 10, y: 5, width: 3, height: 1 },
+            rect: Rect {
+                x: 10,
+                y: 5,
+                width: 3,
+                height: 1,
+            },
             action: ClickAction::DeleteBlock(a),
         });
         // A scroll event right inside the region — must not delete.
@@ -11233,7 +11450,12 @@ mod tests {
 
     fn make_body_region(shed_id: ShedId, lines: Vec<&str>) -> BodyRegion {
         BodyRegion {
-            rect: Rect { x: 2, y: 3, width: 40, height: lines.len() as u16 },
+            rect: Rect {
+                x: 2,
+                y: 3,
+                width: 40,
+                height: lines.len() as u16,
+            },
             shed_id,
             lines: lines.into_iter().map(|s| s.to_string()).collect(),
             cells: Vec::new(),
@@ -11271,7 +11493,8 @@ mod tests {
                 structured: None,
             });
         }
-        app.body_regions.push(make_body_region(a, vec!["hello", "world"]));
+        app.body_regions
+            .push(make_body_region(a, vec!["hello", "world"]));
         let me = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 5, // inside rect.x=2..42
@@ -11284,7 +11507,13 @@ mod tests {
         assert!(labels.contains(&"Copy line"));
         assert!(labels.contains(&"Copy whole output"));
         // Targeted line text should be the first body row.
-        match &menu.items.iter().find(|i| i.label == "Copy line").unwrap().action {
+        match &menu
+            .items
+            .iter()
+            .find(|i| i.label == "Copy line")
+            .unwrap()
+            .action
+        {
             ContextMenuAction::CopyText(t) => assert_eq!(t, "hello"),
             _ => panic!("expected CopyText"),
         }
@@ -11308,7 +11537,8 @@ mod tests {
             });
         }
         // Empty line at row 3.
-        app.body_regions.push(make_body_region(a, vec!["", "world"]));
+        app.body_regions
+            .push(make_body_region(a, vec!["", "world"]));
         let me = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 5,
@@ -11318,7 +11548,10 @@ mod tests {
         handle_mouse(&mut app, me);
         let menu = app.context_menu.as_ref().expect("menu opened");
         let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-        assert!(!labels.contains(&"Copy line"), "blank line shouldn't offer copy");
+        assert!(
+            !labels.contains(&"Copy line"),
+            "blank line shouldn't offer copy"
+        );
         assert!(labels.contains(&"Copy whole output"));
     }
 
@@ -11513,8 +11746,14 @@ mod tests {
         assert!(path_basename("").is_none());
         assert!(path_basename("nope").is_none(), "no slash");
         assert!(path_basename("42").is_none());
-        assert!(path_basename("hello world").is_none(), "contains whitespace");
-        assert!(path_basename("/path with space/file").is_none(), "spaces disqualify");
+        assert!(
+            path_basename("hello world").is_none(),
+            "contains whitespace"
+        );
+        assert!(
+            path_basename("/path with space/file").is_none(),
+            "spaces disqualify"
+        );
         assert!(path_basename("/").is_none(), "trim leaves empty");
     }
 
@@ -11552,11 +11791,21 @@ mod tests {
         // A 1x1 cell located at (col 10, row 5) so tests can right-click
         // precisely. Width 8 lets us hit columns 10..18.
         BodyRegion {
-            rect: Rect { x: 6, y: 3, width: 40, height: 6 },
+            rect: Rect {
+                x: 6,
+                y: 3,
+                width: 40,
+                height: 6,
+            },
             shed_id,
             lines: vec![String::new(); 6],
             cells: vec![CellRegion {
-                rect: Rect { x: 10, y: 5, width: 8, height: 1 },
+                rect: Rect {
+                    x: 10,
+                    y: 5,
+                    width: 8,
+                    height: 1,
+                },
                 value,
             }],
         }
@@ -11597,8 +11846,7 @@ mod tests {
         let mut app = App::new();
         app.history.clear();
         let a = app.session.add_shed(vec!["echo".into()]);
-        app.body_regions
-            .push(body_with_one_cell(a, Value::Int(42)));
+        app.body_regions.push(body_with_one_cell(a, Value::Int(42)));
         let me = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 12,
@@ -11711,7 +11959,12 @@ mod tests {
         // Register a delete click region overlapping (10, 0); also a body
         // region whose lines are all empty so no-op is expected.
         app.click_regions.push(ClickRegion {
-            rect: Rect { x: 10, y: 0, width: 3, height: 1 },
+            rect: Rect {
+                x: 10,
+                y: 0,
+                width: 3,
+                height: 1,
+            },
             action: ClickAction::DeleteBlock(a),
         });
         let me = MouseEvent {
@@ -11884,13 +12137,11 @@ mod tests {
         let _ = app.session.add_shed(vec!["b".into()]);
         // Switch back to tab 0 — should see "a" only.
         app.switch_to_tab(0);
-        let argvs: Vec<String> =
-            app.session.sheds().map(|s| s.argv.join(" ")).collect();
+        let argvs: Vec<String> = app.session.sheds().map(|s| s.argv.join(" ")).collect();
         assert_eq!(argvs, vec!["a".to_string()]);
         // Switch to tab 1 — should see "b".
         app.switch_to_tab(1);
-        let argvs: Vec<String> =
-            app.session.sheds().map(|s| s.argv.join(" ")).collect();
+        let argvs: Vec<String> = app.session.sheds().map(|s| s.argv.join(" ")).collect();
         assert_eq!(argvs, vec!["b".to_string()]);
     }
 
@@ -11931,8 +12182,7 @@ mod tests {
         // Tab 2 closed, we should land on tab 1 ("b").
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active_tab, 1);
-        let argvs: Vec<String> =
-            app.session.sheds().map(|s| s.argv.join(" ")).collect();
+        let argvs: Vec<String> = app.session.sheds().map(|s| s.argv.join(" ")).collect();
         assert_eq!(argvs, vec!["b".to_string()]);
     }
 
@@ -12004,10 +12254,7 @@ mod tests {
         try_handle_tab_key(&mut app, key);
         assert_eq!(app.active_tab, 2);
         // Ctrl-Shift-Tab cycles backward.
-        let key = KeyEvent::new(
-            KeyCode::Tab,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        );
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         try_handle_tab_key(&mut app, key);
         assert_eq!(app.active_tab, 1);
     }

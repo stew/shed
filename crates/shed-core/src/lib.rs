@@ -27,15 +27,14 @@
 //! toward the budget but are never evicted.
 
 pub mod aliases;
-pub mod shed;
 pub mod capture;
 pub mod filter;
 pub mod notebook;
 pub mod session;
+pub mod shed;
 pub mod value;
 
 pub use aliases::{ALIASES_VERSION, Alias, AliasError, AliasFile};
-pub use shed::{Shed, ShedId, ShedState};
 pub use capture::Capture;
 pub use filter::{
     CompareOp, Filter, FilterError, FilterNotes, FilterSpec, PipelineValue, Predicate,
@@ -43,4 +42,5 @@ pub use filter::{
 };
 pub use notebook::{NOTEBOOK_VERSION, Notebook, NotebookEntry, NotebookError};
 pub use session::{DEFAULT_CAPTURE_BUDGET_BYTES, Session};
+pub use shed::{Shed, ShedId, ShedState};
 pub use value::Value;

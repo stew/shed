@@ -118,8 +118,14 @@ pub enum SortDirection {
 /// data-model features that have to be constructed programmatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Predicate {
-    Matches { column: String, pattern: String },
-    Contains { column: String, substring: String },
+    Matches {
+        column: String,
+        pattern: String,
+    },
+    Contains {
+        column: String,
+        substring: String,
+    },
     Compare {
         column: String,
         op: CompareOp,
@@ -294,10 +300,7 @@ fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
                             i += 1;
                             break;
                         }
-                        if chars[i] == '\x1b'
-                            && i + 1 < chars.len()
-                            && chars[i + 1] == '\\'
-                        {
+                        if chars[i] == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
                             i += 2;
                             break;
                         }
@@ -444,10 +447,7 @@ fn apply_where_with_notes(
     Ok((PipelineValue::Structured(Value::List(kept)), error_drops))
 }
 
-fn validate_predicate(
-    p: &Predicate,
-    sample: &IndexMap<String, Value>,
-) -> Result<(), FilterError> {
+fn validate_predicate(p: &Predicate, sample: &IndexMap<String, Value>) -> Result<(), FilterError> {
     match p {
         Predicate::Matches { column, pattern } => {
             if !sample.contains_key(column) {
@@ -495,8 +495,7 @@ fn apply_select(input: PipelineValue, columns: &[String]) -> Result<PipelineValu
 
 fn apply_drop(input: PipelineValue, columns: &[String]) -> Result<PipelineValue, FilterError> {
     let items = require_list(input)?;
-    let drop_set: std::collections::HashSet<&str> =
-        columns.iter().map(|s| s.as_str()).collect();
+    let drop_set: std::collections::HashSet<&str> = columns.iter().map(|s| s.as_str()).collect();
     let kept: Vec<Value> = items
         .into_iter()
         .map(|item| match item {
@@ -700,7 +699,9 @@ fn apply_count(input: PipelineValue) -> Result<PipelineValue, FilterError> {
     let items = require_list(input)?;
     let mut rec = IndexMap::with_capacity(1);
     rec.insert("count".to_string(), Value::Int(items.len() as i64));
-    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
+    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(
+        rec,
+    )])))
 }
 
 fn value_to_display_string(v: &Value) -> String {
@@ -768,7 +769,9 @@ fn apply_join(
     let joined = parts.join(delimiter);
     let mut rec = IndexMap::with_capacity(1);
     rec.insert(column.to_string(), Value::String(joined));
-    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(rec)])))
+    Ok(PipelineValue::Structured(Value::List(vec![Value::Record(
+        rec,
+    )])))
 }
 
 fn apply_rename(
@@ -868,7 +871,11 @@ impl Predicate {
                 };
                 Ok(text.contains(substring))
             }
-            Predicate::Compare { column, op, value: target } => {
+            Predicate::Compare {
+                column,
+                op,
+                value: target,
+            } => {
                 let field = lookup_column(value, column)?;
                 let Some(ord) = compare_values(field, target) else {
                     return Err(FilterError::TypeMismatch {
@@ -992,10 +999,7 @@ mod tests {
                 ),
             },
         ];
-        let result = run(
-            &pipeline,
-            b"strawberry\nblueberry\nblackberry\nbanana\n",
-        );
+        let result = run(&pipeline, b"strawberry\nblueberry\nblackberry\nbanana\n");
         assert_eq!(lines_of(result), vec!["blueberry", "blackberry"]);
     }
 
@@ -1164,8 +1168,7 @@ mod tests {
     fn strip_ansi_progress_bar_keeps_only_last_state() {
         // Cargo-style progress: each \r\x1b[K rewrites the same line;
         // the parsed "logical" line is just the final 100% version.
-        let input =
-            b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
+        let input = b"\rBuilding (10%)\r\x1b[KBuilding (50%)\r\x1b[KBuilding (100%)\nDone\n";
         assert_eq!(strip_ansi(input), b"Building (100%)\nDone\n");
     }
 
@@ -1485,9 +1488,7 @@ mod tests {
     #[test]
     fn from_json_array_of_scalars() {
         let result = FilterSpec::FromJson
-            .apply(PipelineValue::Bytes(Bytes::from(
-                "[1, 2, 3]".to_string(),
-            )))
+            .apply(PipelineValue::Bytes(Bytes::from("[1, 2, 3]".to_string())))
             .unwrap();
         let items = match result {
             PipelineValue::Structured(Value::List(items)) => items,
@@ -1503,7 +1504,10 @@ mod tests {
         let err = FilterSpec::FromJson
             .apply(PipelineValue::Bytes(Bytes::from("not json".to_string())))
             .unwrap_err();
-        assert!(matches!(err, FilterError::ParseError { format: "json", .. }));
+        assert!(matches!(
+            err,
+            FilterError::ParseError { format: "json", .. }
+        ));
     }
 
     #[test]
@@ -1761,10 +1765,7 @@ mod tests {
         let pipeline = vec![
             FilterSpec::FromFields,
             FilterSpec::Rename {
-                pairs: vec![
-                    ("_1".into(), "file".into()),
-                    ("_3".into(), "owner".into()),
-                ],
+                pairs: vec![("_1".into(), "file".into()), ("_3".into(), "owner".into())],
             },
         ];
         let result = run(&pipeline, b"a b c\n");

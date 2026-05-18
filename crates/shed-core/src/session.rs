@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-use crate::shed::{Shed, ShedId, ShedState};
 use crate::capture::Capture;
+use crate::shed::{Shed, ShedId, ShedState};
 
 /// Default total capture-byte budget for an entire [`Session`], in bytes
 /// (256 MiB). When the sum of unpinned captures exceeds this, the
@@ -311,7 +311,10 @@ mod tests {
 
         s.evict_to_fit();
         assert!(s.shed(a).unwrap().capture.is_some(), "pinned never evicts");
-        assert!(s.shed(b).unwrap().capture.is_none(), "oldest unpinned evicts");
+        assert!(
+            s.shed(b).unwrap().capture.is_none(),
+            "oldest unpinned evicts"
+        );
         assert!(s.shed(c).unwrap().capture.is_some());
     }
 
@@ -359,7 +362,10 @@ mod tests {
 
         s.evict_to_fit();
         assert!(s.shed(a).unwrap().capture.is_some(), "touched stays alive");
-        assert!(s.shed(b).unwrap().capture.is_none(), "untouched oldest evicts");
+        assert!(
+            s.shed(b).unwrap().capture.is_none(),
+            "untouched oldest evicts"
+        );
         assert!(s.shed(c).unwrap().capture.is_some());
     }
 }
