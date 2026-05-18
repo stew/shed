@@ -78,8 +78,8 @@ use input::{
     InputOutcome, apply_readline_edit, handle_text_input, input_spans_with_cursor, render_input_bar,
 };
 use render::{
-    cell_string, describe_filter, draw_context_menu, draw_header, filter_error_lines,
-    render_pipeline_value_with_max, render_shed,
+    cell_string, describe_filter, draw_alias_manage, draw_context_menu, draw_env_edit, draw_header,
+    draw_note_edit, filter_error_lines, render_pipeline_value_with_max, render_shed,
 };
 use tabs::{
     TabSlot, begin_rename_tab, draw_tab_bar, drive_all_tabs, handle_rename_tab_input_key,
@@ -92,8 +92,8 @@ type CommandTask = JoinHandle<Result<CaptureOutcome, ExecError>>;
 /// Rebuilt every frame; hit-tested in [`handle_mouse_click`].
 #[derive(Debug, Clone)]
 struct ClickRegion {
-    rect: Rect,
-    action: ClickAction,
+    pub(crate) rect: Rect,
+    pub(crate) action: ClickAction,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,18 +117,18 @@ enum ClickAction {
 /// …) before falling back to line-level options.
 #[derive(Debug, Clone)]
 struct BodyRegion {
-    rect: Rect,
-    shed_id: ShedId,
-    lines: Vec<String>,
-    cells: Vec<CellRegion>,
+    pub(crate) rect: Rect,
+    pub(crate) shed_id: ShedId,
+    pub(crate) lines: Vec<String>,
+    pub(crate) cells: Vec<CellRegion>,
 }
 
 /// Absolute-coordinate hit rect for a single table cell, plus the typed
 /// value the cell renders.
 #[derive(Debug, Clone)]
 struct CellRegion {
-    rect: Rect,
-    value: Value,
+    pub(crate) rect: Rect,
+    pub(crate) value: Value,
 }
 
 /// Pre-translation cell layout produced by the render functions.
@@ -138,10 +138,10 @@ struct CellRegion {
 /// using the body's inner rect.
 #[derive(Debug, Clone)]
 struct CellLayout {
-    line_idx: usize,
-    x_offset: u16,
-    width: u16,
-    value: Value,
+    pub(crate) line_idx: usize,
+    pub(crate) x_offset: u16,
+    pub(crate) width: u16,
+    pub(crate) value: Value,
 }
 
 /// State for the floating context menu opened by right-clicking on a shed
@@ -282,7 +282,7 @@ enum Focus {
 /// the selected row; the alias list itself comes from `App.aliases`.
 #[derive(Debug, Clone, Default)]
 struct AliasManageState {
-    cursor: usize,
+    pub(crate) cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,10 +297,10 @@ enum NotePosition {
 /// notes.
 #[derive(Debug, Clone)]
 struct NoteEditState {
-    shed_id: ShedId,
-    position: NotePosition,
-    buffer: Vec<char>,
-    cursor: usize,
+    pub(crate) shed_id: ShedId,
+    pub(crate) position: NotePosition,
+    pub(crate) buffer: Vec<char>,
+    pub(crate) cursor: usize,
 }
 
 impl NoteEditState {
@@ -322,8 +322,8 @@ impl NoteEditState {
 
 #[derive(Debug, Clone)]
 struct PaletteState {
-    input: String,
-    cursor: usize,
+    pub(crate) input: String,
+    pub(crate) cursor: usize,
 }
 
 impl PaletteState {
@@ -341,10 +341,10 @@ impl PaletteState {
 /// the action — typically by setting focus / state for downstream
 /// handling, since most actions mirror existing keybindings.
 struct Action {
-    name: &'static str,
-    description: &'static str,
-    enabled: fn(&App) -> bool,
-    handler: fn(&mut App),
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) enabled: fn(&App) -> bool,
+    pub(crate) handler: fn(&mut App),
 }
 
 fn always_enabled(_: &App) -> bool {
@@ -657,10 +657,10 @@ enum EnvInputMode {
 
 #[derive(Debug, Clone)]
 struct EnvEditState {
-    cursor: usize,
-    filter: String,
-    input_mode: EnvInputMode,
-    input_buffer: String,
+    pub(crate) cursor: usize,
+    pub(crate) filter: String,
+    pub(crate) input_mode: EnvInputMode,
+    pub(crate) input_buffer: String,
 }
 
 impl EnvEditState {
@@ -675,7 +675,7 @@ impl EnvEditState {
 
     /// Snapshot of `std::env::vars()` sorted by key, optionally filtered
     /// by `self.filter` (case-insensitive substring on the key).
-    fn entries(&self) -> Vec<(String, String)> {
+    pub(super) fn entries(&self) -> Vec<(String, String)> {
         let mut all: Vec<(String, String)> = std::env::vars().collect();
         all.sort_by(|a, b| a.0.cmp(&b.0));
         if self.filter.is_empty() {
@@ -781,7 +781,7 @@ const DELIM_CHOICES: &[(char, &str)] = &[
     ('|', "pipe"),
 ];
 
-pub(super) fn delim_label(c: char) -> &'static str {
+fn delim_label(c: char) -> &'static str {
     DELIM_CHOICES
         .iter()
         .find_map(|(ch, label)| if *ch == c { Some(*label) } else { None })
@@ -891,9 +891,9 @@ fn compare_op_to_where_op(op: CompareOp) -> WhereOp {
 
 #[derive(Debug, Clone)]
 struct WhereClause {
-    column: usize,
-    op: WhereOp,
-    pattern: String,
+    pub(crate) column: usize,
+    pub(crate) op: WhereOp,
+    pub(crate) pattern: String,
 }
 
 impl WhereClause {
@@ -1062,26 +1062,26 @@ enum EditMode {
 }
 
 struct FilterEditState {
-    shed_id: ShedId,
-    kind: FilterKind,
-    where_clauses: Vec<WhereClause>,
-    where_active_clause: usize,
-    where_combine: WhereCombine,
-    n_input: String,
-    column_selections: Vec<bool>,
-    column_cursor: usize,
-    csv_delim: char,
-    csv_has_header: bool,
-    regex_pattern: String,
-    sort_keys: Vec<(usize, SortDirection)>,
-    sort_keys_cursor: usize,
-    rename_to_inputs: Vec<String>,
-    rename_cursor: usize,
-    target_column: usize,
-    delim_text: String,
-    available_columns: Vec<String>,
-    field: FormField,
-    mode: EditMode,
+    pub(crate) shed_id: ShedId,
+    pub(crate) kind: FilterKind,
+    pub(crate) where_clauses: Vec<WhereClause>,
+    pub(crate) where_active_clause: usize,
+    pub(crate) where_combine: WhereCombine,
+    pub(crate) n_input: String,
+    pub(crate) column_selections: Vec<bool>,
+    pub(crate) column_cursor: usize,
+    pub(crate) csv_delim: char,
+    pub(crate) csv_has_header: bool,
+    pub(crate) regex_pattern: String,
+    pub(crate) sort_keys: Vec<(usize, SortDirection)>,
+    pub(crate) sort_keys_cursor: usize,
+    pub(crate) rename_to_inputs: Vec<String>,
+    pub(crate) rename_cursor: usize,
+    pub(crate) target_column: usize,
+    pub(crate) delim_text: String,
+    pub(crate) available_columns: Vec<String>,
+    pub(crate) field: FormField,
+    pub(crate) mode: EditMode,
 }
 
 impl FilterEditState {
@@ -4207,7 +4207,10 @@ fn line_text(line: &Line) -> String {
 /// stay intact). Match positions are byte offsets into the line's
 /// concatenated plain text; regex guarantees they fall on UTF-8 char
 /// boundaries.
-fn highlight_matches_in_line(line: Line<'static>, regex: &regex::Regex) -> Line<'static> {
+fn highlight_matches_in_line(
+    line: Line<'static>,
+    regex: &regex::Regex,
+) -> Line<'static> {
     let plain = line_text(&line);
     let matches: Vec<(usize, usize)> = regex
         .find_iter(&plain)
@@ -5276,97 +5279,6 @@ fn draw(f: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>, bodies: &mut V
     }
 }
 
-fn draw_alias_manage(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let title = format!("aliases  ({} entries)", app.aliases.aliases.len());
-    draw_header(f, chunks[0], &title);
-
-    let body_area = chunks[1];
-    let visible = body_area.height as usize;
-    let total = app.aliases.aliases.len();
-    let cursor = app
-        .alias_manage
-        .as_ref()
-        .map(|s| s.cursor.min(total.saturating_sub(1)))
-        .unwrap_or(0);
-    let scroll_offset = if total > visible && cursor + 1 > visible {
-        cursor + 1 - visible
-    } else {
-        0
-    };
-
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let name_style_unselected = Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if app.aliases.aliases.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no aliases — press A on a shed to save one)",
-            dim,
-        )));
-    } else {
-        for (i, alias) in app
-            .aliases
-            .aliases
-            .iter()
-            .enumerate()
-            .skip(scroll_offset)
-            .take(visible)
-        {
-            let selected = i == cursor;
-            let prefix = if selected { "▸ " } else { "  " };
-            let name_style = if selected {
-                highlight
-            } else {
-                name_style_unselected
-            };
-            let argv_style = if selected {
-                highlight
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let pipeline_summary = if alias.pipeline.is_empty() {
-                String::new()
-            } else {
-                let mut s = String::from(" │ ");
-                for (j, f) in alias.pipeline.iter().enumerate() {
-                    if j > 0 {
-                        s.push_str(" │ ");
-                    }
-                    s.push_str(&describe_filter(f));
-                }
-                s
-            };
-            let argv_str = alias.argv.join(" ");
-            lines.push(Line::from(vec![
-                Span::raw(prefix),
-                Span::styled(alias.name.clone(), name_style),
-                Span::raw("  "),
-                Span::styled(argv_str, argv_style),
-                Span::styled(pipeline_summary, dim),
-            ]));
-        }
-    }
-    let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(widget, body_area);
-
-    draw_status(f, chunks[2], app);
-}
-
 fn open_alias_manage(app: &mut App) {
     app.alias_manage = Some(AliasManageState::default());
     app.focus = Focus::AliasManage;
@@ -5517,82 +5429,6 @@ fn spawn_alias(app: &mut App, alias: &Alias) {
     app.cmd_edit_input = format!("{joined} ");
     app.cmd_edit_cursor = app.cmd_edit_input.len();
     app.cmd_edit_input_mode = true;
-}
-
-fn draw_note_edit(f: &mut Frame, app: &App) {
-    let Some(state) = app.note_edit.as_ref() else {
-        return;
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let title = match state.position {
-        NotePosition::Pre => format!("note before %{}", state.shed_id.0),
-        NotePosition::Post => format!("note after %{}", state.shed_id.0),
-    };
-    draw_header(f, chunks[0], &title);
-
-    // Render buffer with an inline cursor marker. Walk the chars and
-    // emit lines split on '\n'; the cursor sits between two characters
-    // (or at start / end) and shows as a colored "▏".
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let cursor_span = Span::styled(
-        "▏",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    let mut current_line_text = String::new();
-    let mut cursor_emitted = false;
-
-    let push_line = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
-        let mut prefixed = vec![Span::styled("▎ ", Style::default().fg(Color::DarkGray))];
-        prefixed.extend(spans);
-        lines.push(Line::from(prefixed));
-    };
-
-    for (i, &c) in state.buffer.iter().enumerate() {
-        if i == state.cursor && !cursor_emitted {
-            if !current_line_text.is_empty() {
-                current.push(Span::raw(current_line_text.clone()));
-                current_line_text.clear();
-            }
-            current.push(cursor_span.clone());
-            cursor_emitted = true;
-        }
-        if c == '\n' {
-            if !current_line_text.is_empty() {
-                current.push(Span::raw(current_line_text.clone()));
-                current_line_text.clear();
-            }
-            push_line(&mut lines, std::mem::take(&mut current));
-        } else {
-            current_line_text.push(c);
-        }
-    }
-    if !cursor_emitted && state.cursor == state.buffer.len() {
-        if !current_line_text.is_empty() {
-            current.push(Span::raw(current_line_text.clone()));
-            current_line_text.clear();
-        }
-        current.push(cursor_span.clone());
-    } else if !current_line_text.is_empty() {
-        current.push(Span::raw(current_line_text.clone()));
-    }
-    push_line(&mut lines, current);
-
-    let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(widget, chunks[1]);
-
-    draw_status(f, chunks[2], app);
 }
 
 /// Return the index of the menu item under (col, row), or `None` if the
@@ -5776,122 +5612,6 @@ fn draw_palette(f: &mut Frame, app: &App) {
     f.render_widget(list_widget, body_area);
 
     draw_status(f, chunks[3], app);
-}
-
-fn draw_env_edit(f: &mut Frame, app: &App) {
-    let Some(state) = app.env_edit.as_ref() else {
-        return;
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
-    let entries = state.entries();
-    let total = entries.len();
-    let title = if state.filter.is_empty() {
-        format!("env  ({total} vars)")
-    } else {
-        format!("env  ({total} vars · filter \"{}\")", state.filter)
-    };
-    draw_header(f, chunks[0], &title);
-
-    // Body: scrollable list with cursor following
-    let body_area = chunks[1];
-    let visible = body_area.height as usize;
-    let cursor = state.cursor.min(total.saturating_sub(1));
-    let scroll_offset = if cursor >= visible {
-        cursor + 1 - visible
-    } else {
-        0
-    };
-
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let key_style = Style::default().fg(Color::LightCyan);
-    let val_style = Style::default().fg(Color::Gray);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, (k, v)) in entries.iter().enumerate().skip(scroll_offset).take(visible) {
-        let selected = i == cursor;
-        let prefix = if selected { "▸ " } else { "  " };
-        let mut spans = vec![
-            Span::styled(prefix, if selected { highlight } else { dim }),
-            Span::styled(k.clone(), if selected { highlight } else { key_style }),
-            Span::styled(" = ", dim),
-            Span::styled(v.clone(), if selected { highlight } else { val_style }),
-        ];
-        if selected {
-            spans.insert(0, Span::raw(""));
-        }
-        lines.push(Line::from(spans));
-    }
-    if total == 0 {
-        lines.push(Line::from(Span::styled(
-            "  (no matching vars)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, body_area);
-
-    // Status bar / input prompt
-    match &state.input_mode {
-        EnvInputMode::Filter => {
-            let widget = Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    "/",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(state.filter.clone()),
-                Span::styled("▏", Style::default().fg(Color::Yellow)),
-            ]))
-            .style(Style::default().bg(Color::DarkGray));
-            f.render_widget(widget, chunks[2]);
-        }
-        EnvInputMode::Edit(key) => {
-            let widget = Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    format!("edit {key}: "),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(state.input_buffer.clone()),
-                Span::styled("▏", Style::default().fg(Color::Yellow)),
-            ]))
-            .style(Style::default().bg(Color::DarkGray));
-            f.render_widget(widget, chunks[2]);
-        }
-        EnvInputMode::Add => {
-            let widget = Paragraph::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    "add KEY=VALUE: ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(state.input_buffer.clone()),
-                Span::styled("▏", Style::default().fg(Color::Yellow)),
-            ]))
-            .style(Style::default().bg(Color::DarkGray));
-            f.render_widget(widget, chunks[2]);
-        }
-        EnvInputMode::None => draw_status(f, chunks[2], app),
-    }
 }
 
 fn draw_shed_expand(f: &mut Frame, app: &App) {
@@ -6389,7 +6109,7 @@ fn draw_one_shed(
 /// Apply a pipeline of filters. Returns the final value plus per-filter
 /// drop counts (rows silently filtered by a `where` due to type mismatch),
 /// indexed by filter position in the pipeline.
-pub(super) fn apply_pipeline(
+fn apply_pipeline(
     capture: &Capture,
     pipeline: &[FilterSpec],
 ) -> Result<(PipelineValue, Vec<usize>), String> {

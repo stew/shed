@@ -16,16 +16,18 @@
 //! subsequent commits.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph};
+use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use shed_core::{
     CompareOp, FilterSpec, PipelineValue, Predicate, Shed, ShedState, SortDirection, Value,
 };
 
 use super::PREVIEW_LINES;
-use super::{App, CellLayout, ansi, apply_pipeline, delim_label};
+use super::{
+    App, CellLayout, EnvInputMode, NotePosition, ansi, apply_pipeline, delim_label, draw_status,
+};
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
@@ -674,6 +676,284 @@ pub(super) fn draw_context_menu(f: &mut Frame, app: &App) {
         .collect();
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
+}
+
+pub(super) fn draw_alias_manage(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let title = format!("aliases  ({} entries)", app.aliases.aliases.len());
+    draw_header(f, chunks[0], &title);
+
+    let body_area = chunks[1];
+    let visible = body_area.height as usize;
+    let total = app.aliases.aliases.len();
+    let cursor = app
+        .alias_manage
+        .as_ref()
+        .map(|s| s.cursor.min(total.saturating_sub(1)))
+        .unwrap_or(0);
+    let scroll_offset = if total > visible && cursor + 1 > visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let name_style_unselected = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.aliases.aliases.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no aliases — press A on a shed to save one)",
+            dim,
+        )));
+    } else {
+        for (i, alias) in app
+            .aliases
+            .aliases
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible)
+        {
+            let selected = i == cursor;
+            let prefix = if selected { "▸ " } else { "  " };
+            let name_style = if selected {
+                highlight
+            } else {
+                name_style_unselected
+            };
+            let argv_style = if selected {
+                highlight
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let pipeline_summary = if alias.pipeline.is_empty() {
+                String::new()
+            } else {
+                let mut s = String::from(" │ ");
+                for (j, f) in alias.pipeline.iter().enumerate() {
+                    if j > 0 {
+                        s.push_str(" │ ");
+                    }
+                    s.push_str(&describe_filter(f));
+                }
+                s
+            };
+            let argv_str = alias.argv.join(" ");
+            lines.push(Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(alias.name.clone(), name_style),
+                Span::raw("  "),
+                Span::styled(argv_str, argv_style),
+                Span::styled(pipeline_summary, dim),
+            ]));
+        }
+    }
+    let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(widget, body_area);
+
+    draw_status(f, chunks[2], app);
+}
+
+pub(super) fn draw_note_edit(f: &mut Frame, app: &App) {
+    let Some(state) = app.note_edit.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let title = match state.position {
+        NotePosition::Pre => format!("note before %{}", state.shed_id.0),
+        NotePosition::Post => format!("note after %{}", state.shed_id.0),
+    };
+    draw_header(f, chunks[0], &title);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let cursor_span = Span::styled(
+        "▏",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut current_line_text = String::new();
+    let mut cursor_emitted = false;
+
+    let push_line = |lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
+        let mut prefixed = vec![Span::styled("▎ ", Style::default().fg(Color::DarkGray))];
+        prefixed.extend(spans);
+        lines.push(Line::from(prefixed));
+    };
+
+    for (i, &c) in state.buffer.iter().enumerate() {
+        if i == state.cursor && !cursor_emitted {
+            if !current_line_text.is_empty() {
+                current.push(Span::raw(current_line_text.clone()));
+                current_line_text.clear();
+            }
+            current.push(cursor_span.clone());
+            cursor_emitted = true;
+        }
+        if c == '\n' {
+            if !current_line_text.is_empty() {
+                current.push(Span::raw(current_line_text.clone()));
+                current_line_text.clear();
+            }
+            push_line(&mut lines, std::mem::take(&mut current));
+        } else {
+            current_line_text.push(c);
+        }
+    }
+    if !cursor_emitted && state.cursor == state.buffer.len() {
+        if !current_line_text.is_empty() {
+            current.push(Span::raw(current_line_text.clone()));
+            current_line_text.clear();
+        }
+        current.push(cursor_span.clone());
+    } else if !current_line_text.is_empty() {
+        current.push(Span::raw(current_line_text.clone()));
+    }
+    push_line(&mut lines, current);
+
+    let widget = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(widget, chunks[1]);
+
+    draw_status(f, chunks[2], app);
+}
+
+pub(super) fn draw_env_edit(f: &mut Frame, app: &App) {
+    let Some(state) = app.env_edit.as_ref() else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    let entries = state.entries();
+    let total = entries.len();
+    let title = if state.filter.is_empty() {
+        format!("env  ({total} vars)")
+    } else {
+        format!("env  ({total} vars · filter \"{}\")", state.filter)
+    };
+    draw_header(f, chunks[0], &title);
+
+    let body_area = chunks[1];
+    let visible = body_area.height as usize;
+    let cursor = state.cursor.min(total.saturating_sub(1));
+    let scroll_offset = if cursor >= visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::LightCyan);
+    let val_style = Style::default().fg(Color::Gray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, (k, v)) in entries.iter().enumerate().skip(scroll_offset).take(visible) {
+        let selected = i == cursor;
+        let prefix = if selected { "▸ " } else { "  " };
+        let mut spans = vec![
+            Span::styled(prefix, if selected { highlight } else { dim }),
+            Span::styled(k.clone(), if selected { highlight } else { key_style }),
+            Span::styled(" = ", dim),
+            Span::styled(v.clone(), if selected { highlight } else { val_style }),
+        ];
+        if selected {
+            spans.insert(0, Span::raw(""));
+        }
+        lines.push(Line::from(spans));
+    }
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "  (no matching vars)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, body_area);
+
+    match &state.input_mode {
+        EnvInputMode::Filter => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.filter.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::Edit(key) => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    format!("edit {key}: "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.input_buffer.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::Add => {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "add KEY=VALUE: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(state.input_buffer.clone()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, chunks[2]);
+        }
+        EnvInputMode::None => draw_status(f, chunks[2], app),
+    }
 }
 
 #[cfg(test)]
