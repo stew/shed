@@ -26,10 +26,10 @@ use shed_core::{
 
 use super::PREVIEW_LINES;
 use super::{
-    App, BodyRegion, CellLayout, CellRegion, ClickAction, ClickRegion, EnvInputMode, Focus,
-    NotePosition, ansi, apply_pipeline, delim_label, draw_status, find_matches_regex,
-    highlight_matches_in_line, input_spans_with_cursor, line_plain_text, matches_for_input,
-    tabs::draw_tab_bar, try_compile,
+    App, BodyRegion, CellLayout, CellRegion, ClickAction, ClickRegion, EnvInputMode, ExitPrompt,
+    Focus, FormField, NotePosition, ansi, apply_pipeline, delim_label, filter_edit_field_hints,
+    find_matches_regex, highlight_matches_in_line, input_spans_with_cursor, line_plain_text,
+    matches_for_input, render_input_bar, tabs::draw_tab_bar, try_compile,
 };
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
@@ -1455,6 +1455,302 @@ fn draw_one_shed(
             action: ClickAction::DeleteBlock(shed.id),
         });
     }
+}
+
+pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(prompt) = app.exit_prompt {
+        if prompt == ExitPrompt::Confirm {
+            let widget = Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "unsaved changes — save before quitting?",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[y]es",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[n]o",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[c]ancel",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .style(Style::default().bg(Color::DarkGray));
+            f.render_widget(widget, area);
+            return;
+        }
+        // AwaitingPath falls through; the save_input_mode bar takes over.
+    }
+    if app.save_input_mode {
+        f.render_widget(
+            render_input_bar("save to: ", Color::Green, &app.save_input, app.save_cursor),
+            area,
+        );
+        return;
+    }
+    if app.open_input_mode {
+        f.render_widget(
+            render_input_bar("open: ", Color::Green, &app.open_input, app.open_cursor),
+            area,
+        );
+        return;
+    }
+    if app.rerun_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "rerun: ",
+                Color::LightCyan,
+                &app.rerun_input,
+                app.rerun_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if app.cmd_edit_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "edit cmd: ",
+                Color::LightMagenta,
+                &app.cmd_edit_input,
+                app.cmd_edit_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if app.rename_tab_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "tab name: ",
+                Color::Cyan,
+                &app.rename_tab_input,
+                app.rename_tab_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if let Some(pending) = &app.alias_overwrite {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("alias `{}` exists — overwrite?", pending.name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[y]es",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[n]o",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
+    if app.alias_name_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "alias name: ",
+                Color::LightMagenta,
+                &app.alias_name_input,
+                app.alias_name_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if app.pin_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "pin name: ",
+                Color::LightMagenta,
+                &app.pin_input,
+                app.pin_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if app.write_input_mode {
+        f.render_widget(
+            render_input_bar(
+                "write to: ",
+                Color::Yellow,
+                &app.write_input,
+                app.write_cursor,
+            ),
+            area,
+        );
+        return;
+    }
+    if app.search_input_mode {
+        let invalid = !app.search_input.is_empty()
+            && try_compile(&app.search_input, app.search_case_insensitive).is_none();
+        let prefix = if app.search_input_backward { "?" } else { "/" };
+        let mut spans = vec![
+            Span::raw(" ".to_string()),
+            Span::styled(
+                prefix.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        spans.extend(input_spans_with_cursor(
+            &app.search_input,
+            app.search_cursor,
+            Color::Yellow,
+        ));
+        if app.search_case_insensitive {
+            spans.push(Span::styled("  (i)", Style::default().fg(Color::DarkGray)));
+        }
+        if invalid {
+            spans.push(Span::styled(
+                "  (invalid regex)",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
+    if let Some(msg) = &app.flash {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(msg.clone(), Style::default().fg(Color::Yellow)),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
+    let hints: Vec<(&str, &str)> = match app.focus {
+        Focus::Prompt => vec![
+            ("Enter", "run"),
+            ("↑↓", "history"),
+            ("!cmd", "fullscreen"),
+            ("@name | %N", "snapshot"),
+            ("/aliases", "manage"),
+            ("Ctrl-A/E/U/K/W", "line edit"),
+            ("Ctrl-P", "palette"),
+            ("Ctrl-S/O", "save/open"),
+            ("Ctrl-Z/Y", "undo/redo"),
+            ("Esc", "focus shed"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::ShedCursor => vec![
+            ("↑↓", "sheds"),
+            ("e", "edit"),
+            ("v", "view"),
+            ("Space", "run"),
+            ("x", "delete"),
+            ("w", "write"),
+            ("p/u", "pin/unpin"),
+            ("r", "rerun"),
+            ("A", "save alias"),
+            ("n/N", "pre/post note"),
+            ("/", "prompt"),
+            ("Ctrl-S/O", "save/open"),
+            ("Ctrl-Z/Y", "undo/redo"),
+            ("Ctrl-C", "cancel"),
+            ("Esc", "prompt"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::EditShed if app.command_focused => {
+            vec![("↓", "filters"), ("f / Enter", "edit cmd"), ("Esc", "back")]
+        }
+        Focus::EditShed => vec![
+            ("↑↓", "cmd / filters"),
+            ("f / Enter", "edit"),
+            ("i", "insert"),
+            ("d", "drop"),
+            ("<>", "reorder"),
+            ("Esc", "back"),
+        ],
+        Focus::FilterEdit => {
+            let field = app
+                .filter_edit
+                .as_ref()
+                .map(|s| s.field)
+                .unwrap_or(FormField::Kind);
+            filter_edit_field_hints(field)
+        }
+        Focus::ShedExpand => vec![
+            ("↑↓ / jk", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("g/G", "top/bot"),
+            ("/?", "search f/b"),
+            ("n/N", "next/prev"),
+            ("i", "case"),
+            ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::EnvEdit => vec![
+            ("↑↓", "nav"),
+            ("/", "filter"),
+            ("e/Enter", "edit"),
+            ("a", "add"),
+            ("d", "delete"),
+            ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::Palette => vec![
+            ("↑↓", "navigate"),
+            ("Enter", "run"),
+            ("Esc", "cancel"),
+            ("Ctrl-D", "quit"),
+        ],
+        Focus::NoteEdit => vec![
+            ("type", "edit"),
+            ("Enter", "newline"),
+            ("←→ ↑↓", "move"),
+            ("Home/End", "line ends"),
+            ("Backspace", "delete"),
+            ("Ctrl-S", "save"),
+            ("Esc / Ctrl-C", "cancel"),
+        ],
+        Focus::AliasManage => vec![
+            ("↑↓", "navigate"),
+            ("x / d", "delete"),
+            ("Esc / q", "back"),
+            ("Ctrl-D", "quit"),
+        ],
+    };
+    let mut spans = Vec::new();
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+        spans.push(Span::raw(format!(" {label}")));
+    }
+    let widget = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
+    f.render_widget(widget, area);
 }
 
 #[cfg(test)]
