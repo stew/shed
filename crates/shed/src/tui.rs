@@ -197,6 +197,12 @@ pub(crate) enum InputKind {
     /// (or inserts) it. Paired with [`App::output_edit_idx`] to
     /// distinguish insert vs replace.
     OutputSpec,
+    /// Alias-invoke bar shown when the prompt resolves to a saved alias.
+    /// Pre-filled with the alias's argv so the user can append args
+    /// before committing; the shed isn't created until commit. Paired
+    /// with [`App::pending_alias`] which carries the alias's pipeline.
+    /// Cancel discards everything — no shed is materialised.
+    AliasInvoke,
 }
 
 /// The single-line input bar's typed state. Lives on `App` as
@@ -232,11 +238,13 @@ struct HandoverRequest {
     reuse_shed: Option<ShedId>,
 }
 
-/// Re-run a command with an edited argv but inherit the original
-/// shed's pipeline. Created in ShedCursor by `r`; consumed at the
-/// top of app_loop so we can spawn from an async context.
+/// A pending request to materialise a fresh shed (argv + optional
+/// pipeline) and start running it. Created by the rerun bar (`r` on a
+/// shed) and the alias-invoke bar (single-token alias at the prompt);
+/// consumed at the top of `app_loop` so we can spawn from an async
+/// context.
 #[derive(Debug, Clone)]
-struct RerunRequest {
+struct SpawnRequest {
     argv: Vec<String>,
     pipeline: Vec<FilterSpec>,
     force_fullscreen: bool,
@@ -1628,7 +1636,13 @@ struct App {
     /// context. See [`cycle_completion`].
     pub(crate) completion: Option<CompletionState>,
     pub(crate) rerun_source_id: Option<ShedId>,
-    pub(crate) pending_rerun: Option<RerunRequest>,
+    pub(crate) pending_spawn: Option<SpawnRequest>,
+    /// Pipeline carried by an alias-invoke in flight (i.e., the
+    /// `InputKind::AliasInvoke` bar is open). The argv lives in the bar
+    /// text; on commit a shed is created with `argv + pipeline` and
+    /// run. `None` outside an alias-invoke. See [`spawn_alias`] /
+    /// [`commit_alias_invoke`].
+    pub(crate) pending_alias_pipeline: Option<Vec<FilterSpec>>,
     /// True when the ShedCursor's "filter cursor" has been pulled left
     /// past the first filter onto the command itself. Visually highlights
     /// the argv span; Enter opens the in-place command editor.
@@ -1765,7 +1779,8 @@ impl App {
             history_cursor: None,
             completion: None,
             rerun_source_id: None,
-            pending_rerun: None,
+            pending_spawn: None,
+            pending_alias_pipeline: None,
             command_focused: false,
             last_cwd: None,
             env_edit: None,
@@ -1980,8 +1995,8 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
         if let Some(req) = app.pending_handover.take() {
             perform_handover(terminal, &mut app, req).await?;
         }
-        if let Some(req) = app.pending_rerun.take() {
-            perform_rerun(&mut app, req).await;
+        if let Some(req) = app.pending_spawn.take() {
+            perform_spawn(&mut app, req).await;
         }
         if app.chain_in_flight.is_none()
             && let Some(next) = app.pending_run_chain.pop_front()
@@ -2018,7 +2033,7 @@ async fn app_loop(terminal: &mut DefaultTerminal, notebook: Option<PathBuf>) -> 
     }
 }
 
-async fn perform_rerun(app: &mut App, req: RerunRequest) {
+async fn perform_spawn(app: &mut App, req: SpawnRequest) {
     if req.force_fullscreen || needs_fullscreen(&req.argv) {
         app.pending_handover = Some(HandoverRequest {
             argv: req.argv,
@@ -3707,6 +3722,26 @@ fn line_plain_text(line: &Line<'_>) -> String {
 }
 
 async fn handle_prompt_key(app: &mut App, key: KeyEvent) {
+    // The alias-invoke bar lives over the prompt: a single-token alias
+    // typed at the prompt opens this bar pre-filled with the alias's
+    // argv, and the bar's commit materialises the shed (see
+    // `commit_alias_invoke`). Cancel here discards the pending pipeline
+    // — no shed is created.
+    if app.is_input(InputKind::AliasInvoke) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
+            InputOutcome::Commit => commit_alias_invoke(app),
+            InputOutcome::Cancel => {
+                app.close_input();
+                app.pending_alias_pipeline = None;
+            }
+            InputOutcome::Continue => {}
+        }
+        return;
+    }
     let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
     if !is_tab {
         app.completion = None;
@@ -4146,7 +4181,7 @@ fn commit_rerun(app: &mut App) {
         .and_then(|id| app.session.shed(id))
         .map(|b| b.pipeline.clone())
         .unwrap_or_default();
-    app.pending_rerun = Some(RerunRequest {
+    app.pending_spawn = Some(SpawnRequest {
         argv,
         pipeline,
         force_fullscreen,
@@ -5933,21 +5968,44 @@ fn confirm_alias_overwrite(app: &mut App, accept: bool) {
 
 /// Materialise an alias as a fresh Idle shed and drop the user into
 /// in-place command edit so they can append args before running.
+/// Resolve a single-token prompt that matches an alias by opening the
+/// alias-invoke input bar pre-filled with the alias's argv (plus a
+/// trailing space, so the user can append args without backspacing).
+/// The shed itself is *not* created here — [`commit_alias_invoke`] does
+/// that on Enter. Cancel discards everything: no shed materialises.
 fn spawn_alias(app: &mut App, alias: &Alias) {
-    app.savepoint();
-    let id = app.session.add_shed(alias.argv.clone());
-    if let Some(shed) = app.session.shed_mut(id) {
-        shed.pipeline = alias.pipeline.clone();
-    }
-    app.session.set_state(id, ShedState::Idle);
-    app.session.set_cursor(Some(id));
-    app.reset_pipeline_cursor();
-    app.command_focused = true;
-    app.focus = Focus::ShedCursor;
-
     let joined = shlex::try_join(alias.argv.iter().map(String::as_str))
         .unwrap_or_else(|_| alias.argv.join(" "));
-    app.open_input(InputKind::CmdEdit, format!("{joined} "));
+    app.pending_alias_pipeline = Some(alias.pipeline.clone());
+    app.focus = Focus::Prompt;
+    app.open_input(InputKind::AliasInvoke, format!("{joined} "));
+}
+
+/// Commit the alias-invoke bar: shlex-split the argv, take the stashed
+/// pipeline, materialise a shed, and queue it to run.
+fn commit_alias_invoke(app: &mut App) {
+    let input = app.take_input_text();
+    let pipeline = app.pending_alias_pipeline.take().unwrap_or_default();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        app.flash = Some("command required".into());
+        return;
+    }
+    let Some(argv) = shlex::split(trimmed) else {
+        app.flash = Some("unmatched quote".into());
+        // Restore the stash so a retry doesn't lose the pipeline.
+        app.pending_alias_pipeline = Some(pipeline);
+        app.open_input(InputKind::AliasInvoke, input);
+        return;
+    };
+    if argv.is_empty() {
+        return;
+    }
+    app.pending_spawn = Some(SpawnRequest {
+        argv,
+        pipeline,
+        force_fullscreen: false,
+    });
 }
 
 /// Return the index of the menu item under (col, row), or `None` if the
@@ -7955,7 +8013,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_alias_creates_idle_shed_and_opens_cmd_edit() {
+    fn spawn_alias_opens_alias_invoke_bar_without_creating_a_shed() {
         let mut app = App::new();
         app.history.clear();
         app.aliases_path = None;
@@ -7964,17 +8022,62 @@ mod tests {
             argv: vec!["ls".into(), "-lat".into()],
             pipeline: vec![FilterSpec::FromFields],
         };
+        let before = app.session.sheds().count();
         spawn_alias(&mut app, &alias);
-        let id = app.session.cursor().expect("cursor set");
-        let shed = app.session.shed(id).unwrap();
-        assert_eq!(shed.argv, vec!["ls", "-lat"]);
-        assert_eq!(shed.pipeline.len(), 1);
-        assert!(matches!(shed.state, ShedState::Idle));
-        assert!(app.command_focused);
-        assert!(app.is_input(InputKind::CmdEdit));
-        // Pre-fill ends with a trailing space for easy arg appending.
+        // No shed materialised yet — bar is the only visible thing.
+        assert_eq!(app.session.sheds().count(), before);
+        assert!(app.session.cursor().is_none());
+        assert!(app.is_input(InputKind::AliasInvoke));
+        // Pipeline stashed for the commit.
+        assert_eq!(app.pending_alias_pipeline.as_ref().unwrap().len(), 1);
+        // Pre-fill is `ls -lat ` (trailing space for easy appending).
         assert!(app.input_text().ends_with(' '));
         assert!(app.input_text().starts_with("ls"));
+    }
+
+    #[test]
+    fn commit_alias_invoke_queues_a_spawn_with_argv_and_pipeline() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        let alias = Alias {
+            name: "list".into(),
+            argv: vec!["ls".into()],
+            pipeline: vec![FilterSpec::FromFields],
+        };
+        spawn_alias(&mut app, &alias);
+        // User appends an arg.
+        {
+            let (t, _) = app.input_mut().unwrap();
+            *t = "ls -lah".into();
+        }
+        commit_alias_invoke(&mut app);
+        let req = app.pending_spawn.take().expect("spawn queued");
+        assert_eq!(req.argv, vec!["ls", "-lah"]);
+        assert_eq!(req.pipeline.len(), 1);
+        // Stash drained.
+        assert!(app.pending_alias_pipeline.is_none());
+    }
+
+    #[test]
+    fn alias_invoke_cancel_clears_pending_pipeline() {
+        let mut app = App::new();
+        app.history.clear();
+        app.aliases_path = None;
+        let alias = Alias {
+            name: "list".into(),
+            argv: vec!["ls".into()],
+            pipeline: vec![FilterSpec::FromFields],
+        };
+        spawn_alias(&mut app, &alias);
+        assert!(app.pending_alias_pipeline.is_some());
+        // Simulate Esc: close the bar + clear the stash (matches the
+        // Cancel branch in handle_prompt_key).
+        app.close_input();
+        app.pending_alias_pipeline = None;
+        assert!(!app.is_input(InputKind::AliasInvoke));
+        assert!(app.pending_alias_pipeline.is_none());
+        assert_eq!(app.session.sheds().count(), 0);
     }
 
     #[test]

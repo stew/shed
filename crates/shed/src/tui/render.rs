@@ -1589,6 +1589,18 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    if app.is_input(InputKind::AliasInvoke) {
+        f.render_widget(
+            render_input_bar(
+                "alias: ",
+                Color::LightMagenta,
+                app.input_text(),
+                app.input_cursor(),
+            ),
+            area,
+        );
+        return;
+    }
     if app.is_input(InputKind::RenameTab) {
         f.render_widget(
             render_input_bar(

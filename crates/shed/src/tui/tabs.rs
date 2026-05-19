@@ -26,7 +26,7 @@ use shed_core::{Session, ShedId};
 
 use super::input::handle_text_input;
 use super::{
-    App, ClickAction, ClickRegion, Focus, HandoverRequest, InputKind, RerunRequest, RunningCommand,
+    App, ClickAction, ClickRegion, Focus, HandoverRequest, InputKind, RunningCommand, SpawnRequest,
     collapse_home_in_path, drain_streams, pinned_entries_json, reap_completed,
 };
 
@@ -48,7 +48,7 @@ pub(super) struct StashedTab {
     pub(super) pending_run_chain: VecDeque<ShedId>,
     pub(super) chain_in_flight: Option<ShedId>,
     pub(super) pending_handover: Option<HandoverRequest>,
-    pub(super) pending_rerun: Option<RerunRequest>,
+    pub(super) pending_spawn: Option<SpawnRequest>,
     /// JSON-serialised snapshot of the *pinned* sheds at the last save
     /// or load. Compared against the current pinned-shed JSON to decide
     /// whether the exit prompt should fire — unpinned-shed edits are
@@ -117,7 +117,7 @@ impl App {
             pending_run_chain: std::mem::take(&mut self.pending_run_chain),
             chain_in_flight: self.chain_in_flight.take(),
             pending_handover: self.pending_handover.take(),
-            pending_rerun: self.pending_rerun.take(),
+            pending_spawn: self.pending_spawn.take(),
             saved_pinned_json: std::mem::take(&mut self.saved_pinned_json),
         }
     }
@@ -136,7 +136,7 @@ impl App {
         self.pending_run_chain = t.pending_run_chain;
         self.chain_in_flight = t.chain_in_flight;
         self.pending_handover = t.pending_handover;
-        self.pending_rerun = t.pending_rerun;
+        self.pending_spawn = t.pending_spawn;
         self.saved_pinned_json = t.saved_pinned_json;
     }
 
@@ -158,7 +158,7 @@ impl App {
             pending_run_chain: VecDeque::new(),
             chain_in_flight: None,
             pending_handover: None,
-            pending_rerun: None,
+            pending_spawn: None,
             saved_pinned_json: baseline,
         }
     }
@@ -170,6 +170,7 @@ impl App {
         self.completion = None;
         self.input_bar = None;
         self.rerun_source_id = None;
+        self.pending_alias_pipeline = None;
         self.command_focused = false;
         self.env_edit = None;
         self.note_edit = None;
