@@ -448,52 +448,57 @@ pub(super) fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App, regions: &mut V
     };
 
     let buf = f.buffer_mut();
-    let mut x = area.x;
-    for (i, slot) in app.tabs.iter().enumerate() {
-        if x >= tab_limit {
-            break;
+    // With a single tab there's nothing to navigate to, so the tab chips
+    // and the `+` affordance are just noise — skip both, leaving the cwd
+    // on its own row. Users can still open a new tab from the palette.
+    if app.tabs.len() >= 2 {
+        let mut x = area.x;
+        for (i, slot) in app.tabs.iter().enumerate() {
+            if x >= tab_limit {
+                break;
+            }
+            let label = format!(" {} {} ", i + 1, slot.display_title(i));
+            let style = if i == app.active_tab {
+                active_style
+            } else if slot.has_unread() {
+                unread_style
+            } else {
+                normal_style
+            };
+            let label_width = label.chars().count() as u16;
+            let drawn_width = label_width.min(tab_limit.saturating_sub(x));
+            if drawn_width == 0 {
+                break;
+            }
+            buf.set_string(x, area.y, &label, style);
+            regions.push(ClickRegion {
+                rect: Rect {
+                    x,
+                    y: area.y,
+                    width: drawn_width,
+                    height: 1,
+                },
+                action: ClickAction::SwitchTab(i),
+            });
+            x = x.saturating_add(drawn_width);
+            if x < tab_limit {
+                buf.set_string(x, area.y, "│", normal_style);
+                x = x.saturating_add(1);
+            }
         }
-        let label = format!(" {} {} ", i + 1, slot.display_title(i));
-        let style = if i == app.active_tab {
-            active_style
-        } else if slot.has_unread() {
-            unread_style
-        } else {
-            normal_style
-        };
-        let label_width = label.chars().count() as u16;
-        let drawn_width = label_width.min(tab_limit.saturating_sub(x));
-        if drawn_width == 0 {
-            break;
+        // `+` new-tab affordance.
+        if x.saturating_add(3) <= tab_limit {
+            buf.set_string(x, area.y, " + ", plus_style);
+            regions.push(ClickRegion {
+                rect: Rect {
+                    x,
+                    y: area.y,
+                    width: 3,
+                    height: 1,
+                },
+                action: ClickAction::NewTab,
+            });
         }
-        buf.set_string(x, area.y, &label, style);
-        regions.push(ClickRegion {
-            rect: Rect {
-                x,
-                y: area.y,
-                width: drawn_width,
-                height: 1,
-            },
-            action: ClickAction::SwitchTab(i),
-        });
-        x = x.saturating_add(drawn_width);
-        if x < tab_limit {
-            buf.set_string(x, area.y, "│", normal_style);
-            x = x.saturating_add(1);
-        }
-    }
-    // `+` new-tab affordance.
-    if x.saturating_add(3) <= tab_limit {
-        buf.set_string(x, area.y, " + ", plus_style);
-        regions.push(ClickRegion {
-            rect: Rect {
-                x,
-                y: area.y,
-                width: 3,
-                height: 1,
-            },
-            action: ClickAction::NewTab,
-        });
     }
     // cwd, right-justified.
     if cwd_width <= area.width {
