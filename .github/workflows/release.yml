@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+# softprops/action-gh-release needs write access to create the release
+# and upload artifacts via the workflow's GITHUB_TOKEN.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build · ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive_suffix: linux-aarch64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive_suffix: macos-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-tools provides musl-gcc for the native arch on each runner
+      # (x86_64-linux-musl-gcc on ubuntu-latest, aarch64- on the arm runner).
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin shed
+
+      - name: Package
+        run: |
+          tar czf shed-${{ github.ref_name }}-${{ matrix.archive_suffix }}.tar.gz \
+            -C target/${{ matrix.target }}/release shed
+
+      - name: Upload release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: shed-${{ github.ref_name }}-${{ matrix.archive_suffix }}.tar.gz
+          draft: false
+          fail_on_unmatched_files: true
