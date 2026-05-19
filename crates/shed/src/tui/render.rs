@@ -340,6 +340,7 @@ pub(super) fn render_shed(
     editing: bool,
     pipeline_cursor: Option<usize>,
     command_focused: bool,
+    output_cursor: Option<usize>,
     cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -423,6 +424,50 @@ pub(super) fn render_shed(
                 Span::styled(" + add ", style),
             ]));
         }
+
+        // Outputs section — visible whenever editing, even if empty
+        // (the `+ add output` slot is the discoverability hook). The
+        // cursor moves into this section when output_cursor is Some.
+        let outputs_heading = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD);
+        lines.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled("outputs:", outputs_heading),
+        ]));
+        let value_dim = Style::default().fg(Color::Green);
+        for (i, (name, spec)) in shed.outputs.iter().enumerate() {
+            let style = if output_cursor == Some(i) {
+                highlight
+            } else {
+                Style::default().fg(Color::LightCyan)
+            };
+            let spec_str = match spec {
+                shed_core::OutputSpec::TempPath => "TempPath".to_string(),
+                shed_core::OutputSpec::Literal(v) => format!("\"{v}\""),
+            };
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled("│ ", dim),
+                Span::styled(format!(" {name} = {spec_str} "), style),
+            ];
+            if let Some(value) = shed.output_values.get(name)
+                && !matches!(spec, shed_core::OutputSpec::Literal(_))
+            {
+                spans.push(Span::styled(format!("  → {value}"), value_dim));
+            }
+            lines.push(Line::from(spans));
+        }
+        let add_style = if output_cursor == Some(shed.outputs.len()) {
+            highlight
+        } else {
+            dim
+        };
+        lines.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled("│ ", dim),
+            Span::styled(" + add output ", add_style),
+        ]));
     }
 
     // Running sheds tail their preview: the most recent rows are
@@ -1187,12 +1232,17 @@ fn draw_sheds(
     for shed in &sheds {
         let selected = cursor_visible && cursor_id == Some(shed.id);
         let editing = selected && app.focus == Focus::EditShed;
-        let pipeline_cursor = if editing {
+        // When the cursor is on argv (command_focused) or in the outputs
+        // section (output_cursor is Some), the pipeline cursor should
+        // render as None so no filter wears the active-magenta highlight.
+        let on_outputs = app.output_cursor.is_some();
+        let pipeline_cursor = if editing && !on_outputs {
             Some(app.pipeline_cursor)
         } else {
             None
         };
         let command_focused = editing && app.command_focused;
+        let output_cursor = if editing { app.output_cursor } else { None };
         let mut shed_cells: Vec<CellLayout> = Vec::new();
         let lines = render_shed(
             shed,
@@ -1200,6 +1250,7 @@ fn draw_sheds(
             editing,
             pipeline_cursor,
             command_focused,
+            output_cursor,
             &mut shed_cells,
         );
         renders.push((lines, selected, editing, shed_cells));
@@ -1542,6 +1593,18 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(
             render_input_bar(
                 "tab name: ",
+                Color::Cyan,
+                app.input_text(),
+                app.input_cursor(),
+            ),
+            area,
+        );
+        return;
+    }
+    if app.is_input(InputKind::OutputSpec) {
+        f.render_widget(
+            render_input_bar(
+                "output (name=TempPath or name=value): ",
                 Color::Cyan,
                 app.input_text(),
                 app.input_cursor(),

@@ -290,9 +290,21 @@ regenerates its `TempPath` outputs; downstream sheds running after
 will pick up the new values.
 
 Notebooks persist output **declarations** (the `outputs:` map); the
-**values** are runtime state, recomputed each spawn. Today, declaring
-outputs is a notebook-edit task — the in-app UI for adding outputs is
-planned but not yet present.
+**values** are runtime state, recomputed each spawn.
+
+In **EditShed** (`e` on a shed), an `outputs:` section appears below the
+filters with one row per declared output plus a `+ add output` slot.
+Use `↓` to walk down from the filters into the outputs section, then:
+
+| Key | Action |
+|-----|--------|
+| `i` | open the input bar to add a new output |
+| `f` / `Enter` | edit the output under the cursor (or `+ add` for a new one) |
+| `d` / `x` | drop the output under the cursor |
+
+The input bar takes `name=TempPath` for a generated temp file path, or
+`name=value` for a literal string. The "Add output" command-palette
+entry jumps straight here from anywhere.
 
 ### Shed notes (pre / post text)
 
@@ -609,12 +621,12 @@ returns to ShedCursor for those.
 
 | Key       | Action |
 |-----------|--------|
-| `↑↓`      | navigate vertically through the command, each filter, and the `+ add` slot. `↑` at the first filter steps onto the command (highlighted in magenta); `↓` from the command returns to the filter list. `←→` are aliases for muscle memory. |
-| `f` / Enter | edit the active slot — opens the filter form for a filter, or the in-place command editor when the command is focused. Committing a command edit re-runs the shed; if the shed is pinned, every shed whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
+| `↑↓`      | navigate vertically through the command, each filter, the `+ add filter` slot, each output row, and the `+ add output` slot. `↑` at the first filter steps onto the command (highlighted in magenta); `↓` from the command returns to the filter list. `←→` are aliases for muscle memory. |
+| `f` / Enter | edit the active slot — opens the filter form for a filter, the in-place command editor when the command is focused, or the `name=spec` input bar when an output is focused. Committing a command edit re-runs the shed; if the shed is pinned, every shed whose argv is `@<name>` (and theirs, recursively) is queued to re-run too. |
 | Tab / Shift-Tab | (in-place command editor only) cycle through completions for the token at the end of the line (see Tab completion). |
-| `i`       | insert a new filter before the cursor's filter (or add at end if on the `+ add` slot) |
+| `i`       | insert: a new filter before the cursor's filter when on a filter row, or a new output when on an output row (both fall through to "add" when on the `+ add` slot) |
 | `<` / `>` | reorder: swap the cursor's filter with its left / right neighbor |
-| `d`       | drop the filter at cursor (or last if on add slot) |
+| `d` / `x` | drop the filter or output at the cursor |
 | Esc       | back to ShedCursor |
 
 ### FilterEdit

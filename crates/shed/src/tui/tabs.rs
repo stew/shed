@@ -177,6 +177,7 @@ impl App {
         self.palette_prev_focus = None;
         self.filter_edit = None;
         self.pipeline_cursor = 0;
+        self.output_cursor = None;
         self.expand_scroll = 0;
         self.search_query.clear();
         self.search_anchor_scroll = 0;

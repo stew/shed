@@ -189,6 +189,14 @@ pub(crate) enum InputKind {
     Search,
     /// Rename-tab bar (F2).
     RenameTab,
+    /// Output declaration bar opened from EditShed's outputs section
+    /// (`f`/`Enter` to edit, `i` to add). Input format:
+    /// `name=TempPath` or `name=literal-value`; empty input cancels.
+    /// When editing an existing entry, the field is pre-filled with
+    /// the current declaration; on commit the parsed entry replaces
+    /// (or inserts) it. Paired with [`App::output_edit_idx`] to
+    /// distinguish insert vs replace.
+    OutputSpec,
 }
 
 /// The single-line input bar's typed state. Lives on `App` as
@@ -485,6 +493,15 @@ const ACTIONS: &[Action] = &[
         handler: |app| {
             app.focus = Focus::EditShed;
             drop_filter_at_cursor(app);
+        },
+    },
+    Action {
+        name: "Add output",
+        description: "Declare a named output for ${...} interpolation by downstream sheds",
+        enabled: shed_selected,
+        handler: |app| {
+            enter_edit_shed(app);
+            open_output_insert(app);
         },
     },
     Action {
@@ -1624,6 +1641,16 @@ struct App {
     pub(crate) focus: Focus,
     pub(crate) filter_edit: Option<FilterEditState>,
     pub(crate) pipeline_cursor: usize,
+    /// EditShed cursor when it's on the outputs section. `None` means the
+    /// cursor is up in the argv/filter section (use `command_focused` +
+    /// `pipeline_cursor` then). `Some(i)` means it's on output row `i`, where
+    /// `i == outputs.len()` is the `+ add output` slot.
+    pub(crate) output_cursor: Option<usize>,
+    /// When the `OutputSpec` input bar is open, remembers which slot
+    /// the commit should land in: `None` = insert new, `Some(i)` =
+    /// replace the existing output at index `i`. Set by
+    /// `open_output_edit` / `open_output_insert`.
+    pub(crate) output_edit_idx: Option<usize>,
     pub(crate) expand_scroll: usize,
     pub(crate) search_query: String,
     pub(crate) search_anchor_scroll: usize,
@@ -1748,6 +1775,8 @@ impl App {
             focus: Focus::Prompt,
             filter_edit: None,
             pipeline_cursor: 0,
+            output_cursor: None,
+            output_edit_idx: None,
             expand_scroll: 0,
             search_query: String::new(),
             search_anchor_scroll: 0,
@@ -1900,6 +1929,13 @@ impl App {
             .cursor()
             .and_then(|id| self.session.shed(id))
             .map(|b| b.pipeline.len())
+    }
+
+    fn cursor_shed_outputs_len(&self) -> Option<usize> {
+        self.session
+            .cursor()
+            .and_then(|id| self.session.shed(id))
+            .map(|b| b.outputs.len())
     }
 }
 
@@ -4007,6 +4043,21 @@ fn enter_edit_shed(app: &mut App) {
 /// (run, delete, pin, etc.) live one focus up in ShedCursor. Esc returns
 /// to ShedCursor.
 fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
+    if app.is_input(InputKind::OutputSpec) {
+        let outcome = {
+            let (t, c) = app.input_mut().expect("input bar open");
+            handle_text_input(t, c, &key)
+        };
+        match outcome {
+            InputOutcome::Commit => commit_output_edit(app),
+            InputOutcome::Cancel => {
+                app.close_input();
+                app.output_edit_idx = None;
+            }
+            InputOutcome::Continue => {}
+        }
+        return;
+    }
     if app.is_input(InputKind::CmdEdit) {
         let is_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
         if !is_tab {
@@ -4040,6 +4091,7 @@ fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.focus = Focus::ShedCursor;
             app.command_focused = false;
+            app.output_cursor = None;
         }
         // Filters render vertically, so ↑↓ does the navigation that
         // ←→ used to. ←→ are kept as aliases for muscle memory.
@@ -4048,11 +4100,22 @@ fn handle_edit_shed_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') | KeyCode::Enter => {
             if app.command_focused {
                 open_cmd_edit(app);
+            } else if app.output_cursor.is_some() {
+                open_output_edit(app);
             } else {
                 open_filter_edit(app);
             }
         }
-        KeyCode::Char('i') => open_filter_insert(app),
+        KeyCode::Char('i') => {
+            if app.output_cursor.is_some() {
+                open_output_insert(app);
+            } else {
+                open_filter_insert(app);
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('x') if app.output_cursor.is_some() => {
+            drop_output_at_cursor(app);
+        }
         KeyCode::Char('d') => drop_filter_at_cursor(app),
         KeyCode::Char('<') => move_filter_in_pipeline(app, -1),
         KeyCode::Char('>') => move_filter_in_pipeline(app, 1),
@@ -4565,11 +4628,12 @@ fn highlight_matches_in_line(line: Line<'static>, regex: &regex::Regex) -> Line<
 }
 
 fn move_filter_cursor(app: &mut App, delta: i32) {
-    let Some(len) = app.cursor_shed_pipeline_len() else {
+    let Some(pipe_len) = app.cursor_shed_pipeline_len() else {
         return;
     };
-    // Pulling left at filter index 0 jumps onto the command itself; the
-    // command sits one virtual slot to the left of the first filter.
+    let out_len = app.cursor_shed_outputs_len().unwrap_or(0);
+
+    // Argv slot — ↓ drops into filter[0], ↑ no-op (top).
     if app.command_focused {
         if delta > 0 {
             app.command_focused = false;
@@ -4577,11 +4641,32 @@ fn move_filter_cursor(app: &mut App, delta: i32) {
         }
         return;
     }
+
+    // Outputs section — walk through outputs[0..=out_len]. ↑ above
+    // outputs[0] climbs back into the filters' `+ add` slot.
+    if let Some(out_cursor) = app.output_cursor {
+        let new = out_cursor as i32 + delta;
+        if new < 0 {
+            app.output_cursor = None;
+            app.pipeline_cursor = pipe_len;
+            return;
+        }
+        let new = (new as usize).min(out_len);
+        app.output_cursor = Some(new);
+        return;
+    }
+
+    // In filter section: ↑ at filter[0] jumps to argv; ↓ past `+ add`
+    // drops into outputs[0] (or +add output if empty).
     if delta < 0 && app.pipeline_cursor == 0 {
         app.command_focused = true;
         return;
     }
-    let max = len as i32;
+    if delta > 0 && app.pipeline_cursor == pipe_len {
+        app.output_cursor = Some(0);
+        return;
+    }
+    let max = pipe_len as i32;
     let new = (app.pipeline_cursor as i32 + delta).clamp(0, max) as usize;
     app.pipeline_cursor = new;
 }
@@ -5032,6 +5117,165 @@ fn drop_filter_at_cursor(app: &mut App) {
     if app.pipeline_cursor > new_len {
         app.pipeline_cursor = new_len;
     }
+}
+
+/// Open the output-spec input bar to *edit* the output at the
+/// EditShed output cursor. The bar pre-fills with `name=spec` so the
+/// user can tweak any part. If the cursor is on the `+ add output`
+/// slot, falls through to [`open_output_insert`].
+fn open_output_edit(app: &mut App) {
+    let Some(out_cursor) = app.output_cursor else {
+        return;
+    };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let Some(shed) = app.session.shed(id) else {
+        return;
+    };
+    if out_cursor >= shed.outputs.len() {
+        open_output_insert(app);
+        return;
+    }
+    let (name, spec) = shed.outputs.get_index(out_cursor).expect("bounds checked");
+    let initial = format!("{name}={}", spec_to_input(spec));
+    app.output_edit_idx = Some(out_cursor);
+    app.open_input(InputKind::OutputSpec, initial);
+}
+
+/// Open the output-spec input bar to *add* a new output. The bar
+/// starts empty with a placeholder.
+fn open_output_insert(app: &mut App) {
+    if app.session.cursor().is_none() {
+        return;
+    }
+    app.output_edit_idx = None;
+    app.open_input(InputKind::OutputSpec, String::new());
+}
+
+/// Drop the output at the EditShed output cursor.
+fn drop_output_at_cursor(app: &mut App) {
+    let Some(out_cursor) = app.output_cursor else {
+        return;
+    };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let dropped_name = {
+        let Some(shed) = app.session.shed(id) else {
+            return;
+        };
+        if out_cursor >= shed.outputs.len() {
+            app.flash = Some("nothing to drop here".into());
+            return;
+        }
+        shed.outputs
+            .get_index(out_cursor)
+            .map(|(k, _)| k.clone())
+            .expect("bounds checked")
+    };
+    app.savepoint();
+    if let Some(shed) = app.session.shed_mut(id) {
+        shed.outputs.shift_remove(&dropped_name);
+        shed.output_values.remove(&dropped_name);
+    }
+    let new_len = app.session.shed(id).map(|b| b.outputs.len()).unwrap_or(0);
+    if let Some(cur) = app.output_cursor.as_mut()
+        && *cur > new_len
+    {
+        *cur = new_len;
+    }
+    app.flash = Some(format!("dropped output `{dropped_name}`"));
+}
+
+/// Render an [`OutputSpec`] back into the `name=value` input-bar form.
+fn spec_to_input(spec: &OutputSpec) -> String {
+    match spec {
+        OutputSpec::TempPath => "TempPath".to_string(),
+        OutputSpec::Literal(v) => v.clone(),
+    }
+}
+
+/// Parse an `OutputSpec` input bar — `name=TempPath` or
+/// `name=literal-value` — into a `(name, OutputSpec)` pair, or an
+/// error describing what's malformed.
+fn parse_output_spec_input(raw: &str) -> Result<(String, OutputSpec), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected `name=TempPath` or `name=value`".to_string())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("output name required".into());
+    }
+    if !is_valid_ident(&name) {
+        return Err(format!(
+            "invalid output name `{name}` — letters/digits/underscore only"
+        ));
+    }
+    let value = value.trim();
+    let spec = if value == "TempPath" {
+        OutputSpec::TempPath
+    } else {
+        OutputSpec::Literal(value.to_string())
+    };
+    Ok((name, spec))
+}
+
+fn commit_output_edit(app: &mut App) {
+    let raw = app.take_input_text();
+    let edit_idx = app.output_edit_idx.take();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        // Empty commit cancels — nothing changes.
+        return;
+    }
+    let (name, spec) = match parse_output_spec_input(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            app.flash = Some(e);
+            return;
+        }
+    };
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    app.savepoint();
+    let (final_len, new_idx) = if let Some(shed) = app.session.shed_mut(id) {
+        match edit_idx {
+            // Replace at index — preserve the slot's position by
+            // re-inserting under the (possibly renamed) key.
+            Some(idx) if idx < shed.outputs.len() => {
+                let old_name = shed.outputs.get_index(idx).map(|(k, _)| k.clone()).unwrap();
+                if old_name != name {
+                    shed.outputs.shift_remove(&old_name);
+                    shed.output_values.remove(&old_name);
+                    shed.outputs.insert(name.clone(), spec);
+                    // Move new entry into the old slot's position.
+                    let last = shed.outputs.len() - 1;
+                    if last != idx {
+                        shed.outputs.move_index(last, idx);
+                    }
+                } else {
+                    shed.outputs.insert(name.clone(), spec);
+                }
+                (shed.outputs.len(), idx)
+            }
+            // Insert new — append at end, drop a stale runtime value
+            // in case the name already existed.
+            _ => {
+                shed.output_values.remove(&name);
+                shed.outputs.insert(name.clone(), spec);
+                let idx = shed.outputs.get_index_of(&name).unwrap_or(0);
+                (shed.outputs.len(), idx)
+            }
+        }
+    } else {
+        (0, 0)
+    };
+    let _ = final_len;
+    // Keep the cursor on the row the user just touched.
+    app.output_cursor = Some(new_idx);
+    app.flash = Some(format!("output `{name}` saved"));
 }
 
 async fn spawn_prompt(app: &mut App) {
@@ -8734,5 +8978,217 @@ mod tests {
         // Closed one tab, didn't quit.
         assert!(!app.quit);
         assert_eq!(app.tabs.len(), 2);
+    }
+
+    // === outputs UI ===
+
+    #[test]
+    fn parse_output_spec_input_accepts_temppath_and_literal() {
+        let (name, spec) = parse_output_spec_input("plan=TempPath").unwrap();
+        assert_eq!(name, "plan");
+        assert!(matches!(spec, OutputSpec::TempPath));
+
+        let (name, spec) = parse_output_spec_input("region=us-west-2").unwrap();
+        assert_eq!(name, "region");
+        assert!(matches!(spec, OutputSpec::Literal(v) if v == "us-west-2"));
+
+        // Whitespace around the name and value is trimmed.
+        let (name, spec) = parse_output_spec_input("  foo  =  bar  ").unwrap();
+        assert_eq!(name, "foo");
+        assert!(matches!(spec, OutputSpec::Literal(v) if v == "bar"));
+    }
+
+    #[test]
+    fn parse_output_spec_input_rejects_malformed() {
+        assert!(parse_output_spec_input("noequalshere").is_err());
+        assert!(parse_output_spec_input("=value").is_err());
+        assert!(
+            parse_output_spec_input("1bad=value").is_err(),
+            "leading digit"
+        );
+        assert!(parse_output_spec_input("has space=value").is_err());
+    }
+
+    #[test]
+    fn spec_to_input_round_trips_through_parse() {
+        for spec in [
+            OutputSpec::TempPath,
+            OutputSpec::Literal("hello".into()),
+            OutputSpec::Literal("".into()),
+        ] {
+            let raw = format!("x={}", spec_to_input(&spec));
+            let (name, parsed) = parse_output_spec_input(&raw).unwrap();
+            assert_eq!(name, "x");
+            // Variants must round-trip.
+            match (&spec, &parsed) {
+                (OutputSpec::TempPath, OutputSpec::TempPath) => {}
+                (OutputSpec::Literal(a), OutputSpec::Literal(b)) => assert_eq!(a, b),
+                _ => panic!("variant changed: {spec:?} -> {parsed:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn commit_output_edit_inserts_new_output() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        app.focus = Focus::EditShed;
+        open_output_insert(&mut app);
+        assert!(app.is_input(InputKind::OutputSpec));
+        // Type the spec and commit.
+        {
+            let (t, _) = app.input_mut().unwrap();
+            *t = "plan=TempPath".into();
+        }
+        commit_output_edit(&mut app);
+
+        let shed = app.session.shed(id).unwrap();
+        assert_eq!(shed.outputs.len(), 1);
+        let (name, spec) = shed.outputs.get_index(0).unwrap();
+        assert_eq!(name, "plan");
+        assert!(matches!(spec, OutputSpec::TempPath));
+        assert_eq!(app.output_cursor, Some(0));
+    }
+
+    #[test]
+    fn commit_output_edit_updates_existing_in_place() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        if let Some(b) = app.session.shed_mut(id) {
+            b.outputs
+                .insert("a".into(), OutputSpec::Literal("x".into()));
+            b.outputs.insert("b".into(), OutputSpec::TempPath);
+            b.outputs
+                .insert("c".into(), OutputSpec::Literal("z".into()));
+        }
+        app.focus = Focus::EditShed;
+        app.output_cursor = Some(1);
+        open_output_edit(&mut app);
+        // The bar should be pre-populated with `b=TempPath`.
+        assert_eq!(app.input_text(), "b=TempPath");
+        {
+            let (t, _) = app.input_mut().unwrap();
+            *t = "b=newval".into();
+        }
+        commit_output_edit(&mut app);
+
+        let shed = app.session.shed(id).unwrap();
+        // Position preserved.
+        let keys: Vec<_> = shed.outputs.keys().cloned().collect();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+        let updated = shed.outputs.get_index(1).unwrap();
+        assert!(matches!(updated.1, OutputSpec::Literal(v) if v == "newval"));
+    }
+
+    #[test]
+    fn commit_output_edit_renames_preserves_position() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        if let Some(b) = app.session.shed_mut(id) {
+            b.outputs.insert("a".into(), OutputSpec::TempPath);
+            b.outputs.insert("b".into(), OutputSpec::TempPath);
+            b.outputs.insert("c".into(), OutputSpec::TempPath);
+        }
+        app.focus = Focus::EditShed;
+        app.output_cursor = Some(1);
+        open_output_edit(&mut app);
+        {
+            let (t, _) = app.input_mut().unwrap();
+            *t = "bb=TempPath".into();
+        }
+        commit_output_edit(&mut app);
+
+        let shed = app.session.shed(id).unwrap();
+        let keys: Vec<_> = shed.outputs.keys().cloned().collect();
+        // Old "b" replaced by "bb" in the same slot.
+        assert_eq!(keys, vec!["a", "bb", "c"]);
+    }
+
+    #[test]
+    fn drop_output_at_cursor_removes_entry() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        if let Some(b) = app.session.shed_mut(id) {
+            b.outputs.insert("a".into(), OutputSpec::TempPath);
+            b.outputs.insert("b".into(), OutputSpec::TempPath);
+            b.output_values.insert("a".into(), "/tmp/a".into());
+        }
+        app.focus = Focus::EditShed;
+        app.output_cursor = Some(0);
+        drop_output_at_cursor(&mut app);
+
+        let shed = app.session.shed(id).unwrap();
+        let keys: Vec<_> = shed.outputs.keys().cloned().collect();
+        assert_eq!(keys, vec!["b"]);
+        // Runtime value cleared too.
+        assert!(!shed.output_values.contains_key("a"));
+    }
+
+    #[test]
+    fn move_filter_cursor_walks_into_outputs_section() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        if let Some(b) = app.session.shed_mut(id) {
+            b.pipeline.push(FilterSpec::FromLines);
+            b.outputs.insert("plan".into(), OutputSpec::TempPath);
+        }
+        // Start on filter[0] = FromLines.
+        app.pipeline_cursor = 0;
+        app.command_focused = false;
+        app.output_cursor = None;
+
+        // ↓ to +add filter (past last filter), then ↓ again into outputs[0].
+        move_filter_cursor(&mut app, 1);
+        assert_eq!(app.pipeline_cursor, 1);
+        assert!(app.output_cursor.is_none());
+
+        move_filter_cursor(&mut app, 1);
+        assert_eq!(app.output_cursor, Some(0));
+
+        // ↓ to +add output (past last output).
+        move_filter_cursor(&mut app, 1);
+        assert_eq!(app.output_cursor, Some(1));
+
+        // ↑ back through the outputs section, then climb to filter +add.
+        move_filter_cursor(&mut app, -1);
+        assert_eq!(app.output_cursor, Some(0));
+        move_filter_cursor(&mut app, -1);
+        assert!(app.output_cursor.is_none());
+        assert_eq!(app.pipeline_cursor, 1);
+    }
+
+    #[test]
+    fn outputs_round_trip_through_notebook() {
+        use shed_core::Notebook;
+        let mut s = Session::new();
+        let id = s.add_shed(vec!["tofu".into(), "plan".into(), "${plan}".into()]);
+        if let Some(b) = s.shed_mut(id) {
+            b.outputs.insert("plan".into(), OutputSpec::TempPath);
+            b.outputs
+                .insert("region".into(), OutputSpec::Literal("us-west-2".into()));
+        }
+        let nb = Notebook::from_session(&s);
+        let json = serde_json::to_string(&nb).unwrap();
+        let nb2: Notebook = serde_json::from_str(&json).unwrap();
+        let mut s2 = Session::new();
+        nb2.apply_to_session(&mut s2);
+        let shed = s2.sheds().next().unwrap();
+        assert_eq!(shed.outputs.len(), 2);
+        let (n0, sp0) = shed.outputs.get_index(0).unwrap();
+        assert_eq!(n0, "plan");
+        assert!(matches!(sp0, OutputSpec::TempPath));
+        let (n1, sp1) = shed.outputs.get_index(1).unwrap();
+        assert_eq!(n1, "region");
+        assert!(matches!(sp1, OutputSpec::Literal(v) if v == "us-west-2"));
     }
 }
