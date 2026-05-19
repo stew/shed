@@ -94,7 +94,10 @@ impl TabSlot {
         {
             return name.to_string();
         }
-        format!("tab {}", index + 1)
+        // No user-set title and no notebook: surface the Alt-N shortcut
+        // instead of generic "tab N" filler, so the chip itself teaches
+        // the keybind.
+        format!("(Alt-{})", index + 1)
     }
 
     pub(super) fn has_unread(&self) -> bool {
@@ -614,7 +617,7 @@ mod tests {
     fn display_title_falls_back_to_default_when_unset() {
         let mut app = App::new();
         app.history.clear();
-        assert_eq!(app.tabs[0].display_title(0), "tab 1");
+        assert_eq!(app.tabs[0].display_title(0), "(Alt-1)");
         app.rename_active_tab("greppy".into());
         assert_eq!(app.tabs[0].display_title(0), "greppy");
     }
