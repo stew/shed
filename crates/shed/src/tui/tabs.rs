@@ -190,6 +190,7 @@ impl App {
         self.alias_overwrite = None;
         self.alias_manage = None;
         self.exit_prompt = None;
+        self.delete_confirm = None;
         self.context_menu = None;
     }
 

@@ -1732,6 +1732,10 @@ struct App {
     /// "Save before quitting?" exit prompt. Showing while non-None;
     /// keys map to y / n / c (cancel).
     pub(crate) exit_prompt: Option<ExitPrompt>,
+    /// Shed pending a "still running — delete anyway?" confirmation.
+    /// Set when a delete is requested on a shed with a live child;
+    /// resolved by y (delete) / n / Esc (cancel).
+    pub(crate) delete_confirm: Option<ShedId>,
     /// Clickable screen regions registered by the last draw pass.
     /// Rebuilt every frame; hit-tested when a mouse click arrives.
     pub(crate) click_regions: Vec<ClickRegion>,
@@ -1825,6 +1829,7 @@ impl App {
             redo_stack: Vec::new(),
             input_bar: None,
             exit_prompt: None,
+            delete_confirm: None,
             click_regions: Vec::new(),
             body_regions: Vec::new(),
             context_menu: None,
@@ -2744,6 +2749,21 @@ fn delete_shed_at_cursor(app: &mut App) {
         app.flash = Some("no shed selected".into());
         return;
     };
+    request_delete_shed(app, id);
+}
+
+/// Entry point for a user-initiated delete (`x` key, `[×]` click). A
+/// shed with a live child process gets a confirmation prompt first —
+/// deleting it kills the process, which is easy to do by accident.
+/// Idle / finished sheds are removed straight away.
+fn request_delete_shed(app: &mut App, id: ShedId) {
+    if app.session.shed(id).is_none() {
+        return;
+    }
+    if app.running.contains_key(&id) {
+        app.delete_confirm = Some(id);
+        return;
+    }
     delete_shed(app, id);
 }
 
@@ -3039,6 +3059,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
     // Exit confirmation takes priority over everything: y / n / c (cancel).
     if app.exit_prompt.is_some() {
         handle_exit_prompt_key(app, key);
+        return;
+    }
+    // "Delete a running shed?" confirmation, likewise modal.
+    if app.delete_confirm.is_some() {
+        handle_delete_confirm_key(app, key);
         return;
     }
     // Notebook save/open input bars are overlaid on top of any focus.
@@ -3405,6 +3430,25 @@ fn handle_exit_prompt_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Resolve the "delete a still-running shed?" confirmation: `y` kills
+/// the child and removes the shed, `n` / `Esc` keeps it.
+fn handle_delete_confirm_key(app: &mut App, key: KeyEvent) {
+    let Some(id) = app.delete_confirm else {
+        return;
+    };
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.delete_confirm = None;
+            delete_shed(app, id);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.delete_confirm = None;
+            app.flash = Some(format!("kept %{}", id.0));
+        }
+        _ => {}
+    }
+}
+
 fn open_palette(app: &mut App) {
     if app.focus == Focus::Palette {
         return;
@@ -3511,6 +3555,11 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
         }
         return;
     }
+    // The delete-confirmation prompt is modal: swallow mouse input so a
+    // stray click can't trigger another delete behind it.
+    if app.delete_confirm.is_some() {
+        return;
+    }
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             // Shift-Left-Click OR Ctrl-Left-Click is a shortcut for "Add
@@ -3537,7 +3586,7 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
             };
             app.flash = None;
             match action {
-                ClickAction::DeleteBlock(id) => delete_shed(app, id),
+                ClickAction::DeleteBlock(id) => request_delete_shed(app, id),
                 ClickAction::SwitchTab(idx) => app.switch_to_tab(idx),
                 ClickAction::NewTab => {
                     app.new_tab();
@@ -9573,5 +9622,87 @@ mod tests {
         assert!(app.body_scroll_for(b) > 0, "wheel scrolled the body up");
         // Shed `a` was never touched.
         assert_eq!(app.body_scroll_for(a), 0);
+    }
+
+    // === delete confirmation for running sheds ===
+
+    #[test]
+    fn request_delete_on_idle_shed_skips_confirmation() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["echo".into()]);
+        app.session.set_cursor(Some(id));
+        request_delete_shed(&mut app, id);
+        // No live child — removed straight away, no prompt raised.
+        assert!(app.delete_confirm.is_none());
+        assert!(app.session.shed(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn request_delete_on_running_shed_asks_first() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["sleep".into(), "30".into()]);
+        app.session.set_state(id, ShedState::Running);
+        let (handle, killer, chunks) =
+            crate::exec::spawn_command(vec!["sleep".into(), "30".into()], 1024)
+                .await
+                .unwrap();
+        app.running.insert(
+            id,
+            RunningCommand {
+                handle,
+                killer,
+                chunks,
+                stream_buf: BytesMut::new(),
+            },
+        );
+
+        request_delete_shed(&mut app, id);
+        // Held back behind a confirmation — shed still present.
+        assert_eq!(app.delete_confirm, Some(id));
+        assert!(app.session.shed(id).is_some());
+
+        // `y` goes through: child killed, shed removed.
+        handle_delete_confirm_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(app.delete_confirm.is_none());
+        assert!(app.session.shed(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_n_keeps_the_running_shed() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["sleep".into(), "30".into()]);
+        app.session.set_state(id, ShedState::Running);
+        let (handle, killer, chunks) =
+            crate::exec::spawn_command(vec!["sleep".into(), "30".into()], 1024)
+                .await
+                .unwrap();
+        app.running.insert(
+            id,
+            RunningCommand {
+                handle,
+                killer,
+                chunks,
+                stream_buf: BytesMut::new(),
+            },
+        );
+
+        request_delete_shed(&mut app, id);
+        assert_eq!(app.delete_confirm, Some(id));
+
+        // `n` dismisses the prompt and leaves the shed running.
+        handle_delete_confirm_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(app.delete_confirm.is_none());
+        assert!(app.session.shed(id).is_some());
+        assert!(app.running.contains_key(&id));
+        // App::drop kills the lingering child when `app` falls out of scope.
     }
 }

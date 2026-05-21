@@ -126,9 +126,10 @@ Pin a shed with `p` from ShedCursor — it renders with `◉ <name>`
 next to its command. `u` unpins.
 
 Each shed's top-right border carries a clickable `[×]` button — left
-click on it to delete that shed (kills the running command first if
-it's still in flight). Same effect as pressing `x` with the shed
-selected, and equally undoable via `Ctrl-Z`. Mouse capture is enabled
+click on it to delete that shed. Same effect as pressing `x` with the
+shed selected, and equally undoable via `Ctrl-Z`. Deleting a shed
+whose command is still running asks for confirmation first (`y` to
+delete and kill the child, `n` to keep it). Mouse capture is enabled
 automatically and toggled off during fullscreen handover so the child
 program owns the terminal.
 
@@ -613,7 +614,7 @@ for typing (focus shifts to Prompt, rendered in green).
 | `/`       | jump to the scratch (Prompt) with `/` typed for slash commands like `/aliases`. |
 | Enter     | on the scratch box, activate the prompt for typing. |
 | Space     | run the selected shed in place (re-spawns its argv, replaces the capture). On the scratch box, activate the prompt. For `@name` snapshot sheds this re-snapshots from the source. |
-| `x`       | delete the selected shed from the session (kills it if running). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
+| `x`       | delete the selected shed from the session. If its command is still running, a `y`/`n` confirmation is shown first (deleting kills the child). Cursor advances to the next sibling, or returns to the prompt if the session becomes empty. |
 | `w`       | write the shed's filtered output to a file path you type. The output format is inferred from the path extension: `.csv` → comma-separated, `.tsv` → tab-separated, `.json` → pretty JSON, anything else → plain text. |
 | `p`       | pin the selected shed under a name (input bar pre-fills with the existing name if any). Pinned sheds render their box title as `@name` and never evict on capture-budget pressure. Empty name unpins. |
 | `u`       | unpin the selected shed (clear its name) |

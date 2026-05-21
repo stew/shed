@@ -1616,6 +1616,32 @@ pub(super) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(widget, area);
         return;
     }
+    if let Some(id) = app.delete_confirm {
+        let widget = Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("%{} is still running — delete anyway?", id.0),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[y]es",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                "[n]o",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .style(Style::default().bg(Color::DarkGray));
+        f.render_widget(widget, area);
+        return;
+    }
     // AwaitingPath falls through; the save_input_mode bar takes over.
     if app.is_input(InputKind::Save) {
         f.render_widget(
