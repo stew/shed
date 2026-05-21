@@ -183,6 +183,7 @@ impl App {
         self.pipeline_cursor = 0;
         self.output_cursor = None;
         self.expand_scroll = 0;
+        self.cursor_body_scroll = None;
         self.search_query.clear();
         self.search_anchor_scroll = 0;
         self.search_input_backward = false;

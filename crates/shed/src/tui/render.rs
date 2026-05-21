@@ -63,14 +63,6 @@ pub(super) fn render_raw_lines(bytes: &bytes::Bytes, max: usize, tail: bool) -> 
     out
 }
 
-pub(super) fn render_pipeline_value(
-    value: PipelineValue,
-    tail: bool,
-    cells: &mut Vec<CellLayout>,
-) -> Vec<Line<'static>> {
-    render_pipeline_value_with_max(value, PREVIEW_LINES, tail, cells)
-}
-
 pub(super) fn render_pipeline_value_with_max(
     value: PipelineValue,
     max: usize,
@@ -334,6 +326,7 @@ pub(super) fn render_note_lines(text: &str) -> Vec<Line<'static>> {
 /// optional post-text note. `cells` accumulates per-cell layout entries
 /// for right-click hit-testing — caller passes a fresh
 /// `Vec<CellLayout>` per shed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_shed(
     shed: &Shed,
     selected: bool,
@@ -341,6 +334,7 @@ pub(super) fn render_shed(
     pipeline_cursor: Option<usize>,
     command_focused: bool,
     output_cursor: Option<usize>,
+    output_cap: usize,
     cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -470,19 +464,22 @@ pub(super) fn render_shed(
         ]));
     }
 
-    // Running sheds tail their preview: the most recent rows are
-    // visible at the bottom, with "N more" pinned at the top. Finished
-    // sheds keep the existing head behaviour.
-    let tail = matches!(shed.state, ShedState::Running);
+    // Output is always tailed: when it overflows `output_cap`, the
+    // oldest lines drop off the top and a "N more" marker is pinned
+    // there. The selected shed passes a huge `output_cap` so its whole
+    // output is rendered (then windowed + scrolled by the caller);
+    // unselected sheds pass PREVIEW_LINES for a compact tail preview.
     match pipeline_outcome {
         Some(Ok((value, _))) => {
-            // render_pipeline_value's cells track line_idx relative to its
-            // own output (which is `render_table`'s line vector). Offset by
-            // the number of lines already in this shed body so cells end
-            // up in body-relative coordinates.
+            // render_pipeline_value_with_max's cells track line_idx
+            // relative to its own output (`render_table`'s line vector).
+            // Offset by the number of lines already in this shed body so
+            // cells end up in body-relative coordinates.
             let body_offset = lines.len();
             let before = cells.len();
-            lines.extend(render_pipeline_value(value, tail, cells));
+            lines.extend(render_pipeline_value_with_max(
+                value, output_cap, true, cells,
+            ));
             for cell in &mut cells[before..] {
                 cell.line_idx += body_offset;
             }
@@ -1226,11 +1223,21 @@ fn draw_sheds(
     let cursor_visible = matches!(app.focus, Focus::ShedCursor | Focus::EditShed);
     let sheds: Vec<&shed_core::Shed> = app.session.sheds().collect();
 
-    // Render each shed's interior content + record selection state.
+    let scratch_height: u16 = 3;
+    let avail = area.height.saturating_sub(scratch_height);
+
+    // Render each shed's interior content + record selection state. The
+    // selected shed renders its *whole* output (output_cap = MAX) so its
+    // box can expand to fill the pane and the body becomes scrollable;
+    // unselected sheds get a compact PREVIEW_LINES tail.
     let mut renders: Vec<(Vec<Line<'static>>, bool, bool, Vec<CellLayout>)> =
         Vec::with_capacity(sheds.len());
-    for shed in &sheds {
+    let mut sel_idx: Option<usize> = None;
+    for (idx, shed) in sheds.iter().enumerate() {
         let selected = cursor_visible && cursor_id == Some(shed.id);
+        if selected {
+            sel_idx = Some(idx);
+        }
         let editing = selected && app.focus == Focus::EditShed;
         // When the cursor is on argv (command_focused) or in the outputs
         // section (output_cursor is Some), the pipeline cursor should
@@ -1243,6 +1250,7 @@ fn draw_sheds(
         };
         let command_focused = editing && app.command_focused;
         let output_cursor = if editing { app.output_cursor } else { None };
+        let output_cap = if selected { usize::MAX } else { PREVIEW_LINES };
         let mut shed_cells: Vec<CellLayout> = Vec::new();
         let lines = render_shed(
             shed,
@@ -1251,32 +1259,68 @@ fn draw_sheds(
             pipeline_cursor,
             command_focused,
             output_cursor,
+            output_cap,
             &mut shed_cells,
         );
         renders.push((lines, selected, editing, shed_cells));
     }
 
+    // Natural box height each shed wants: its content + 2 border rows.
     let heights: Vec<u16> = renders
         .iter()
         .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
         .collect();
 
-    let scratch_height: u16 = 3;
-    let avail = area.height.saturating_sub(scratch_height);
-
-    let mut total: u16 = 0;
-    let mut start = renders.len();
-    for i in (0..renders.len()).rev() {
-        if total.saturating_add(heights[i]) > avail {
-            break;
+    // Decide the visible (contiguous) range of sheds and each one's box
+    // height. With a selection we anchor on the selected shed — it gets
+    // up to the whole pane and neighbours fill the rest; without one we
+    // fall back to the most-recent suffix that fits.
+    let mut layout_h: Vec<u16> = heights.clone();
+    let (start, end) = match sel_idx {
+        Some(sel) => {
+            // The selected shed claims min(full height, whole pane).
+            let sel_box = heights[sel].min(avail);
+            layout_h[sel] = sel_box;
+            let mut used = sel_box;
+            let mut start = sel;
+            let mut end = sel + 1;
+            // Grow the window outward, preferring more-recent sheds
+            // (downward) over older ones, until neither side fits.
+            loop {
+                let mut progressed = false;
+                if end < renders.len() && used.saturating_add(heights[end]) <= avail {
+                    used = used.saturating_add(heights[end]);
+                    end += 1;
+                    progressed = true;
+                }
+                if start > 0 && used.saturating_add(heights[start - 1]) <= avail {
+                    start -= 1;
+                    used = used.saturating_add(heights[start - 1]);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            (start, end)
         }
-        total = total.saturating_add(heights[i]);
-        start = i;
-    }
+        None => {
+            let mut total: u16 = 0;
+            let mut start = renders.len();
+            for i in (0..renders.len()).rev() {
+                if total.saturating_add(heights[i]) > avail {
+                    break;
+                }
+                total = total.saturating_add(heights[i]);
+                start = i;
+            }
+            (start, renders.len())
+        }
+    };
 
-    let visible = &renders[start..];
+    let visible = &renders[start..end];
     let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 2);
-    for h in &heights[start..] {
+    for h in &layout_h[start..end] {
         constraints.push(Constraint::Length(*h));
     }
     constraints.push(Constraint::Min(0));
@@ -1288,16 +1332,16 @@ fn draw_sheds(
         .split(area);
 
     for (i, (lines, selected, editing, shed_cells)) in visible.iter().enumerate() {
+        let shed = sheds[start + i];
+        // The selected shed's body is windowed: by default it shows the
+        // tail (bottom), and `cursor_body_scroll` lifts the window up.
+        let scroll = if *selected {
+            app.body_scroll_for(shed.id)
+        } else {
+            0
+        };
         draw_one_shed(
-            f,
-            rects[i],
-            sheds[start + i],
-            lines,
-            *selected,
-            *editing,
-            regions,
-            bodies,
-            shed_cells,
+            f, rects[i], shed, lines, *selected, *editing, scroll, regions, bodies, shed_cells,
         );
     }
     let scratch_rect = rects[rects.len() - 1];
@@ -1389,6 +1433,7 @@ fn draw_one_shed(
     lines: &[Line<'static>],
     selected: bool,
     editing: bool,
+    scroll: usize,
     regions: &mut Vec<ClickRegion>,
     bodies: &mut Vec<BodyRegion>,
     shed_cells: &[CellLayout],
@@ -1444,22 +1489,48 @@ fn draw_one_shed(
         Style::default().fg(Color::DarkGray)
     };
 
-    let widget = TuiBlock::default()
+    // Window the body to the box's interior height. By default the
+    // *tail* is shown (oldest lines scroll off the top); `scroll` lifts
+    // that window upward. Only the selected shed is ever taller than its
+    // box, so non-selected sheds window to the identity slice.
+    let visible_h = area.height.saturating_sub(2) as usize;
+    let content_h = lines.len();
+    let max_scroll = content_h.saturating_sub(visible_h);
+    let lift = scroll.min(max_scroll);
+    let top = max_scroll - lift;
+    let bottom = top.saturating_add(visible_h).min(content_h);
+    let windowed: Vec<Line<'static>> = lines[top..bottom].to_vec();
+
+    // When the body overflows, annotate the bottom border with the
+    // visible line range so the scroll position is legible.
+    let mut widget = TuiBlock::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
+    if content_h > visible_h && visible_h > 0 {
+        let marker = format!(" {}–{}/{} ", top + 1, bottom, content_h);
+        widget = widget.title_bottom(
+            Line::from(Span::styled(marker, Style::default().fg(Color::DarkGray))).right_aligned(),
+        );
+    }
     let inner = widget.inner(area);
     f.render_widget(widget, area);
-    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    let para = Paragraph::new(windowed.clone()).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 
     if inner.width > 0 && inner.height > 0 {
-        let plain: Vec<String> = lines.iter().map(line_plain_text).collect();
+        let plain: Vec<String> = windowed.iter().map(line_plain_text).collect();
         let cell_regions: Vec<CellRegion> = shed_cells
             .iter()
             .filter_map(|cell| {
+                // Cell line indices are body-relative; shift into the
+                // visible window and drop anything scrolled out of view.
+                let screen_row = cell.line_idx.checked_sub(top)?;
+                if screen_row >= visible_h {
+                    return None;
+                }
                 let abs_x = inner.x.checked_add(cell.x_offset)?;
-                let abs_y = inner.y.checked_add(cell.line_idx as u16)?;
+                let abs_y = inner.y.checked_add(screen_row as u16)?;
                 if abs_x >= inner.x.saturating_add(inner.width) {
                     return None;
                 }

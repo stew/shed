@@ -77,7 +77,7 @@ use completion::{CompletionState, cycle_completion};
 use input::{
     InputOutcome, apply_readline_edit, handle_text_input, input_spans_with_cursor, render_input_bar,
 };
-use render::{cell_string, filter_error_lines, render_pipeline_value_with_max};
+use render::{cell_string, filter_error_lines, render_pipeline_value_with_max, render_shed};
 use tabs::{
     TabSlot, begin_rename_tab, drive_all_tabs, handle_rename_tab_input_key, try_handle_tab_key,
 };
@@ -309,6 +309,8 @@ const CAPTURE_CAP: usize = 16 * 1024 * 1024;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const PREVIEW_LINES: usize = 8;
 const MAX_UNDO_DEPTH: usize = 50;
+/// Lines scrolled per mouse-wheel notch over a shed body.
+const WHEEL_LINES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -1666,6 +1668,14 @@ struct App {
     /// `open_output_edit` / `open_output_insert`.
     pub(crate) output_edit_idx: Option<usize>,
     pub(crate) expand_scroll: usize,
+    /// Inline scroll position of the *selected* shed's body, as
+    /// `(shed id, lines scrolled up from the bottom)`. `0` = pinned to
+    /// the bottom (the default — newest output visible). The id tag
+    /// means the offset auto-resets to bottom when the cursor moves to
+    /// a different shed: a stale id just reads as scroll 0. `None`
+    /// before the first scroll. Display + handlers clamp against the
+    /// shed's actual content height.
+    pub(crate) cursor_body_scroll: Option<(ShedId, usize)>,
     pub(crate) search_query: String,
     pub(crate) search_anchor_scroll: usize,
     pub(crate) search_input_backward: bool,
@@ -1793,6 +1803,7 @@ impl App {
             output_cursor: None,
             output_edit_idx: None,
             expand_scroll: 0,
+            cursor_body_scroll: None,
             search_query: String::new(),
             search_anchor_scroll: 0,
             search_input_backward: false,
@@ -1951,6 +1962,16 @@ impl App {
             .cursor()
             .and_then(|id| self.session.shed(id))
             .map(|b| b.outputs.len())
+    }
+
+    /// Effective inline body-scroll for `id` — lines lifted up from the
+    /// bottom. `cursor_body_scroll` is tagged with a shed id, so a value
+    /// left over from a previously-selected shed reads as `0` here.
+    pub(crate) fn body_scroll_for(&self, id: ShedId) -> usize {
+        match self.cursor_body_scroll {
+            Some((tagged, n)) if tagged == id => n,
+            _ => 0,
+        }
     }
 }
 
@@ -3534,6 +3555,32 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
             };
             open_body_context_menu(app, &region, me.column, me.row);
         }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let hit = app
+                .body_regions
+                .iter()
+                .find(|r| rect_contains(r.rect, me.column, me.row))
+                .map(|r| r.shed_id);
+            let Some(id) = hit else {
+                return;
+            };
+            // Wheel selects the shed under the pointer (unless it's the
+            // one already being edited) so the scroll has a target.
+            let editing_this = app.session.cursor() == Some(id) && app.focus == Focus::EditShed;
+            if !editing_this {
+                app.session.set_cursor(Some(id));
+                app.reset_pipeline_cursor();
+                app.focus = Focus::ShedCursor;
+            }
+            let dir = if matches!(me.kind, MouseEventKind::ScrollUp) {
+                1
+            } else {
+                -1
+            };
+            for _ in 0..WHEEL_LINES {
+                scroll_cursor_body(app, dir, false);
+            }
+        }
         _ => {}
     }
 }
@@ -4061,6 +4108,20 @@ fn handle_cursor_key(app: &mut App, key: KeyEvent) {
                 app.rerun_source_id = Some(id);
             }
         }
+        // Inline body scroll for the selected shed. j/k step one line,
+        // PgUp/PgDn jump a page. ↑/↓ are reserved for shed navigation.
+        KeyCode::Char('k') if app.session.cursor().is_some() => {
+            scroll_cursor_body(app, 1, false);
+        }
+        KeyCode::Char('j') if app.session.cursor().is_some() => {
+            scroll_cursor_body(app, -1, false);
+        }
+        KeyCode::PageUp if app.session.cursor().is_some() => {
+            scroll_cursor_body(app, 1, true);
+        }
+        KeyCode::PageDown if app.session.cursor().is_some() => {
+            scroll_cursor_body(app, -1, true);
+        }
         _ => {}
     }
 }
@@ -4579,6 +4640,65 @@ fn compute_shed_lines(shed: &Shed) -> Vec<Line<'static>> {
         },
         None => Vec::new(),
     }
+}
+
+/// `(full body line count, interior height of the box last frame)` for
+/// the selected shed. Used to clamp inline body scrolling — the second
+/// value comes from the previous frame's [`BodyRegion`], so it's `0`
+/// before the first render.
+fn selected_body_metrics(app: &App) -> (usize, usize) {
+    let Some(id) = app.session.cursor() else {
+        return (0, 0);
+    };
+    let visible_h = app
+        .body_regions
+        .iter()
+        .find(|r| r.shed_id == id)
+        .map(|r| r.rect.height as usize)
+        .unwrap_or(0);
+    let Some(shed) = app.session.shed(id) else {
+        return (0, visible_h);
+    };
+    let editing = app.focus == Focus::EditShed;
+    let content_h = render_shed(
+        shed,
+        true,
+        editing,
+        None,
+        false,
+        None,
+        usize::MAX,
+        &mut Vec::new(),
+    )
+    .len();
+    (content_h, visible_h)
+}
+
+/// Scroll the selected shed's inline body. `dir > 0` lifts the window
+/// toward the top (older output), `dir < 0` drops it back toward the
+/// bottom. `page` swaps the one-line step for a near-full-height jump.
+/// The offset is clamped so it can't run past the start of the output.
+fn scroll_cursor_body(app: &mut App, dir: i32, page: bool) {
+    let Some(id) = app.session.cursor() else {
+        return;
+    };
+    let (content_h, visible_h) = selected_body_metrics(app);
+    let max_scroll = content_h.saturating_sub(visible_h);
+    if max_scroll == 0 {
+        return;
+    }
+    let step = if page {
+        visible_h.saturating_sub(1).max(1)
+    } else {
+        1
+    };
+    let current = app.body_scroll_for(id);
+    let next = if dir > 0 {
+        current.saturating_add(step).min(max_scroll)
+    } else {
+        current.saturating_sub(step)
+    };
+    app.cursor_body_scroll = Some((id, next));
 }
 
 fn try_compile(query: &str, case_insensitive: bool) -> Option<regex::Regex> {
@@ -9293,5 +9413,165 @@ mod tests {
         let (n1, sp1) = shed.outputs.get_index(1).unwrap();
         assert_eq!(n1, "region");
         assert!(matches!(sp1, OutputSpec::Literal(v) if v == "us-west-2"));
+    }
+
+    // === inline body scroll ===
+
+    fn capture_with_lines(n: usize) -> Capture {
+        let body: String = (1..=n).map(|i| format!("line {i}\n")).collect();
+        Capture {
+            stdout: Bytes::from(body),
+            stderr: Bytes::new(),
+            exit_code: Some(0),
+            started_at: Instant::now(),
+            finished_at: Some(Instant::now()),
+            truncated: false,
+            snapshotted: false,
+            structured: None,
+        }
+    }
+
+    fn body_region_h(shed_id: ShedId, height: u16) -> BodyRegion {
+        BodyRegion {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height,
+            },
+            shed_id,
+            lines: Vec::new(),
+            cells: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn body_scroll_for_is_tagged_by_shed_id() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        assert_eq!(app.body_scroll_for(a), 0);
+        app.cursor_body_scroll = Some((a, 7));
+        assert_eq!(app.body_scroll_for(a), 7);
+        // A scroll tagged for `a` reads as 0 for any other shed — that's
+        // how the offset auto-resets when the cursor moves.
+        assert_eq!(app.body_scroll_for(b), 0);
+    }
+
+    #[test]
+    fn render_shed_shows_tail_of_overflowing_output() {
+        // A finished shed with far more output than PREVIEW_LINES: the
+        // compact body must show the *last* lines, not the first.
+        let shed = shed_with_stdout(
+            (1..=30)
+                .map(|i| format!("row{i}\n"))
+                .collect::<String>()
+                .as_bytes(),
+        );
+        let mut cells = Vec::new();
+        let lines = render_shed(
+            &shed,
+            false,
+            false,
+            None,
+            false,
+            None,
+            PREVIEW_LINES,
+            &mut cells,
+        );
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("row30"), "newest line visible");
+        assert!(!text.contains("row1\n"), "oldest line truncated off top");
+    }
+
+    #[test]
+    fn scroll_cursor_body_lifts_and_clamps() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["seq".into()]);
+        if let Some(b) = app.session.shed_mut(id) {
+            b.capture = Some(capture_with_lines(30));
+        }
+        app.session.set_state(id, ShedState::Done(0));
+        app.session.set_cursor(Some(id));
+        app.focus = Focus::ShedCursor;
+        // Pretend last frame rendered a 6-row interior.
+        app.body_regions.push(body_region_h(id, 6));
+
+        scroll_cursor_body(&mut app, 1, false);
+        assert_eq!(app.body_scroll_for(id), 1);
+
+        // Run well past the top — must clamp, not grow unbounded.
+        for _ in 0..500 {
+            scroll_cursor_body(&mut app, 1, false);
+        }
+        let clamped = app.body_scroll_for(id);
+        assert!(clamped > 0, "should have scrolled up");
+        assert!(clamped <= 30, "clamped within content, got {clamped}");
+
+        // Scrolling back down lands cleanly on the bottom (offset 0).
+        for _ in 0..500 {
+            scroll_cursor_body(&mut app, -1, false);
+        }
+        assert_eq!(app.body_scroll_for(id), 0);
+    }
+
+    #[test]
+    fn scroll_cursor_body_noop_when_content_fits() {
+        let mut app = App::new();
+        app.history.clear();
+        let id = app.session.add_shed(vec!["seq".into()]);
+        if let Some(b) = app.session.shed_mut(id) {
+            b.capture = Some(capture_with_lines(3));
+        }
+        app.session.set_state(id, ShedState::Done(0));
+        app.session.set_cursor(Some(id));
+        // Interior far taller than the content: nothing to scroll.
+        app.body_regions.push(body_region_h(id, 20));
+        scroll_cursor_body(&mut app, 1, false);
+        assert_eq!(app.body_scroll_for(id), 0);
+    }
+
+    #[test]
+    fn wheel_over_body_selects_and_scrolls_that_shed() {
+        let mut app = App::new();
+        app.history.clear();
+        let a = app.session.add_shed(vec!["a".into()]);
+        let b = app.session.add_shed(vec!["b".into()]);
+        if let Some(s) = app.session.shed_mut(b) {
+            s.capture = Some(capture_with_lines(30));
+        }
+        app.session.set_state(b, ShedState::Done(0));
+        // Start on the prompt with nothing selected.
+        app.session.set_cursor(None);
+        app.focus = Focus::Prompt;
+        app.body_regions.push(BodyRegion {
+            rect: Rect {
+                x: 0,
+                y: 5,
+                width: 40,
+                height: 6,
+            },
+            shed_id: b,
+            lines: Vec::new(),
+            cells: Vec::new(),
+        });
+        let me = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 7, // inside shed b's body rect
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, me);
+        // The wheel selected shed `b` and switched to cursor focus.
+        assert_eq!(app.session.cursor(), Some(b));
+        assert_eq!(app.focus, Focus::ShedCursor);
+        assert!(app.body_scroll_for(b) > 0, "wheel scrolled the body up");
+        // Shed `a` was never touched.
+        assert_eq!(app.body_scroll_for(a), 0);
     }
 }

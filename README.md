@@ -201,11 +201,23 @@ mirrors onto the shed's `capture` while the command is still running.
 The pipeline re-applies on every render, so `from-lines | where …`
 shows partial rows accumulate in real time. The final `Capture` (with
 exit code + finished timestamp) replaces the partial one when the
-reader task completes. While a shed is `Running`, its inline preview
-*tails* the output (most recent rows at the bottom, with `… N more
-rows` pinned to the top) so the latest activity is always visible.
-Once the shed reaches `Done`, the preview reverts to the standard
-head-with-`… N more` style.
+reader task completes.
+
+### Shed previews and inline scrolling
+
+An *unselected* shed shows a compact preview: the last few lines of its
+output (with `… N more` pinned to the top), so the most recent activity
+is always what you see. Selecting a shed (ShedCursor focus) **expands**
+it — the box grows to show as much of the full output as fits, pushing
+neighbouring sheds aside. When the output is taller than the expanded
+box, the body becomes scrollable:
+
+- `j` / `k` scroll one line, PgDn / PgUp scroll a page.
+- The mouse wheel scrolls the shed under the pointer (and selects it).
+- The bottom border shows the visible line range, e.g. ` 12–31/86 `.
+
+For heavier scrolling — search, page jumps, whole-output inspection —
+`v` still opens the fullscreen pager.
 
 ### Builtins
 
@@ -594,6 +606,8 @@ for typing (focus shifts to Prompt, rendered in green).
 | Key       | Action |
 |-----------|--------|
 | `↑↓`      | navigate between sheds; `↓` past the last shed selects the scratch box (still ShedCursor); `↑` from the scratch returns to the last shed. |
+| `j` / `k` | scroll the selected shed's body down / up by one line. |
+| PgDn / PgUp | scroll the selected shed's body down / up by a page. |
 | `e`       | enter EditShed — reveals the command and each filter on its own line so you can navigate / edit them. On the scratch box, `e` activates the prompt for typing. |
 | `v`       | view the selected shed in the fullscreen pager. |
 | `/`       | jump to the scratch (Prompt) with `/` typed for slash commands like `/aliases`. |
@@ -773,8 +787,6 @@ Known gaps and likely next steps, in rough priority order:
 - Standalone note entries between sheds (today notes attach as
   pre / post text on a specific command shed — fine for commentary
   alongside a command but not for prose-only sections)
-- Scrollback within long shed previews (sub-shed scroll without
-  entering the pager)
 
 ## License
 
