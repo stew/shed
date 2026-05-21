@@ -1212,6 +1212,66 @@ pub(super) fn draw_repl(
     draw_status(f, chunks[2], app);
 }
 
+/// Decide which contiguous range of sheds is visible and the box height
+/// to give each one. With a selection the window anchors on the selected
+/// shed — it claims up to the whole pane (`avail`) and neighbours fill
+/// the rest, preferring more-recent (downward) sheds; without one it is
+/// the most-recent suffix that fits.
+///
+/// Returns `(start, end, layout_heights)`: the visible range is
+/// `[start, end)` and `layout_heights[i]` is the box height for shed
+/// `i` (it only differs from `heights[i]` for the expanded selected
+/// shed, which is clamped to `avail`).
+fn visible_shed_layout(
+    heights: &[u16],
+    avail: u16,
+    sel_idx: Option<usize>,
+) -> (usize, usize, Vec<u16>) {
+    let n = heights.len();
+    let mut layout_h = heights.to_vec();
+    match sel_idx {
+        Some(sel) => {
+            // The selected shed claims min(full height, whole pane).
+            let sel_box = heights[sel].min(avail);
+            layout_h[sel] = sel_box;
+            let mut used = sel_box;
+            let mut start = sel;
+            let mut end = sel + 1;
+            // Grow the window outward, preferring more-recent sheds
+            // (downward) over older ones, until neither side fits.
+            loop {
+                let mut progressed = false;
+                if end < n && used.saturating_add(heights[end]) <= avail {
+                    used = used.saturating_add(heights[end]);
+                    end += 1;
+                    progressed = true;
+                }
+                if start > 0 && used.saturating_add(heights[start - 1]) <= avail {
+                    start -= 1;
+                    used = used.saturating_add(heights[start]);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            (start, end, layout_h)
+        }
+        None => {
+            let mut total: u16 = 0;
+            let mut start = n;
+            for i in (0..n).rev() {
+                if total.saturating_add(heights[i]) > avail {
+                    break;
+                }
+                total = total.saturating_add(heights[i]);
+                start = i;
+            }
+            (start, n, layout_h)
+        }
+    }
+}
+
 fn draw_sheds(
     f: &mut Frame,
     area: Rect,
@@ -1271,52 +1331,7 @@ fn draw_sheds(
         .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
         .collect();
 
-    // Decide the visible (contiguous) range of sheds and each one's box
-    // height. With a selection we anchor on the selected shed — it gets
-    // up to the whole pane and neighbours fill the rest; without one we
-    // fall back to the most-recent suffix that fits.
-    let mut layout_h: Vec<u16> = heights.clone();
-    let (start, end) = match sel_idx {
-        Some(sel) => {
-            // The selected shed claims min(full height, whole pane).
-            let sel_box = heights[sel].min(avail);
-            layout_h[sel] = sel_box;
-            let mut used = sel_box;
-            let mut start = sel;
-            let mut end = sel + 1;
-            // Grow the window outward, preferring more-recent sheds
-            // (downward) over older ones, until neither side fits.
-            loop {
-                let mut progressed = false;
-                if end < renders.len() && used.saturating_add(heights[end]) <= avail {
-                    used = used.saturating_add(heights[end]);
-                    end += 1;
-                    progressed = true;
-                }
-                if start > 0 && used.saturating_add(heights[start - 1]) <= avail {
-                    start -= 1;
-                    used = used.saturating_add(heights[start - 1]);
-                    progressed = true;
-                }
-                if !progressed {
-                    break;
-                }
-            }
-            (start, end)
-        }
-        None => {
-            let mut total: u16 = 0;
-            let mut start = renders.len();
-            for i in (0..renders.len()).rev() {
-                if total.saturating_add(heights[i]) > avail {
-                    break;
-                }
-                total = total.saturating_add(heights[i]);
-                start = i;
-            }
-            (start, renders.len())
-        }
-    };
+    let (start, end, layout_h) = visible_shed_layout(&heights, avail, sel_idx);
 
     let visible = &renders[start..end];
     let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 2);
@@ -2555,5 +2570,43 @@ mod tests {
         assert!(texts[1].trim().ends_with("d"));
         assert!(texts[2].trim().ends_with("e"));
         assert!(texts[3].trim().ends_with("f"));
+    }
+
+    #[test]
+    fn visible_shed_layout_selection_at_index_0_does_not_overflow() {
+        // Regression: the upward-expansion arm used to index
+        // `heights[start - 1]` *after* decrementing `start`, so reaching
+        // shed 0 computed `heights[usize::MAX]` and panicked.
+        let heights = vec![5u16, 5, 5, 5];
+        let (start, end, layout) = visible_shed_layout(&heights, 40, Some(0));
+        assert_eq!(start, 0);
+        assert_eq!(end, 4);
+        assert_eq!(layout.len(), 4);
+    }
+
+    #[test]
+    fn visible_shed_layout_expands_selected_into_the_pane() {
+        // Selected shed wants 100 rows but the pane is 30 — it's clamped
+        // to 30 and claims the whole window, no room for neighbours.
+        let heights = vec![5u16, 100, 5];
+        let (start, end, layout) = visible_shed_layout(&heights, 30, Some(1));
+        assert_eq!((start, end), (1, 2));
+        assert_eq!(layout[1], 30);
+    }
+
+    #[test]
+    fn visible_shed_layout_no_selection_is_recent_suffix() {
+        // 4 sheds of height 10, pane fits 3 → newest three visible.
+        let heights = vec![10u16, 10, 10, 10];
+        let (start, end, _) = visible_shed_layout(&heights, 30, None);
+        assert_eq!((start, end), (1, 4));
+    }
+
+    #[test]
+    fn visible_shed_layout_single_shed() {
+        let heights = vec![6u16];
+        let (start, end, layout) = visible_shed_layout(&heights, 40, Some(0));
+        assert_eq!((start, end), (0, 1));
+        assert_eq!(layout[0], 6);
     }
 }
