@@ -1493,11 +1493,16 @@ fn draw_one_shed(
     // *tail* is shown (oldest lines scroll off the top); `scroll` lifts
     // that window upward. Only the selected shed is ever taller than its
     // box, so non-selected sheds window to the identity slice.
+    //
+    // EditShed is the exception: the command + filter rows it edits sit
+    // at the *top* of the body, so the window anchors there regardless
+    // of scroll — otherwise a long output would push the editable rows
+    // off-screen the moment you press `e`.
     let visible_h = area.height.saturating_sub(2) as usize;
     let content_h = lines.len();
     let max_scroll = content_h.saturating_sub(visible_h);
     let lift = scroll.min(max_scroll);
-    let top = max_scroll - lift;
+    let top = if editing { 0 } else { max_scroll - lift };
     let bottom = top.saturating_add(visible_h).min(content_h);
     let windowed: Vec<Line<'static>> = lines[top..bottom].to_vec();
 
