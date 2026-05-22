@@ -177,7 +177,7 @@ pub(super) fn render_table(
                 Value::Record(r) => r.get(col).cloned().unwrap_or(Value::Null),
                 _ => Value::Null,
             };
-            let cell = cell_string(&value);
+            let cell = cell_display(&value);
             row_spans.push(Span::raw(pad_right(&cell, widths[i])));
             cells.push(CellLayout {
                 line_idx: row_line_idx,
@@ -204,7 +204,7 @@ pub(super) fn compute_column_widths(items: &[Value], columns: &[String]) -> Vec<
         if let Value::Record(r) = item {
             for (i, col) in columns.iter().enumerate() {
                 if let Some(v) = r.get(col) {
-                    let w = display_width(&cell_string(v));
+                    let w = display_width(&cell_display(v));
                     if w > widths[i] {
                         widths[i] = w;
                     }
@@ -236,10 +236,11 @@ pub(super) fn render_scalar_list(items: &[Value], max: usize, tail: bool) -> Vec
         Box::new(items.iter().take(max))
     };
     for item in slice {
-        out.push(Line::from(vec![
-            Span::raw("      "),
-            Span::raw(format_scalar(item)),
-        ]));
+        let text = match item {
+            Value::DateTime(ts) => humanize_timestamp(*ts),
+            other => format_scalar(other),
+        };
+        out.push(Line::from(vec![Span::raw("      "), Span::raw(text)]));
     }
     if truncated && !tail {
         out.push(more_line());
@@ -294,8 +295,50 @@ pub(super) fn format_scalar(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
+        // Canonical RFC 3339 form — stable for copying, export, and
+        // column widths. The relative "3 minutes ago" form is applied
+        // separately by `cell_display` at table-render time.
+        Value::DateTime(ts) => ts.to_string(),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
         Value::List(_) | Value::Record(_) => format!("{v:?}"),
+    }
+}
+
+/// Display form of a cell for the inline table: same as [`cell_string`]
+/// except [`Value::DateTime`] renders as relative time ("3 minutes
+/// ago"). Recomputed every frame, so the relative text ticks live.
+pub(super) fn cell_display(v: &Value) -> String {
+    match v {
+        Value::DateTime(ts) => humanize_timestamp(*ts),
+        other => cell_string(other),
+    }
+}
+
+/// Render an absolute instant as a coarse relative phrase against now —
+/// "just now", "3 minutes ago", "in 2 hours", "5 days ago".
+pub(super) fn humanize_timestamp(ts: jiff::Timestamp) -> String {
+    let delta = jiff::Timestamp::now().as_second() - ts.as_second();
+    let (ago, secs) = (delta >= 0, delta.unsigned_abs());
+    let (n, unit) = if secs < 45 {
+        return "just now".to_string();
+    } else if secs < 90 {
+        (1, "minute")
+    } else if secs < 3600 {
+        (secs / 60, "minute")
+    } else if secs < 86_400 {
+        (secs / 3600, "hour")
+    } else if secs < 2_592_000 {
+        (secs / 86_400, "day")
+    } else if secs < 31_536_000 {
+        (secs / 2_592_000, "month")
+    } else {
+        (secs / 31_536_000, "year")
+    };
+    let plural = if n == 1 { "" } else { "s" };
+    if ago {
+        format!("{n} {unit}{plural} ago")
+    } else {
+        format!("in {n} {unit}{plural}")
     }
 }
 
@@ -600,6 +643,9 @@ pub(super) fn describe_filter(spec: &FilterSpec) -> String {
         }
         FilterSpec::Join { column, delimiter } => {
             format!("join {column} with {delimiter:?}")
+        }
+        FilterSpec::ParseTime { columns } => {
+            format!("parse-time {}", columns.join(", "))
         }
     }
 }
@@ -2608,5 +2654,17 @@ mod tests {
         let (start, end, layout) = visible_shed_layout(&heights, 40, Some(0));
         assert_eq!((start, end), (0, 1));
         assert_eq!(layout[0], 6);
+    }
+
+    #[test]
+    fn humanize_timestamp_renders_relative_phrases() {
+        let now = jiff::Timestamp::now().as_second();
+        let at = |secs: i64| jiff::Timestamp::from_second(now + secs).unwrap();
+        assert_eq!(humanize_timestamp(at(-5)), "just now");
+        assert_eq!(humanize_timestamp(at(-180)), "3 minutes ago");
+        assert_eq!(humanize_timestamp(at(-3600)), "1 hour ago");
+        assert_eq!(humanize_timestamp(at(-2 * 86_400)), "2 days ago");
+        // A future instant reads as "in …".
+        assert_eq!(humanize_timestamp(at(600)), "in 10 minutes");
     }
 }

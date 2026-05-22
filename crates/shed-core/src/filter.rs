@@ -89,6 +89,15 @@ pub enum FilterSpec {
     /// every input row's `column` joined by `delimiter`. Other columns
     /// are dropped.
     Join { column: String, delimiter: String },
+    /// Combine one or more columns into a single timestamp. The chosen
+    /// columns are space-joined and parsed as a datetime (RFC 3339, the
+    /// naive `YYYY-MM-DD HH:MM:SS[.fff]` form, or a bare date — naive
+    /// forms are resolved in the system time zone). The first chosen
+    /// column is replaced with the parsed [`Value::DateTime`] and the
+    /// rest are dropped. A row whose join doesn't parse keeps the raw
+    /// joined string; a row missing the first column passes through
+    /// untouched.
+    ParseTime { columns: Vec<String> },
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
@@ -238,6 +247,7 @@ impl Filter for FilterSpec {
             FilterSpec::Rename { pairs } => apply_rename(input, pairs),
             FilterSpec::Split { column, delimiter } => apply_split(input, column, delimiter),
             FilterSpec::Join { column, delimiter } => apply_join(input, column, delimiter),
+            FilterSpec::ParseTime { columns } => apply_parse_time(input, columns),
         }
     }
 }
@@ -694,6 +704,7 @@ fn value_key_string(v: Option<&Value>) -> String {
         Some(Value::Int(i)) => i.to_string(),
         Some(Value::Float(f)) => f.to_string(),
         Some(Value::String(s)) => s.clone(),
+        Some(Value::DateTime(ts)) => ts.to_string(),
         Some(other) => format!("{other:?}"),
     }
 }
@@ -714,6 +725,7 @@ fn value_to_display_string(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
+        Value::DateTime(ts) => ts.to_string(),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
         _ => format!("{v:?}"),
     }
@@ -775,6 +787,79 @@ fn apply_join(
     Ok(PipelineValue::Structured(Value::List(vec![Value::Record(
         rec,
     )])))
+}
+
+/// Parse a string into an absolute instant. Tries, in order: RFC 3339
+/// (offset / `Z`), the naive `YYYY-MM-DD HH:MM:SS[.fff]` form, a bare
+/// `YYYY-MM-DD` date, and finally a naive datetime with a trailing
+/// space-separated numeric offset (the shape `ls --full-iso` emits).
+/// Naive forms are resolved in the system time zone.
+fn parse_datetime(s: &str) -> Option<jiff::Timestamp> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(ts) = s.parse::<jiff::Timestamp>() {
+        return Some(ts);
+    }
+    let tz = jiff::tz::TimeZone::system();
+    if let Ok(dt) = s.parse::<jiff::civil::DateTime>()
+        && let Ok(zoned) = dt.to_zoned(tz.clone())
+    {
+        return Some(zoned.timestamp());
+    }
+    if let Ok(date) = s.parse::<jiff::civil::Date>()
+        && let Ok(zoned) = date.at(0, 0, 0, 0).to_zoned(tz)
+    {
+        return Some(zoned.timestamp());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f %z", "%Y-%m-%d %H:%M:%S %z"] {
+        if let Ok(zoned) = jiff::Zoned::strptime(fmt, s) {
+            return Some(zoned.timestamp());
+        }
+    }
+    None
+}
+
+fn apply_parse_time(
+    input: PipelineValue,
+    columns: &[String],
+) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    if columns.is_empty() {
+        return Ok(PipelineValue::Structured(Value::List(items)));
+    }
+    let primary = columns[0].as_str();
+    let drop: std::collections::HashSet<&str> = columns[1..].iter().map(String::as_str).collect();
+    let out: Vec<Value> = items
+        .into_iter()
+        .map(|item| match item {
+            // A record missing the primary column passes through untouched.
+            Value::Record(r) if r.contains_key(primary) => {
+                let joined = columns
+                    .iter()
+                    .map(|c| r.get(c).map(value_to_display_string).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let parsed = parse_datetime(&joined);
+                let merged = match parsed {
+                    Some(ts) => Value::DateTime(ts),
+                    None => Value::String(joined.trim().to_string()),
+                };
+                let mut new_rec = IndexMap::with_capacity(r.len());
+                for (k, v) in r {
+                    if k == primary {
+                        new_rec.insert(k, merged.clone());
+                    } else if !drop.contains(k.as_str()) {
+                        new_rec.insert(k, v);
+                    }
+                }
+                Value::Record(new_rec)
+            }
+            other => other,
+        })
+        .collect();
+    Ok(PipelineValue::Structured(Value::List(out)))
 }
 
 fn apply_rename(
@@ -915,6 +1000,7 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Null, Null) => Some(Ordering::Equal),
         (Bool(x), Bool(y)) => Some(x.cmp(y)),
         (Int(x), Int(y)) => Some(x.cmp(y)),
+        (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
         (Float(x), Float(y)) => x.partial_cmp(y),
         (Int(x), Float(y)) => (*x as f64).partial_cmp(y),
         (Float(x), Int(y)) => x.partial_cmp(&(*y as f64)),
@@ -1825,5 +1911,106 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(first.get("missing"), Some(&Value::Null));
+    }
+
+    // === parse-time ===
+
+    fn record(pairs: &[(&str, &str)]) -> Value {
+        let mut r = IndexMap::new();
+        for (k, v) in pairs {
+            r.insert((*k).to_string(), Value::String((*v).to_string()));
+        }
+        Value::Record(r)
+    }
+
+    #[test]
+    fn parse_datetime_handles_common_forms() {
+        assert!(parse_datetime("2026-05-21T14:32:01Z").is_some());
+        assert!(parse_datetime("2026-05-21 14:32:01").is_some());
+        assert!(parse_datetime("2026-05-21 14:32:01.123456789").is_some());
+        assert!(parse_datetime("2026-05-21").is_some());
+        assert!(parse_datetime("not a date").is_none());
+        assert!(parse_datetime("").is_none());
+    }
+
+    #[test]
+    fn parse_time_merges_columns_into_a_datetime() {
+        let input = PipelineValue::Structured(Value::List(vec![record(&[
+            ("date", "2026-05-21"),
+            ("time", "14:32:01"),
+            ("name", "a.txt"),
+        ])]));
+        let out = FilterSpec::ParseTime {
+            columns: vec!["date".into(), "time".into()],
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!("expected list");
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!("expected record");
+        };
+        // `date` now holds a DateTime; `time` was consumed; `name` survives.
+        assert!(matches!(r.get("date"), Some(Value::DateTime(_))));
+        assert!(r.get("time").is_none());
+        assert!(matches!(r.get("name"), Some(Value::String(s)) if s == "a.txt"));
+        // Column order is preserved (first column kept in place).
+        let keys: Vec<&str> = r.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["date", "name"]);
+    }
+
+    #[test]
+    fn parse_time_keeps_raw_string_when_unparseable() {
+        let input = PipelineValue::Structured(Value::List(vec![record(&[("t", "garbage")])]));
+        let out = FilterSpec::ParseTime {
+            columns: vec!["t".into()],
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!("expected list");
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!("expected record");
+        };
+        assert!(matches!(r.get("t"), Some(Value::String(s)) if s == "garbage"));
+    }
+
+    #[test]
+    fn sort_by_orders_a_datetime_column_chronologically() {
+        let input = PipelineValue::Structured(Value::List(vec![
+            record(&[("when", "2026-05-21 10:00:00")]),
+            record(&[("when", "2024-01-01 00:00:00")]),
+            record(&[("when", "2026-05-21 09:00:00")]),
+        ]));
+        let parsed = FilterSpec::ParseTime {
+            columns: vec!["when".into()],
+        }
+        .apply(input)
+        .unwrap();
+        let sorted = FilterSpec::SortBy {
+            keys: vec![SortKey {
+                column: "when".into(),
+                direction: SortDirection::Asc,
+            }],
+        }
+        .apply(parsed)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = sorted else {
+            panic!("expected list");
+        };
+        let stamps: Vec<jiff::Timestamp> = items
+            .iter()
+            .map(|it| match it {
+                Value::Record(r) => match r.get("when") {
+                    Some(Value::DateTime(t)) => *t,
+                    _ => panic!("expected datetime"),
+                },
+                _ => panic!("expected record"),
+            })
+            .collect();
+        // Ascending: the 2024 row first, then 09:00, then 10:00.
+        assert!(stamps[0] < stamps[1] && stamps[1] < stamps[2]);
     }
 }

@@ -16,6 +16,12 @@ pub enum Value {
     Int(i64),
     Float(f64),
     String(String),
+    /// An absolute instant in time. Produced by the `parse-time` filter,
+    /// which combines and parses date/time columns. Sorts chronologically
+    /// (it's a real `Ord` instant); the TUI renders it as relative time
+    /// ("3 minutes ago") while keeping a canonical RFC 3339 form for
+    /// copying, export, and dedup keys.
+    DateTime(jiff::Timestamp),
     /// Raw bytes — used for binary cell values; not produced by any v0
     /// parser but reserved for future use.
     Bytes(Bytes),
@@ -34,6 +40,7 @@ impl Value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::String(_) => "string",
+            Value::DateTime(_) => "datetime",
             Value::Bytes(_) => "bytes",
             Value::List(_) => "list",
             Value::Record(_) => "record",

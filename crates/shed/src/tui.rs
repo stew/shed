@@ -762,6 +762,7 @@ enum FilterKind {
     Rename,
     Split,
     Join,
+    ParseTime,
 }
 
 impl FilterKind {
@@ -782,6 +783,7 @@ impl FilterKind {
         FilterKind::Rename,
         FilterKind::Split,
         FilterKind::Join,
+        FilterKind::ParseTime,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -802,6 +804,7 @@ impl FilterKind {
             FilterKind::Rename => "rename",
             FilterKind::Split => "split",
             FilterKind::Join => "join",
+            FilterKind::ParseTime => "parse-time",
         }
     }
 
@@ -824,6 +827,9 @@ impl FilterKind {
             FilterKind::Split => "split each row's column value by a delimiter, one row per piece",
             FilterKind::Join => {
                 "concatenate every row's column value with a delimiter into one row"
+            }
+            FilterKind::ParseTime => {
+                "combine columns into a timestamp shown as relative time (\"3 minutes ago\")"
             }
         }
     }
@@ -1265,6 +1271,14 @@ impl FilterEditState {
                     .unwrap_or(0);
                 state.delim_text = delimiter.clone();
             }
+            Some(FilterSpec::ParseTime { columns }) => {
+                state.kind = FilterKind::ParseTime;
+                for col in columns {
+                    if let Some(i) = state.available_columns.iter().position(|c| c == col) {
+                        state.column_selections[i] = true;
+                    }
+                }
+            }
             Some(FilterSpec::Where { predicate }) => {
                 state.kind = FilterKind::Where;
                 let (combine, mut clauses) =
@@ -1331,7 +1345,7 @@ impl FilterEditState {
                 FormField::Op,
                 FormField::Pattern,
             ],
-            FilterKind::Select | FilterKind::Drop | FilterKind::Uniq => {
+            FilterKind::Select | FilterKind::Drop | FilterKind::Uniq | FilterKind::ParseTime => {
                 &[FormField::Kind, FormField::Columns]
             }
             FilterKind::Take | FilterKind::Skip => &[FormField::Kind, FormField::N],
@@ -1591,6 +1605,14 @@ impl FilterEditState {
                     column,
                     delimiter: self.delim_text.clone(),
                 })
+            }
+            FilterKind::ParseTime => {
+                let columns = self.selected_columns();
+                if columns.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::ParseTime { columns })
+                }
             }
         }
     }
@@ -4493,6 +4515,7 @@ fn value_to_json(v: Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::String(s) => serde_json::Value::String(s),
+        Value::DateTime(ts) => serde_json::Value::String(ts.to_string()),
         Value::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(&b).to_string()),
         Value::List(items) => {
             serde_json::Value::Array(items.into_iter().map(value_to_json).collect())

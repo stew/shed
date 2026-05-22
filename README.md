@@ -61,7 +61,8 @@ A walkthrough:
 4. The form's first field is the filter type. Use **←→** to cycle:
    `from-lines`, `from-fields`, `from-csv`, `from-json`, `from-regex`,
    `where`, `select`, `drop`, `take`, `skip`, `sort-by`, `uniq`, `count`,
-   `rename`. Pick `from-fields` and press **Enter**.
+   `rename`, `split`, `join`, `parse-time`. Pick `from-fields` and press
+   **Enter**.
 5. The shed now shows columns `_1` through `_9` and the inline pipeline
    reads `from-fields`.
 6. Press **f** again to add another filter. The form defaults to `where`
@@ -555,6 +556,7 @@ Detection has three paths, in order:
 | `count`       | aggregation | (none)                    | single row `{count: N}` |
 | `split`       | rows        | `column`, `delimiter`     | each row's `column` is split into pieces; one row per piece, other columns duplicated |
 | `join`        | rows        | `column`, `delimiter`     | concatenate every row's `column` value with `delimiter` into a single row; other columns dropped |
+| `parse-time`  | columns     | `columns`                 | space-join the chosen columns, parse as a datetime, replace the first column with the result (others dropped). Renders as relative time ("3 minutes ago") and sorts chronologically; an unparseable join keeps the raw string |
 
 ### The `⓲ -N` annotation
 
