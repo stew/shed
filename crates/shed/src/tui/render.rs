@@ -1371,10 +1371,10 @@ fn draw_sheds(
         renders.push((lines, selected, editing, shed_cells));
     }
 
-    // Natural box height each shed wants: its content + 2 border rows.
+    // Natural box height each shed wants: its content + 1 top rule.
     let heights: Vec<u16> = renders
         .iter()
-        .map(|(l, _, _, _)| (l.len() as u16).saturating_add(2))
+        .map(|(l, _, _, _)| (l.len() as u16).saturating_add(1))
         .collect();
 
     let (start, end, layout_h) = visible_shed_layout(&heights, avail, sel_idx);
@@ -1559,7 +1559,7 @@ fn draw_one_shed(
     // at the *top* of the body, so the window anchors there regardless
     // of scroll — otherwise a long output would push the editable rows
     // off-screen the moment you press `e`.
-    let visible_h = area.height.saturating_sub(2) as usize;
+    let visible_h = area.height.saturating_sub(1) as usize;
     let content_h = lines.len();
     let max_scroll = content_h.saturating_sub(visible_h);
     let lift = scroll.min(max_scroll);
@@ -1567,18 +1567,13 @@ fn draw_one_shed(
     let bottom = top.saturating_add(visible_h).min(content_h);
     let windowed: Vec<Line<'static>> = lines[top..bottom].to_vec();
 
-    // When the body overflows, annotate the bottom border with the
-    // visible line range so the scroll position is legible.
-    let mut widget = TuiBlock::default()
-        .borders(Borders::ALL)
+    // Sheds aren't fully boxed: a single top rule carries the title and
+    // separates one shed from the next. The body runs edge-to-edge — no
+    // side borders eating two columns of width.
+    let widget = TuiBlock::default()
+        .borders(Borders::TOP)
         .border_style(border_style)
         .title(title);
-    if content_h > visible_h && visible_h > 0 {
-        let marker = format!(" {}–{}/{} ", top + 1, bottom, content_h);
-        widget = widget.title_bottom(
-            Line::from(Span::styled(marker, Style::default().fg(Color::DarkGray))).right_aligned(),
-        );
-    }
     let inner = widget.inner(area);
     f.render_widget(widget, area);
     let para = Paragraph::new(windowed.clone()).wrap(Wrap { trim: false });
@@ -1628,9 +1623,24 @@ fn draw_one_shed(
     }
 
     let close_width: u16 = 3;
-    let min_room: u16 = 6; // corner + 1 padding + title room + close + corner
+    let min_room: u16 = 6;
     if area.width >= min_room {
         let close_x = area.right().saturating_sub(close_width + 1);
+        // Scroll-position indicator, drawn on the top rule just left of
+        // [×] (there's no bottom border to hang it on any more).
+        if content_h > visible_h && visible_h > 0 {
+            let marker = format!(" {}–{}/{} ", top + 1, bottom, content_h);
+            let marker_w = marker.chars().count() as u16;
+            let marker_x = close_x.saturating_sub(marker_w);
+            if marker_x > area.x {
+                f.buffer_mut().set_string(
+                    marker_x,
+                    area.y,
+                    &marker,
+                    Style::default().fg(Color::DarkGray),
+                );
+            }
+        }
         let buf = f.buffer_mut();
         let close_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         buf.set_string(close_x, area.y, "[×]", close_style);

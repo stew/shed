@@ -126,8 +126,8 @@ pressure (LRU); pinned sheds count toward the budget but never evict.
 Pin a shed with `p` from ShedCursor — it renders with `◉ <name>`
 next to its command. `u` unpins.
 
-Each shed's top-right border carries a clickable `[×]` button — left
-click on it to delete that shed. Same effect as pressing `x` with the
+Each shed's top rule carries a clickable `[×]` button at its right end
+— left click on it to delete that shed. Same effect as pressing `x` with the
 shed selected, and equally undoable via `Ctrl-Z`. Deleting a shed
 whose command is still running asks for confirmation first (`y` to
 delete and kill the child, `n` to keep it). Mouse capture is enabled
@@ -151,10 +151,11 @@ filter. Captures are bounded (16 MB) so re-running the pipeline is cheap.
 
 ### Focus model
 
-Each shed renders as a bordered box; the box title carries the
-identifier (`%5` or `@name` for pinned sheds) plus a state glyph. A
-single "scratch" box at the bottom is the place to type a new command —
-it's always present and takes the next id.
+Each shed is headed by a single top rule that carries the identifier
+(`%5` or `@name` for pinned sheds) plus a state glyph; the body runs
+edge-to-edge below it with no side borders. A single "scratch" box at
+the bottom is the place to type a new command — it's always present and
+takes the next id.
 
 - **ShedCursor** — navigate sheds (`↑↓`); the scratch sits one slot
   past the last real shed. Compact view: id/name + glyph + argv in
@@ -216,7 +217,7 @@ box, the body becomes scrollable:
 
 - `j` / `k` scroll one line, PgDn / PgUp scroll a page.
 - The mouse wheel scrolls the shed under the pointer (and selects it).
-- The bottom border shows the visible line range, e.g. ` 12–31/86 `.
+- The top rule shows the visible line range, e.g. ` 12–31/86 `.
 
 For heavier scrolling — search, page jumps, whole-output inspection —
 `v` still opens the fullscreen pager.
@@ -598,9 +599,9 @@ so you don't lose data without noticing.
 
 ### ShedCursor
 
-The compact, default focus. Each shed renders as a bordered box whose
-top border carries `id/name + glyph + argv`; the body is just the
-output. The per-filter pipeline detail stays hidden until you press
+The compact, default focus. Each shed is headed by a top rule carrying
+`id/name + glyph + argv`; the body below it is just the output. The
+per-filter pipeline detail stays hidden until you press
 `e` to enter EditShed. Pressing `↓` past the last real shed *selects*
 the scratch box (still in ShedCursor, rendered in cyan); `↑` walks
 back to the last shed, and Enter / Space / `e` activates the scratch
