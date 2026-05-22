@@ -28,9 +28,9 @@ use super::PREVIEW_LINES;
 use super::{
     App, BodyRegion, CellLayout, CellRegion, ClickAction, ClickRegion, EditMode, EnvInputMode,
     ExitPrompt, FilterEditState, Focus, FormField, InputKind, MAX_SORT_KEYS, NotePosition, WhereOp,
-    ansi, apply_pipeline, delim_label, filter_edit_field_hints, find_matches_regex,
-    highlight_matches_in_line, input_spans_with_cursor, line_plain_text, matches_for_input,
-    render_input_bar, tabs::draw_tab_bar, try_compile,
+    ansi, apply_pipeline, apply_pipeline_dry, delim_label, filter_edit_field_hints,
+    find_matches_regex, highlight_matches_in_line, input_spans_with_cursor, line_plain_text,
+    matches_for_input, render_input_bar, tabs::draw_tab_bar, try_compile,
 };
 
 pub(super) fn filter_error_lines(message: &str) -> Vec<Line<'static>> {
@@ -391,7 +391,7 @@ pub(super) fn render_shed(
     let pipeline_outcome = shed
         .capture
         .as_ref()
-        .map(|c| apply_pipeline(c, &shed.pipeline));
+        .map(|_| apply_pipeline(shed, &shed.pipeline));
     let drops: Vec<usize> = pipeline_outcome
         .as_ref()
         .and_then(|r| r.as_ref().ok())
@@ -716,6 +716,12 @@ pub(super) fn describe_filter(spec: &FilterSpec) -> String {
         FilterSpec::ParseTime { columns } => {
             format!("parse-time {}", columns.join(", "))
         }
+        FilterSpec::Pipe { argv } => {
+            let joined =
+                shlex::try_join(argv.iter().map(String::as_str)).unwrap_or_else(|_| argv.join(" "));
+            format!("pipe {joined}")
+        }
+        FilterSpec::ToJson => "to-json".into(),
     }
 }
 
@@ -1214,7 +1220,7 @@ pub(super) fn draw_shed_expand(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let all_lines: Vec<Line<'static>> = match shed.capture.as_ref() {
-        Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
+        Some(_capture) => match apply_pipeline(shed, &shed.pipeline) {
             Ok((value, _drops)) => {
                 render_pipeline_value_with_max(value, usize::MAX, false, &mut Vec::new())
             }
@@ -2085,7 +2091,7 @@ fn hypothetical_outcome(
     shed: &Shed,
     state: &FilterEditState,
 ) -> Option<Result<(PipelineValue, Vec<usize>), String>> {
-    let capture = shed.capture.as_ref()?;
+    shed.capture.as_ref()?;
     let mut hypothetical: Vec<FilterSpec> = shed.pipeline.clone();
     match (state.mode, state.build_filter()) {
         (EditMode::Add, Some(spec)) => hypothetical.push(spec),
@@ -2096,7 +2102,9 @@ fn hypothetical_outcome(
         }
         _ => {}
     }
-    Some(apply_pipeline(capture, &hypothetical))
+    // Dry-run mode: a `pipe` filter being edited shouldn't spawn awk/jq
+    // on every keystroke — it falls back to pass-through on cache miss.
+    Some(apply_pipeline_dry(shed, &hypothetical))
 }
 
 pub(super) fn draw_filter_edit(f: &mut Frame, app: &App) {
@@ -2463,6 +2471,7 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::WhereClauseSelect => "clause",
         FormField::TargetColumn => "column",
         FormField::DelimText => "delim",
+        FormField::Argv => "command",
     };
     let label_style = if active {
         Style::default()
@@ -2556,6 +2565,11 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             &state.delim_text,
             active,
             "(empty: no split / no separator)",
+        ),
+        FormField::Argv => render_text_field(
+            &state.argv_text,
+            active,
+            "(empty: e.g. `jq .foo` or `awk '/inet/{print $2}'`)",
         ),
     };
 
@@ -2772,6 +2786,7 @@ mod tests {
             post_text: None,
             outputs: indexmap::IndexMap::new(),
             output_values: std::collections::HashMap::new(),
+            pipe_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 

@@ -763,6 +763,8 @@ enum FilterKind {
     Split,
     Join,
     ParseTime,
+    Pipe,
+    ToJson,
 }
 
 impl FilterKind {
@@ -784,6 +786,8 @@ impl FilterKind {
         FilterKind::Split,
         FilterKind::Join,
         FilterKind::ParseTime,
+        FilterKind::Pipe,
+        FilterKind::ToJson,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -805,6 +809,8 @@ impl FilterKind {
             FilterKind::Split => "split",
             FilterKind::Join => "join",
             FilterKind::ParseTime => "parse-time",
+            FilterKind::Pipe => "pipe",
+            FilterKind::ToJson => "to-json",
         }
     }
 
@@ -830,6 +836,12 @@ impl FilterKind {
             }
             FilterKind::ParseTime => {
                 "combine columns into a timestamp shown as relative time (\"3 minutes ago\")"
+            }
+            FilterKind::Pipe => {
+                "pipe the bytes through an external command (awk, jq, sed, …); cached per shed"
+            }
+            FilterKind::ToJson => {
+                "serialize structured input to JSON bytes (pass-through for raw bytes)"
             }
         }
     }
@@ -866,6 +878,7 @@ enum FormField {
     WhereClauseSelect,
     TargetColumn,
     DelimText,
+    Argv,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1140,6 +1153,7 @@ struct FilterEditState {
     pub(crate) rename_cursor: usize,
     pub(crate) target_column: usize,
     pub(crate) delim_text: String,
+    pub(crate) argv_text: String,
     pub(crate) available_columns: Vec<String>,
     pub(crate) field: FormField,
     pub(crate) mode: EditMode,
@@ -1170,6 +1184,7 @@ impl FilterEditState {
             rename_cursor: 0,
             target_column: 0,
             delim_text: String::new(),
+            argv_text: String::new(),
             available_columns,
             field: FormField::Kind,
             mode,
@@ -1279,6 +1294,14 @@ impl FilterEditState {
                     }
                 }
             }
+            Some(FilterSpec::Pipe { argv }) => {
+                state.kind = FilterKind::Pipe;
+                state.argv_text = shlex::try_join(argv.iter().map(String::as_str))
+                    .unwrap_or_else(|_| argv.join(" "));
+            }
+            Some(FilterSpec::ToJson) => {
+                state.kind = FilterKind::ToJson;
+            }
             Some(FilterSpec::Where { predicate }) => {
                 state.kind = FilterKind::Where;
                 let (combine, mut clauses) =
@@ -1356,6 +1379,8 @@ impl FilterEditState {
                 FormField::TargetColumn,
                 FormField::DelimText,
             ],
+            FilterKind::Pipe => &[FormField::Kind, FormField::Argv],
+            FilterKind::ToJson => &[FormField::Kind],
         }
     }
 
@@ -1614,6 +1639,15 @@ impl FilterEditState {
                     Some(FilterSpec::ParseTime { columns })
                 }
             }
+            FilterKind::Pipe => {
+                let argv = shlex::split(self.argv_text.trim())?;
+                if argv.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::Pipe { argv })
+                }
+            }
+            FilterKind::ToJson => Some(FilterSpec::ToJson),
         }
     }
 }
@@ -2699,12 +2733,11 @@ fn snapshot_ref(session: &Session, r: &ShedRef) -> Result<SnapshotOutput, String
     let shed = session
         .shed(id)
         .ok_or_else(|| format!("{label} missing from session"))?;
-    let capture = shed
-        .capture
+    shed.capture
         .as_ref()
         .ok_or_else(|| format!("{label} has no captured output yet"))?;
 
-    let value = match apply_pipeline(capture, &shed.pipeline) {
+    let value = match apply_pipeline(shed, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return Err(format!("{label} pipeline error: {e}")),
     };
@@ -4436,10 +4469,10 @@ fn render_plain_bytes(shed: &Shed) -> Vec<u8> {
 }
 
 fn render_csv_bytes(shed: &Shed, delim: u8) -> Vec<u8> {
-    let Some(capture) = shed.capture.as_ref() else {
+    if shed.capture.is_none() {
         return Vec::new();
-    };
-    let value = match apply_pipeline(capture, &shed.pipeline) {
+    }
+    let value = match apply_pipeline(shed, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
@@ -4486,50 +4519,22 @@ fn render_csv_bytes(shed: &Shed, delim: u8) -> Vec<u8> {
 }
 
 fn render_json_bytes(shed: &Shed) -> Vec<u8> {
-    let Some(capture) = shed.capture.as_ref() else {
+    if shed.capture.is_none() {
         return Vec::new();
-    };
-    let value = match apply_pipeline(capture, &shed.pipeline) {
+    }
+    let value = match apply_pipeline(shed, &shed.pipeline) {
         Ok((v, _)) => v,
         Err(e) => return e.into_bytes(),
     };
-    let json = pipeline_value_to_json(value);
-    let mut out = serde_json::to_vec_pretty(&json).unwrap_or_else(|e| e.to_string().into_bytes());
-    out.push(b'\n');
-    out
-}
-
-fn pipeline_value_to_json(v: PipelineValue) -> serde_json::Value {
-    match v {
+    let json = match value {
         PipelineValue::Bytes(b) => {
             serde_json::Value::String(String::from_utf8_lossy(&b).to_string())
         }
-        PipelineValue::Structured(val) => value_to_json(val),
-    }
-}
-
-fn value_to_json(v: Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(b),
-        Value::Int(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-        Value::Float(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::String(s) => serde_json::Value::String(s),
-        Value::DateTime(ts) => serde_json::Value::String(ts.to_string()),
-        Value::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(&b).to_string()),
-        Value::List(items) => {
-            serde_json::Value::Array(items.into_iter().map(value_to_json).collect())
-        }
-        Value::Record(r) => {
-            let mut map = serde_json::Map::with_capacity(r.len());
-            for (k, val) in r {
-                map.insert(k, value_to_json(val));
-            }
-            serde_json::Value::Object(map)
-        }
-    }
+        PipelineValue::Structured(val) => val.to_json(),
+    };
+    let mut out = serde_json::to_vec_pretty(&json).unwrap_or_else(|e| e.to_string().into_bytes());
+    out.push(b'\n');
+    out
 }
 
 fn value_to_field_string(v: &Value) -> String {
@@ -4706,7 +4711,7 @@ fn jump_to_search(app: &mut App, forward: bool) {
 
 fn compute_shed_lines(shed: &Shed) -> Vec<Line<'static>> {
     match shed.capture.as_ref() {
-        Some(capture) => match apply_pipeline(capture, &shed.pipeline) {
+        Some(_) => match apply_pipeline(shed, &shed.pipeline) {
             Ok((value, _drops)) => {
                 render_pipeline_value_with_max(value, usize::MAX, false, &mut Vec::new())
             }
@@ -4981,6 +4986,7 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::WhereClauseSelect => handle_where_clause_select_key(state, key),
             FormField::TargetColumn => handle_target_column_key(state, key),
             FormField::DelimText => handle_delim_text_key(state, key),
+            FormField::Argv => handle_argv_key(state, key),
         },
     }
 }
@@ -5016,6 +5022,7 @@ fn filter_edit_field_hints(field: FormField) -> Vec<(&'static str, &'static str)
         WhereClauseSelect => vec![("←→", "clause"), ("a", "add"), ("x", "remove")],
         TargetColumn => vec![("←→", "column")],
         DelimText => vec![("type", "delim")],
+        Argv => vec![("type", "command")],
     };
     hints.push(("Tab", "next field"));
     hints.push(("Enter", "apply"));
@@ -5041,6 +5048,16 @@ fn handle_delim_text_key(state: &mut FilterEditState, key: KeyEvent) {
         KeyCode::Char(c) => state.delim_text.push(c),
         KeyCode::Backspace => {
             state.delim_text.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_argv_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => state.argv_text.push(c),
+        KeyCode::Backspace => {
+            state.argv_text.pop();
         }
         _ => {}
     }
@@ -6319,24 +6336,175 @@ fn collapse_home_in_path(p: &std::path::Path) -> String {
 /// drop counts (rows silently filtered by a `where` due to type mismatch),
 /// indexed by filter position in the pipeline.
 fn apply_pipeline(
-    capture: &Capture,
+    shed: &Shed,
     pipeline: &[FilterSpec],
 ) -> Result<(PipelineValue, Vec<usize>), String> {
+    apply_pipeline_inner(shed, pipeline, false)
+}
+
+/// Same as [`apply_pipeline`] but `Pipe` filters never spawn — they
+/// pass-through on cache miss. Used by the FilterEdit preview so typing
+/// into a pipe filter's argv field doesn't kick off awk/jq per keystroke.
+fn apply_pipeline_dry(
+    shed: &Shed,
+    pipeline: &[FilterSpec],
+) -> Result<(PipelineValue, Vec<usize>), String> {
+    apply_pipeline_inner(shed, pipeline, true)
+}
+
+fn apply_pipeline_inner(
+    shed: &Shed,
+    pipeline: &[FilterSpec],
+    dry_run: bool,
+) -> Result<(PipelineValue, Vec<usize>), String> {
+    let capture = match shed.capture.as_ref() {
+        Some(c) => c,
+        // Without a capture there's no input to run filters against —
+        // hand back an empty structured list so the caller can render
+        // "no rows" without special-casing.
+        None => {
+            return Ok((
+                PipelineValue::Structured(Value::List(Vec::new())),
+                vec![0; pipeline.len()],
+            ));
+        }
+    };
     let mut value = match &capture.structured {
         Some(v) => PipelineValue::Structured(v.clone()),
         None => PipelineValue::Bytes(capture.stdout.clone()),
     };
     let mut drops: Vec<usize> = vec![0; pipeline.len()];
     for (i, filter) in pipeline.iter().enumerate() {
-        match apply_with_notes(filter, value) {
-            Ok((v, n)) => {
-                drops[i] = n.error_drops;
-                value = v;
+        match filter {
+            FilterSpec::Pipe { argv } => {
+                let bytes_in = match value {
+                    PipelineValue::Bytes(b) => b,
+                    PipelineValue::Structured(_) => {
+                        return Err("pipe needs bytes — add a `to-json` filter first".into());
+                    }
+                };
+                let next = run_pipe_cached(shed, argv, bytes_in.clone(), dry_run)
+                    .map_err(|e| format!("pipe: {e}"))?;
+                value = PipelineValue::Bytes(next.unwrap_or(bytes_in));
             }
-            Err(e) => return Err(e.to_string()),
+            other => match apply_with_notes(other, value) {
+                Ok((v, n)) => {
+                    drops[i] = n.error_drops;
+                    value = v;
+                }
+                Err(e) => return Err(e.to_string()),
+            },
         }
     }
     Ok((value, drops))
+}
+
+/// Look up the per-shed cache for `argv` + input hash, returning the
+/// cached output if it hits. On miss in live mode, spawn the command
+/// and update the cache. On miss in dry-run mode, return `None` (the
+/// caller passes the input through unchanged).
+fn run_pipe_cached(
+    shed: &Shed,
+    argv: &[String],
+    input: bytes::Bytes,
+    dry_run: bool,
+) -> Result<Option<bytes::Bytes>, String> {
+    let input_hash = hash_bytes(&input);
+    {
+        let cache = shed.pipe_cache.borrow();
+        if let Some((h, out)) = cache.get(argv)
+            && *h == input_hash
+        {
+            return Ok(Some(out.clone()));
+        }
+    }
+    if dry_run {
+        return Ok(None);
+    }
+    let out = run_pipe(argv, &input)?;
+    let bytes_out = bytes::Bytes::from(out);
+    shed.pipe_cache
+        .borrow_mut()
+        .insert(argv.to_vec(), (input_hash, bytes_out.clone()));
+    Ok(Some(bytes_out))
+}
+
+fn hash_bytes(b: &bytes::Bytes) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b.as_ref().hash(&mut h);
+    h.finish()
+}
+
+/// Spawn `argv[0]` with `argv[1..]` as args, write `input` to its
+/// stdin, read stdout to EOF (with a 5-second timeout), and return the
+/// captured bytes. Non-zero exits and timeouts become `Err`.
+fn run_pipe(argv: &[String], input: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use wait_timeout::ChildExt;
+
+    if argv.is_empty() {
+        return Err("empty command".into());
+    }
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn `{}`: {e}", argv[0]))?;
+
+    // Stream input on a thread so a child that produces output before
+    // consuming all of stdin can't deadlock the pipeline. Likewise read
+    // stderr in parallel with stdout for the same reason.
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let input_vec = input.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input_vec);
+        // stdin is dropped here, closing the pipe and signalling EOF.
+    });
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stdout_buf = Vec::new();
+
+    match child.wait_timeout(Duration::from_secs(5)) {
+        Ok(Some(status)) => {
+            let _ = stdout.read_to_end(&mut stdout_buf);
+            let stderr_buf = stderr_reader.join().unwrap_or_default();
+            let _ = writer.join();
+            if !status.success() {
+                let code = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let first_line = String::from_utf8_lossy(&stderr_buf)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                return Err(if first_line.is_empty() {
+                    format!("exit {code}")
+                } else {
+                    format!("exit {code}: {first_line}")
+                });
+            }
+            Ok(stdout_buf)
+        }
+        Ok(None) => {
+            // Timed out — kill the child and surface a clear error.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err("timed out after 5s".into())
+        }
+        Err(e) => Err(format!("wait failed: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -6369,6 +6537,7 @@ mod tests {
             post_text: None,
             outputs: indexmap::IndexMap::new(),
             output_values: std::collections::HashMap::new(),
+            pipe_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -6663,7 +6832,12 @@ mod tests {
         rec2.insert("age".to_string(), Value::Int(25));
         let v =
             PipelineValue::Structured(Value::List(vec![Value::Record(rec1), Value::Record(rec2)]));
-        let json = pipeline_value_to_json(v);
+        let json = match v {
+            PipelineValue::Bytes(b) => {
+                serde_json::Value::String(String::from_utf8_lossy(&b).to_string())
+            }
+            PipelineValue::Structured(val) => val.to_json(),
+        };
         let s = serde_json::to_string(&json).unwrap();
         // Structure check via round-trip.
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -7795,7 +7969,8 @@ mod tests {
         use indexmap::IndexMap;
         let mut row = IndexMap::new();
         row.insert("x".to_string(), Value::Int(42));
-        let cap = Capture {
+        let mut shed = shed_with_stdout(b"");
+        shed.capture = Some(Capture {
             stdout: Bytes::new(),
             stderr: Bytes::new(),
             exit_code: Some(0),
@@ -7805,12 +7980,79 @@ mod tests {
             truncated: false,
             snapshotted: true,
             structured: Some(Value::List(vec![Value::Record(row)])),
-        };
-        let (out, _) = apply_pipeline(&cap, &[]).expect("apply");
+        });
+        let (out, _) = apply_pipeline(&shed, &[]).expect("apply");
         match out {
             PipelineValue::Structured(Value::List(rows)) => assert_eq!(rows.len(), 1),
             other => panic!("expected structured list, got {other:?}"),
         }
+    }
+
+    // === pipe (external command filter) ===
+
+    #[test]
+    fn run_pipe_passes_bytes_through_a_command() {
+        let out = run_pipe(&["cat".into()], b"hello").expect("cat should succeed");
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn run_pipe_returns_error_on_nonzero_exit() {
+        let err = run_pipe(&["false".into()], b"").expect_err("false exits non-zero");
+        assert!(err.contains("exit"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_pipeline_runs_pipe_filter_and_populates_cache() {
+        let shed = shed_with_stdout(b"hello");
+        let pipeline = vec![FilterSpec::Pipe {
+            argv: vec!["cat".into()],
+        }];
+        let (out, _) = apply_pipeline(&shed, &pipeline).expect("pipe via cat");
+        match out {
+            PipelineValue::Bytes(b) => assert_eq!(b.as_ref(), b"hello"),
+            other => panic!("expected bytes, got {other:?}"),
+        }
+        // The cache holds the output keyed by argv.
+        assert_eq!(shed.pipe_cache.borrow().len(), 1);
+        let (_, cached) = shed
+            .pipe_cache
+            .borrow()
+            .get(&vec!["cat".into()])
+            .cloned()
+            .unwrap();
+        assert_eq!(cached.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn apply_pipeline_dry_passes_pipe_through_on_cache_miss() {
+        // dry-run mode: a Pipe filter with no cache entry must NOT spawn —
+        // it falls back to identity so FilterEdit keystrokes don't fork
+        // awk/jq once per character.
+        let shed = shed_with_stdout(b"hello");
+        let pipeline = vec![FilterSpec::Pipe {
+            argv: vec!["this-binary-does-not-exist".into()],
+        }];
+        let (out, _) = apply_pipeline_dry(&shed, &pipeline).expect("dry-run skips spawn");
+        match out {
+            PipelineValue::Bytes(b) => assert_eq!(b.as_ref(), b"hello"),
+            other => panic!("expected bytes pass-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_pipeline_errors_when_pipe_sees_structured_input() {
+        // `from-lines` produces Structured; the next `pipe` requires
+        // Bytes, so the user is told to insert a `to-json` first.
+        let shed = shed_with_stdout(b"a\nb\n");
+        let pipeline = vec![
+            FilterSpec::FromLines,
+            FilterSpec::Pipe {
+                argv: vec!["cat".into()],
+            },
+        ];
+        let err = apply_pipeline(&shed, &pipeline).expect_err("structured → pipe is rejected");
+        assert!(err.contains("to-json"), "got: {err}");
     }
 
     #[test]

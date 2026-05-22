@@ -67,6 +67,7 @@ impl Session {
             post_text: None,
             outputs: indexmap::IndexMap::new(),
             output_values: std::collections::HashMap::new(),
+            pipe_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         self.sheds.insert(id, shed);
         id

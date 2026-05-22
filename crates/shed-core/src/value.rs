@@ -46,4 +46,32 @@ impl Value {
             Value::Record(_) => "record",
         }
     }
+
+    /// Convert into a `serde_json::Value` for export / for piping into
+    /// downstream JSON-consuming tools. Lossy for [`Value::DateTime`]
+    /// (serialized as RFC 3339 string) and [`Value::Bytes`] (lossy UTF-8
+    /// → string).
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(b),
+            Value::Int(i) => serde_json::Value::Number(serde_json::Number::from(i)),
+            Value::Float(f) => serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Value::String(s) => serde_json::Value::String(s),
+            Value::DateTime(ts) => serde_json::Value::String(ts.to_string()),
+            Value::Bytes(b) => serde_json::Value::String(String::from_utf8_lossy(&b).to_string()),
+            Value::List(items) => {
+                serde_json::Value::Array(items.into_iter().map(Value::to_json).collect())
+            }
+            Value::Record(r) => {
+                let mut map = serde_json::Map::with_capacity(r.len());
+                for (k, v) in r {
+                    map.insert(k, v.to_json());
+                }
+                serde_json::Value::Object(map)
+            }
+        }
+    }
 }

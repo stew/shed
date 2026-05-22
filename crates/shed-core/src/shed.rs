@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use bytes::Bytes;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +91,14 @@ pub struct Shed {
     /// successful completions so downstream sheds can read them.
     /// Runtime artefact — *not* persisted to notebooks.
     pub output_values: HashMap<String, String>,
+    /// Per-shed cache for `FilterSpec::Pipe` outputs. Keyed by the
+    /// command's argv; each entry holds the input-bytes hash that
+    /// produced the cached output. A cache hit means we don't re-spawn
+    /// awk/jq/etc. on every redraw — only when the input bytes or the
+    /// argv change. Wrapped in `RefCell` so the bin can populate it
+    /// while holding an `&Shed` during render. Runtime-only; not
+    /// persisted to notebooks.
+    pub pipe_cache: RefCell<HashMap<Vec<String>, (u64, Bytes)>>,
 }
 
 impl Shed {

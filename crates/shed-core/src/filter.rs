@@ -98,6 +98,19 @@ pub enum FilterSpec {
     /// joined string; a row missing the first column passes through
     /// untouched.
     ParseTime { columns: Vec<String> },
+    /// Pipe the current pipeline bytes through an external command
+    /// (awk, jq, sed, …). Requires `PipelineValue::Bytes` input — use
+    /// [`FilterSpec::ToJson`] first when piping structured data.
+    ///
+    /// `FilterSpec::Pipe.apply` is a no-op stub returning an error: the
+    /// host binary intercepts this variant in its pipeline-apply loop,
+    /// spawns the process, caches the output, and replaces the pipeline
+    /// value. shed-core itself never spawns a process.
+    Pipe { argv: Vec<String> },
+    /// Serialize structured input to compact JSON bytes; pass `Bytes`
+    /// input through unchanged. Used to bridge structured pipelines
+    /// into byte-consuming filters like [`FilterSpec::Pipe`].
+    ToJson,
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
@@ -186,6 +199,11 @@ pub enum FilterError {
         expected: &'static str,
         got: &'static str,
     },
+    /// A filter variant must be executed by the host binary, not by
+    /// shed-core itself. Currently only [`FilterSpec::Pipe`] uses this —
+    /// process spawning lives in the bin.
+    #[error("{0}")]
+    RequiresHost(&'static str),
 }
 
 /// Trait implemented by [`FilterSpec`]: applies a filter to a
@@ -248,6 +266,10 @@ impl Filter for FilterSpec {
             FilterSpec::Split { column, delimiter } => apply_split(input, column, delimiter),
             FilterSpec::Join { column, delimiter } => apply_join(input, column, delimiter),
             FilterSpec::ParseTime { columns } => apply_parse_time(input, columns),
+            FilterSpec::Pipe { .. } => Err(FilterError::RequiresHost(
+                "pipe filter must execute through the host application",
+            )),
+            FilterSpec::ToJson => apply_to_json(input),
         }
     }
 }
@@ -787,6 +809,21 @@ fn apply_join(
     Ok(PipelineValue::Structured(Value::List(vec![Value::Record(
         rec,
     )])))
+}
+
+fn apply_to_json(input: PipelineValue) -> Result<PipelineValue, FilterError> {
+    let bytes = match input {
+        PipelineValue::Bytes(b) => b,
+        PipelineValue::Structured(value) => {
+            let json = value.to_json();
+            let s = serde_json::to_vec(&json).map_err(|e| FilterError::ParseError {
+                format: "json output",
+                error: e.to_string(),
+            })?;
+            Bytes::from(s)
+        }
+    };
+    Ok(PipelineValue::Bytes(bytes))
 }
 
 /// Parse a string into an absolute instant. Tries, in order: RFC 3339
@@ -2012,5 +2049,48 @@ mod tests {
             .collect();
         // Ascending: the 2024 row first, then 09:00, then 10:00.
         assert!(stamps[0] < stamps[1] && stamps[1] < stamps[2]);
+    }
+
+    // === to-json / pipe ===
+
+    #[test]
+    fn to_json_serialises_structured_to_compact_json() {
+        let input =
+            PipelineValue::Structured(Value::List(vec![record(&[("name", "x"), ("age", "3")])]));
+        let out = FilterSpec::ToJson.apply(input).unwrap();
+        let PipelineValue::Bytes(b) = out else {
+            panic!("expected bytes");
+        };
+        let s = std::str::from_utf8(&b).unwrap();
+        // The whole structured snapshot becomes valid JSON.
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert!(v.is_array(), "{s}");
+        assert_eq!(v[0]["name"], "x");
+        assert_eq!(v[0]["age"], "3");
+    }
+
+    #[test]
+    fn to_json_passes_bytes_through_unchanged() {
+        let input = PipelineValue::Bytes(Bytes::from_static(b"raw text"));
+        let out = FilterSpec::ToJson.apply(input).unwrap();
+        let PipelineValue::Bytes(b) = out else {
+            panic!("expected bytes");
+        };
+        assert_eq!(b.as_ref(), b"raw text");
+    }
+
+    #[test]
+    fn pipe_apply_in_core_is_a_stub_error() {
+        // The actual subprocess execution lives in the host binary;
+        // shed-core's `Pipe.apply` must refuse rather than silently
+        // pass-through (which would hide missing-interception bugs).
+        let input = PipelineValue::Bytes(Bytes::from_static(b""));
+        let spec = FilterSpec::Pipe {
+            argv: vec!["true".into()],
+        };
+        let err = spec
+            .apply(input)
+            .expect_err("pipe.apply must error in core");
+        assert!(matches!(err, FilterError::RequiresHost(_)));
     }
 }
