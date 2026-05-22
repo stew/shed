@@ -188,6 +188,11 @@ run side-by-side. Each shed carries a status glyph:
 | `❄`   | snapshotted from a stream (planned) |
 | `◉`   | pinned with a name (planned UI) |
 
+Below the output, each shed that has run carries a status footer: `✓`
+plus the elapsed time on success, `✗ exit N · <time>` on a non-zero
+exit, `✗ <reason>` when the command couldn't be spawned, and `⏵
+running <time>` (ticking live) while it's still in flight.
+
 ### PTY-based capture
 
 shed spawns commands attached to a pseudo-terminal so terminal-aware
@@ -521,8 +526,8 @@ session out.
 For interactive programs (`top`, `vim`, `less`, `man`, `tmux`, `ssh`,
 `tig`, `ranger`, `fzf`, …), shed temporarily yields the entire terminal:
 tears down its TUI, runs the child with inherited stdio, restores. The
-shed records the exit code with no captured output (`(no captured
-output)`).
+shed records the exit code (shown in its status footer) with no
+captured output.
 
 Detection has three paths, in order:
 - **Built-in blacklist** of common interactive programs — handover

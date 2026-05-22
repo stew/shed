@@ -531,39 +531,13 @@ pub(super) fn render_shed(
         None => {}
     }
 
-    if let Some(capture) = &shed.capture {
-        if capture.truncated {
-            lines.push(Line::from(Span::styled(
-                " ✂ output truncated",
-                Style::default().fg(Color::Magenta),
-            )));
-        }
-        if let Some(code) = capture.exit_code
-            && code != 0
-        {
-            lines.push(Line::from(Span::styled(
-                format!(" exit {code}"),
-                Style::default().fg(Color::Red),
-            )));
-        }
-    } else if let ShedState::Done(code) = &shed.state {
-        let mut spans = vec![Span::styled(
-            " (no captured output)",
-            Style::default().fg(Color::DarkGray),
-        )];
-        if *code != 0 {
-            spans.push(Span::styled(
-                format!("  exit {code}"),
-                Style::default().fg(Color::Red),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    if let ShedState::Failed(msg) = &shed.state {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(msg.clone(), Style::default().fg(Color::Red)),
-        ]));
+    if let Some(capture) = &shed.capture
+        && capture.truncated
+    {
+        lines.push(Line::from(Span::styled(
+            " ✂ output truncated",
+            Style::default().fg(Color::Magenta),
+        )));
     }
     if matches!(shed.state, ShedState::Idle) && selected {
         lines.push(Line::from(vec![
@@ -589,7 +563,79 @@ pub(super) fn render_shed(
         lines.extend(render_note_lines(text));
     }
 
+    // Execution receipt — success/failure cue, exit code on failure,
+    // and elapsed time — as the shed's final line.
+    if let Some(footer) = execution_footer(shed) {
+        lines.push(footer);
+    }
+
     lines
+}
+
+/// Format an execution duration compactly: `840ms`, `3.2s`, `2m 5s`.
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let total = d.as_secs();
+        format!("{}m {}s", total / 60, total % 60)
+    }
+}
+
+/// Build the per-shed status footer: a ✓/✗/⏵ cue, the exit code when a
+/// command failed, and how long it ran. `None` for states with nothing
+/// to report (idle, snapshot).
+fn execution_footer(shed: &Shed) -> Option<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let ok = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let bad = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let run = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    // Elapsed time: final span for a finished capture, live span while
+    // a command is still running.
+    let elapsed = shed.capture.as_ref().map(|c| match c.finished_at {
+        Some(f) => f.duration_since(c.started_at),
+        None => c.started_at.elapsed(),
+    });
+
+    match &shed.state {
+        ShedState::Idle | ShedState::Snapshotted => None,
+        ShedState::Running => Some(Line::from(vec![
+            Span::styled(" ⏵ ", run),
+            Span::styled(
+                match elapsed {
+                    Some(d) => format!("running {}", format_duration(d)),
+                    None => "running".to_string(),
+                },
+                dim,
+            ),
+        ])),
+        ShedState::Done(code) => {
+            let mut spans = Vec::new();
+            if *code == 0 {
+                spans.push(Span::styled(" ✓ ", ok));
+            } else {
+                spans.push(Span::styled(" ✗ ", bad));
+                spans.push(Span::styled(format!("exit {code}"), bad));
+                spans.push(Span::styled("  ·  ", dim));
+            }
+            if let Some(d) = elapsed {
+                spans.push(Span::styled(format_duration(d), dim));
+            }
+            Some(Line::from(spans))
+        }
+        ShedState::Failed(msg) => Some(Line::from(vec![
+            Span::styled(" ✗ ", bad),
+            Span::styled(msg.clone(), Style::default().fg(Color::Red)),
+        ])),
+    }
 }
 
 /// Human-readable label for a filter — used in EditShed's per-filter
@@ -2676,5 +2722,81 @@ mod tests {
         assert_eq!(humanize_timestamp(at(-2 * 86_400)), "2 days ago");
         // A future instant reads as "in …".
         assert_eq!(humanize_timestamp(at(600)), "in 10 minutes");
+    }
+
+    #[test]
+    fn format_duration_scales_units() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(840)), "840ms");
+        assert_eq!(format_duration(Duration::from_millis(3200)), "3.2s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
+    }
+
+    fn shed_in_state(
+        state: shed_core::ShedState,
+        capture: Option<shed_core::Capture>,
+    ) -> shed_core::Shed {
+        shed_core::Shed {
+            id: shed_core::ShedId(1),
+            name: None,
+            argv: vec!["x".into()],
+            capture,
+            pipeline: Vec::new(),
+            state,
+            last_touched: std::time::Instant::now(),
+            pre_text: None,
+            post_text: None,
+            outputs: indexmap::IndexMap::new(),
+            output_values: std::collections::HashMap::new(),
+        }
+    }
+
+    fn capture_lasting(ms: u64, exit: i32) -> shed_core::Capture {
+        let start = std::time::Instant::now();
+        shed_core::Capture {
+            stdout: bytes::Bytes::new(),
+            stderr: bytes::Bytes::new(),
+            exit_code: Some(exit),
+            started_at: start,
+            finished_at: Some(start + std::time::Duration::from_millis(ms)),
+            truncated: false,
+            snapshotted: false,
+            structured: None,
+        }
+    }
+
+    #[test]
+    fn execution_footer_shows_success_cue_and_duration() {
+        let shed = shed_in_state(
+            shed_core::ShedState::Done(0),
+            Some(capture_lasting(1500, 0)),
+        );
+        let line = execution_footer(&shed).expect("footer for a finished shed");
+        let text = line_text(&line);
+        assert!(text.contains('✓'), "success cue: {text:?}");
+        assert!(text.contains("1.5s"), "duration: {text:?}");
+    }
+
+    #[test]
+    fn execution_footer_shows_exit_code_on_failure() {
+        let shed = shed_in_state(shed_core::ShedState::Done(3), Some(capture_lasting(200, 3)));
+        let text = line_text(&execution_footer(&shed).unwrap());
+        assert!(text.contains('✗'), "failure cue: {text:?}");
+        assert!(text.contains("exit 3"), "exit code: {text:?}");
+        assert!(text.contains("200ms"), "duration: {text:?}");
+    }
+
+    #[test]
+    fn execution_footer_for_spawn_failure_carries_the_message() {
+        let shed = shed_in_state(shed_core::ShedState::Failed("no such file".into()), None);
+        let text = line_text(&execution_footer(&shed).unwrap());
+        assert!(text.contains('✗'));
+        assert!(text.contains("no such file"));
+    }
+
+    #[test]
+    fn execution_footer_is_absent_for_idle_sheds() {
+        let shed = shed_in_state(shed_core::ShedState::Idle, None);
+        assert!(execution_footer(&shed).is_none());
     }
 }
