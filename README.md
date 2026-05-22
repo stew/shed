@@ -191,7 +191,9 @@ run side-by-side. Each shed carries a status glyph:
 Below the output, each shed that has run carries a status footer: `✓`
 plus the elapsed time on success, `✗ exit N · <time>` on a non-zero
 exit, `✗ <reason>` when the command couldn't be spawned, and `⏵
-running <time>` (ticking live) while it's still in flight.
+running <time>` (ticking live) while it's still in flight. Once a
+command finishes, the wall-clock time it finished (`HH:MM:SS`) is shown
+right-aligned at the end of that line.
 
 ### PTY-based capture
 

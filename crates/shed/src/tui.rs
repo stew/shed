@@ -2735,6 +2735,7 @@ fn populate_snapshot(app: &mut App, id: ShedId, r: &ShedRef) {
                 exit_code: Some(0),
                 started_at,
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: true,
                 structured,
@@ -3014,6 +3015,7 @@ fn drain_streams(app: &mut App) -> bool {
             exit_code: None,
             started_at,
             finished_at: None,
+            finished_wall: None,
             truncated: false,
             snapshotted: false,
             structured: None,
@@ -3038,7 +3040,7 @@ async fn reap_completed(app: &mut App) -> bool {
         match cmd.handle.await {
             Ok(Ok(CaptureOutcome::Captured(capture))) => {
                 let exit = capture.exit_code.unwrap_or(-1);
-                app.session.set_capture(id, capture);
+                app.session.set_capture(id, *capture);
                 app.session.set_state(id, ShedState::Done(exit));
             }
             Ok(Ok(CaptureOutcome::NeededFullscreen)) => {
@@ -4740,6 +4742,7 @@ fn selected_body_metrics(app: &App) -> (usize, usize) {
         false,
         None,
         usize::MAX,
+        0,
         &mut Vec::new(),
     )
     .len();
@@ -6354,6 +6357,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7472,6 +7476,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7582,6 +7587,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7621,6 +7627,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7666,6 +7673,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: Some(Value::List(vec![Value::Record(row1)])),
@@ -7698,6 +7706,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7737,6 +7746,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -7766,6 +7776,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: true,
                 structured: Some(Value::List(vec![Value::Record(row)])),
@@ -7790,6 +7801,7 @@ mod tests {
             exit_code: Some(0),
             started_at: Instant::now(),
             finished_at: Some(Instant::now()),
+            finished_wall: Some(jiff::Timestamp::now()),
             truncated: false,
             snapshotted: true,
             structured: Some(Value::List(vec![Value::Record(row)])),
@@ -7966,6 +7978,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -8618,6 +8631,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -8661,6 +8675,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -8797,6 +8812,7 @@ mod tests {
                 exit_code: Some(0),
                 started_at: Instant::now(),
                 finished_at: Some(Instant::now()),
+                finished_wall: Some(jiff::Timestamp::now()),
                 truncated: false,
                 snapshotted: false,
                 structured: None,
@@ -9497,6 +9513,7 @@ mod tests {
             exit_code: Some(0),
             started_at: Instant::now(),
             finished_at: Some(Instant::now()),
+            finished_wall: Some(jiff::Timestamp::now()),
             truncated: false,
             snapshotted: false,
             structured: None,
@@ -9550,6 +9567,7 @@ mod tests {
             false,
             None,
             PREVIEW_LINES,
+            80,
             &mut cells,
         );
         let text: String = lines

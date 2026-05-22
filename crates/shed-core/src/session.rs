@@ -228,6 +228,7 @@ mod tests {
             exit_code: Some(0),
             started_at: Instant::now(),
             finished_at: Some(Instant::now()),
+            finished_wall: Some(jiff::Timestamp::now()),
             truncated: false,
             snapshotted: false,
             structured: None,

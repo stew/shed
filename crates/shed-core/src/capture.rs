@@ -31,6 +31,11 @@ pub struct Capture {
     pub exit_code: Option<i32>,
     pub started_at: Instant,
     pub finished_at: Option<Instant>,
+    /// Wall-clock instant the command finished, as a calendar timestamp.
+    /// `finished_at` is monotonic and can't be turned into a time of day,
+    /// so this is recorded alongside it for the UI to show "finished at
+    /// 14:32:07". `None` while the command is still running.
+    pub finished_wall: Option<jiff::Timestamp>,
     /// `true` if the capture buffer hit the byte cap and additional bytes
     /// were discarded.
     pub truncated: bool,

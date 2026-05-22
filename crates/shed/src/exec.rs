@@ -65,7 +65,9 @@ pub type ChunkReceiver = mpsc::UnboundedReceiver<Bytes>;
 /// stdio, and runs the program with full terminal control.
 #[derive(Debug)]
 pub enum CaptureOutcome {
-    Captured(Capture),
+    // Boxed: `Capture` is large (hundreds of bytes), so an unboxed
+    // variant would bloat every `CaptureOutcome` to that size.
+    Captured(Box<Capture>),
     NeededFullscreen,
 }
 
@@ -217,6 +219,7 @@ fn run_blocking(
 
     let exit_status = child.wait().map_err(|e| ExecError::Wait(e.to_string()))?;
     let finished_at = Instant::now();
+    let finished_wall = jiff::Timestamp::now();
 
     if needs_fullscreen {
         return Ok(CaptureOutcome::NeededFullscreen);
@@ -228,16 +231,17 @@ fn run_blocking(
         exit_status.exit_code() as i32
     };
 
-    Ok(CaptureOutcome::Captured(Capture {
+    Ok(CaptureOutcome::Captured(Box::new(Capture {
         stdout: Bytes::from(buf),
         stderr: Bytes::new(),
         exit_code: Some(exit_code),
         started_at,
         finished_at: Some(finished_at),
+        finished_wall: Some(finished_wall),
         truncated,
         snapshotted: false,
         structured: None,
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -246,7 +250,7 @@ mod tests {
 
     fn unwrap_captured(o: CaptureOutcome) -> Capture {
         match o {
-            CaptureOutcome::Captured(c) => c,
+            CaptureOutcome::Captured(c) => *c,
             CaptureOutcome::NeededFullscreen => panic!("expected Captured"),
         }
     }

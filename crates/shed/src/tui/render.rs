@@ -378,6 +378,7 @@ pub(super) fn render_shed(
     command_focused: bool,
     output_cursor: Option<usize>,
     output_cap: usize,
+    body_width: u16,
     cells: &mut Vec<CellLayout>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -565,7 +566,7 @@ pub(super) fn render_shed(
 
     // Execution receipt — success/failure cue, exit code on failure,
     // and elapsed time — as the shed's final line.
-    if let Some(footer) = execution_footer(shed) {
+    if let Some(footer) = execution_footer(shed, body_width) {
         lines.push(footer);
     }
 
@@ -585,10 +586,18 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// Local wall-clock time of day for a timestamp, e.g. `14:32:07`.
+fn format_clock(ts: jiff::Timestamp) -> String {
+    ts.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H:%M:%S")
+        .to_string()
+}
+
 /// Build the per-shed status footer: a ✓/✗/⏵ cue, the exit code when a
-/// command failed, and how long it ran. `None` for states with nothing
-/// to report (idle, snapshot).
-fn execution_footer(shed: &Shed) -> Option<Line<'static>> {
+/// command failed, and how long it ran. When the command finished, the
+/// wall-clock time it finished is right-aligned to `width`. `None` for
+/// states with nothing to report (idle, snapshot).
+fn execution_footer(shed: &Shed, width: u16) -> Option<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let ok = Style::default()
         .fg(Color::Green)
@@ -605,9 +614,9 @@ fn execution_footer(shed: &Shed) -> Option<Line<'static>> {
         None => c.started_at.elapsed(),
     });
 
-    match &shed.state {
-        ShedState::Idle | ShedState::Snapshotted => None,
-        ShedState::Running => Some(Line::from(vec![
+    let mut spans: Vec<Span<'static>> = match &shed.state {
+        ShedState::Idle | ShedState::Snapshotted => return None,
+        ShedState::Running => vec![
             Span::styled(" ⏵ ", run),
             Span::styled(
                 match elapsed {
@@ -616,7 +625,7 @@ fn execution_footer(shed: &Shed) -> Option<Line<'static>> {
                 },
                 dim,
             ),
-        ])),
+        ],
         ShedState::Done(code) => {
             let mut spans = Vec::new();
             if *code == 0 {
@@ -629,13 +638,27 @@ fn execution_footer(shed: &Shed) -> Option<Line<'static>> {
             if let Some(d) = elapsed {
                 spans.push(Span::styled(format_duration(d), dim));
             }
-            Some(Line::from(spans))
+            spans
         }
-        ShedState::Failed(msg) => Some(Line::from(vec![
+        ShedState::Failed(msg) => vec![
             Span::styled(" ✗ ", bad),
             Span::styled(msg.clone(), Style::default().fg(Color::Red)),
-        ])),
+        ],
+    };
+
+    // Right-align the wall-clock time the command finished, padding the
+    // gap so it sits flush with the shed's right edge.
+    if let Some(ts) = shed.capture.as_ref().and_then(|c| c.finished_wall) {
+        let clock = format_clock(ts);
+        let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let clock_w = clock.chars().count();
+        let total = width as usize;
+        if total > left_w + clock_w {
+            spans.push(Span::raw(" ".repeat(total - left_w - clock_w)));
+            spans.push(Span::styled(clock, dim));
+        }
     }
+    Some(Line::from(spans))
 }
 
 /// Human-readable label for a filter — used in EditShed's per-filter
@@ -1412,6 +1435,7 @@ fn draw_sheds(
             command_focused,
             output_cursor,
             output_cap,
+            area.width,
             &mut shed_cells,
         );
         renders.push((lines, selected, editing, shed_cells));
@@ -2759,6 +2783,7 @@ mod tests {
             exit_code: Some(exit),
             started_at: start,
             finished_at: Some(start + std::time::Duration::from_millis(ms)),
+            finished_wall: Some(jiff::Timestamp::now()),
             truncated: false,
             snapshotted: false,
             structured: None,
@@ -2771,7 +2796,7 @@ mod tests {
             shed_core::ShedState::Done(0),
             Some(capture_lasting(1500, 0)),
         );
-        let line = execution_footer(&shed).expect("footer for a finished shed");
+        let line = execution_footer(&shed, 80).expect("footer for a finished shed");
         let text = line_text(&line);
         assert!(text.contains('✓'), "success cue: {text:?}");
         assert!(text.contains("1.5s"), "duration: {text:?}");
@@ -2780,16 +2805,44 @@ mod tests {
     #[test]
     fn execution_footer_shows_exit_code_on_failure() {
         let shed = shed_in_state(shed_core::ShedState::Done(3), Some(capture_lasting(200, 3)));
-        let text = line_text(&execution_footer(&shed).unwrap());
+        let text = line_text(&execution_footer(&shed, 80).unwrap());
         assert!(text.contains('✗'), "failure cue: {text:?}");
         assert!(text.contains("exit 3"), "exit code: {text:?}");
         assert!(text.contains("200ms"), "duration: {text:?}");
     }
 
     #[test]
+    fn execution_footer_right_aligns_the_finish_clock() {
+        let shed = shed_in_state(
+            shed_core::ShedState::Done(0),
+            Some(capture_lasting(1500, 0)),
+        );
+        let text = line_text(&execution_footer(&shed, 80).unwrap());
+        // The line fills the width and ends with an HH:MM:SS clock.
+        assert_eq!(text.chars().count(), 80, "footer fills the width: {text:?}");
+        let clock_re = regex::Regex::new(r"\d\d:\d\d:\d\d$").unwrap();
+        assert!(clock_re.is_match(&text), "ends with a clock: {text:?}");
+    }
+
+    #[test]
+    fn execution_footer_omits_the_clock_when_too_narrow() {
+        let shed = shed_in_state(
+            shed_core::ShedState::Done(0),
+            Some(capture_lasting(1500, 0)),
+        );
+        // Width 4 can't fit the clock — footer just carries the cue.
+        let text = line_text(&execution_footer(&shed, 4).unwrap());
+        assert!(
+            !regex::Regex::new(r"\d\d:\d\d:\d\d")
+                .unwrap()
+                .is_match(&text)
+        );
+    }
+
+    #[test]
     fn execution_footer_for_spawn_failure_carries_the_message() {
         let shed = shed_in_state(shed_core::ShedState::Failed("no such file".into()), None);
-        let text = line_text(&execution_footer(&shed).unwrap());
+        let text = line_text(&execution_footer(&shed, 80).unwrap());
         assert!(text.contains('✗'));
         assert!(text.contains("no such file"));
     }
@@ -2797,6 +2850,6 @@ mod tests {
     #[test]
     fn execution_footer_is_absent_for_idle_sheds() {
         let shed = shed_in_state(shed_core::ShedState::Idle, None);
-        assert!(execution_footer(&shed).is_none());
+        assert!(execution_footer(&shed, 80).is_none());
     }
 }
