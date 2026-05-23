@@ -885,6 +885,7 @@ enum FormField {
     TargetColumn,
     DelimText,
     Argv,
+    Range,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,6 +1161,7 @@ struct FilterEditState {
     pub(crate) target_column: usize,
     pub(crate) delim_text: String,
     pub(crate) argv_text: String,
+    pub(crate) range_text: String,
     pub(crate) available_columns: Vec<String>,
     pub(crate) field: FormField,
     pub(crate) mode: EditMode,
@@ -1191,6 +1193,7 @@ impl FilterEditState {
             target_column: 0,
             delim_text: String::new(),
             argv_text: String::new(),
+            range_text: String::new(),
             available_columns,
             field: FormField::Kind,
             mode,
@@ -1308,13 +1311,9 @@ impl FilterEditState {
             Some(FilterSpec::ToJson) => {
                 state.kind = FilterKind::ToJson;
             }
-            Some(FilterSpec::Combine { columns, separator }) => {
+            Some(FilterSpec::Combine { range, separator }) => {
                 state.kind = FilterKind::Combine;
-                for col in columns {
-                    if let Some(i) = state.available_columns.iter().position(|c| c == col) {
-                        state.column_selections[i] = true;
-                    }
-                }
+                state.range_text = range.clone();
                 state.delim_text = separator.clone();
             }
             Some(FilterSpec::Where { predicate }) => {
@@ -1396,7 +1395,7 @@ impl FilterEditState {
             ],
             FilterKind::Pipe => &[FormField::Kind, FormField::Argv],
             FilterKind::ToJson => &[FormField::Kind],
-            FilterKind::Combine => &[FormField::Kind, FormField::Columns, FormField::DelimText],
+            FilterKind::Combine => &[FormField::Kind, FormField::Range, FormField::DelimText],
         }
     }
 
@@ -1665,12 +1664,12 @@ impl FilterEditState {
             }
             FilterKind::ToJson => Some(FilterSpec::ToJson),
             FilterKind::Combine => {
-                let columns = self.selected_columns();
-                if columns.is_empty() {
+                let range = self.range_text.trim().to_string();
+                if range.is_empty() {
                     None
                 } else {
                     Some(FilterSpec::Combine {
-                        columns,
+                        range,
                         separator: self.delim_text.clone(),
                     })
                 }
@@ -5014,6 +5013,7 @@ fn handle_filter_edit_key(app: &mut App, key: KeyEvent) {
             FormField::TargetColumn => handle_target_column_key(state, key),
             FormField::DelimText => handle_delim_text_key(state, key),
             FormField::Argv => handle_argv_key(state, key),
+            FormField::Range => handle_range_key(state, key),
         },
     }
 }
@@ -5050,6 +5050,7 @@ fn filter_edit_field_hints(field: FormField) -> Vec<(&'static str, &'static str)
         TargetColumn => vec![("←→", "column")],
         DelimText => vec![("type", "delim")],
         Argv => vec![("type", "command")],
+        Range => vec![("type", "e.g. 1, 3-5, 11-")],
     };
     hints.push(("Tab", "next field"));
     hints.push(("Enter", "apply"));
@@ -5085,6 +5086,16 @@ fn handle_argv_key(state: &mut FilterEditState, key: KeyEvent) {
         KeyCode::Char(c) => state.argv_text.push(c),
         KeyCode::Backspace => {
             state.argv_text.pop();
+        }
+        _ => {}
+    }
+}
+
+fn handle_range_key(state: &mut FilterEditState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => state.range_text.push(c),
+        KeyCode::Backspace => {
+            state.range_text.pop();
         }
         _ => {}
     }

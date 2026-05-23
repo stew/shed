@@ -111,16 +111,18 @@ pub enum FilterSpec {
     /// input through unchanged. Used to bridge structured pipelines
     /// into byte-consuming filters like [`FilterSpec::Pipe`].
     ToJson,
-    /// Merge the chosen columns into the first one, joined by
-    /// `separator`. The other source columns are dropped, the column
-    /// order is otherwise preserved. Useful for tools like `ps aux`
-    /// where the trailing columns (e.g. `_11..` for the command) are
-    /// really one logical value that `from-fields` over-split. A row
-    /// missing the first column passes through untouched.
-    Combine {
-        columns: Vec<String>,
-        separator: String,
-    },
+    /// Merge a range of columns into the first one of that range,
+    /// joined by `separator`. The other source columns are dropped;
+    /// column order is otherwise preserved.
+    ///
+    /// `range` is a comma-separated list of 1-based positions and
+    /// ranges over the current schema, e.g. `"3-9"`, `"1, 2, 3-9"`, or
+    /// the headline case `"11-"` ("everything from column 11 onward").
+    /// Resolved against the schema at the filter's input, so `"10-"`
+    /// correctly tracks the row when upstream filters change the
+    /// column count. A row missing the first resolved column passes
+    /// through untouched.
+    Combine { range: String, separator: String },
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
@@ -280,7 +282,7 @@ impl Filter for FilterSpec {
                 "pipe filter must execute through the host application",
             )),
             FilterSpec::ToJson => apply_to_json(input),
-            FilterSpec::Combine { columns, separator } => apply_combine(input, columns, separator),
+            FilterSpec::Combine { range, separator } => apply_combine(input, range, separator),
         }
     }
 }
@@ -910,22 +912,104 @@ fn apply_parse_time(
     Ok(PipelineValue::Structured(Value::List(out)))
 }
 
+/// Parse a column-range spec like `"1, 2, 3-9"` or `"10-"` against a
+/// schema of length `n` into the corresponding zero-based indices.
+///
+/// - Bare numbers: `"5"` → index 4.
+/// - Closed ranges: `"3-9"` → indices 2..=8.
+/// - Open-ended ranges: `"10-"` → indices 9..=n-1; `"-5"` → indices 0..=4.
+/// - Just `"-"` selects all columns.
+///
+/// Indices beyond `n` are clipped (no error). Indexing is 1-based;
+/// `"0"` is a syntactic error. A reversed range (`"7-3"`) errors too.
+pub fn parse_column_range(text: &str, n: usize) -> Result<Vec<usize>, String> {
+    let mut out = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let a = a.trim();
+                let b = b.trim();
+                let lo = if a.is_empty() {
+                    1
+                } else {
+                    a.parse::<usize>()
+                        .map_err(|_| format!("not a number: `{a}`"))?
+                };
+                let hi = if b.is_empty() {
+                    n
+                } else {
+                    b.parse::<usize>()
+                        .map_err(|_| format!("not a number: `{b}`"))?
+                };
+                if lo == 0 || (!b.is_empty() && hi == 0) {
+                    return Err("column positions are 1-based; got 0".into());
+                }
+                // Explicit reversed range (`7-3`) is a typo and worth
+                // flagging; open-ended ranges that simply outrun the
+                // schema (`11-` on a 4-column row) clip silently.
+                if !b.is_empty() && lo > hi {
+                    return Err(format!("reversed range: {lo}-{hi}"));
+                }
+                for i in lo..=hi {
+                    if i <= n {
+                        out.push(i - 1);
+                    }
+                }
+            }
+            None => {
+                let i = part
+                    .parse::<usize>()
+                    .map_err(|_| format!("not a number: `{part}`"))?;
+                if i == 0 {
+                    return Err("column positions are 1-based; got 0".into());
+                }
+                if i <= n {
+                    out.push(i - 1);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn apply_combine(
     input: PipelineValue,
-    columns: &[String],
+    range: &str,
     separator: &str,
 ) -> Result<PipelineValue, FilterError> {
     let items = require_list(input)?;
+    // Pull the schema from the first record — `from-fields` and friends
+    // give every row the same shape, so this is stable for our use.
+    let schema: Vec<String> = items
+        .iter()
+        .find_map(|v| match v {
+            Value::Record(r) => Some(r.keys().cloned().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let indices = parse_column_range(range, schema.len()).map_err(|e| FilterError::ParseError {
+        format: "column range",
+        error: e,
+    })?;
+    let columns: Vec<String> = indices
+        .into_iter()
+        .filter_map(|i| schema.get(i).cloned())
+        .collect();
     if columns.is_empty() {
+        // Nothing to merge (empty range, out-of-bounds, no schema).
         return Ok(PipelineValue::Structured(Value::List(items)));
     }
-    let primary = columns[0].as_str();
+    let primary = columns[0].clone();
     let drop: std::collections::HashSet<&str> = columns[1..].iter().map(String::as_str).collect();
     let out: Vec<Value> = items
         .into_iter()
         .map(|item| match item {
             // A record missing the primary column passes through untouched.
-            Value::Record(r) if r.contains_key(primary) => {
+            Value::Record(r) if r.contains_key(primary.as_str()) => {
                 let joined = columns
                     .iter()
                     .map(|c| r.get(c).map(value_to_display_string).unwrap_or_default())
@@ -2146,18 +2230,18 @@ mod tests {
 
     #[test]
     fn combine_merges_trailing_columns_for_ps_aux_shape() {
-        // Simulates `ps aux` after `from-fields`: the command spans
-        // _11, _12, _13. Combining them yields one logical command
-        // column under _11, the others dropped.
+        // The headline case: `ps aux` after `from-fields` has the
+        // command split across _3.._5 here (using a small schema for
+        // the test). `3-` resolves to those three and merges them.
         let input = PipelineValue::Structured(Value::List(vec![record(&[
             ("_1", "root"),
             ("_2", "1"),
-            ("_11", "/sbin/init"),
-            ("_12", "splash"),
-            ("_13", "--quiet"),
+            ("_3", "/sbin/init"),
+            ("_4", "splash"),
+            ("_5", "--quiet"),
         ])]));
         let out = FilterSpec::Combine {
-            columns: vec!["_11".into(), "_12".into(), "_13".into()],
+            range: "3-".into(),
             separator: " ".into(),
         }
         .apply(input)
@@ -2168,14 +2252,13 @@ mod tests {
         let Value::Record(r) = &items[0] else {
             panic!("expected record");
         };
-        assert!(matches!(r.get("_11"), Some(Value::String(s)) if s == "/sbin/init splash --quiet"));
-        assert!(r.get("_12").is_none());
-        assert!(r.get("_13").is_none());
+        assert!(matches!(r.get("_3"), Some(Value::String(s)) if s == "/sbin/init splash --quiet"));
+        assert!(r.get("_4").is_none());
+        assert!(r.get("_5").is_none());
         // Non-source columns survive in place.
         assert!(matches!(r.get("_1"), Some(Value::String(s)) if s == "root"));
-        // Order is preserved: _1, _2, _11.
         let keys: Vec<&str> = r.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["_1", "_2", "_11"]);
+        assert_eq!(keys, vec!["_1", "_2", "_3"]);
     }
 
     #[test]
@@ -2185,7 +2268,7 @@ mod tests {
             ("last", "Lovelace"),
         ])]));
         let out = FilterSpec::Combine {
-            columns: vec!["first".into(), "last".into()],
+            range: "1-2".into(),
             separator: ", ".into(),
         }
         .apply(input)
@@ -2200,10 +2283,12 @@ mod tests {
     }
 
     #[test]
-    fn combine_passes_row_through_when_primary_missing() {
+    fn combine_passes_row_through_when_range_is_out_of_bounds() {
+        // Schema has one column; `5-` lands entirely past the end, so
+        // there's nothing to merge — original row survives untouched.
         let input = PipelineValue::Structured(Value::List(vec![record(&[("other", "x")])]));
         let out = FilterSpec::Combine {
-            columns: vec!["_11".into(), "_12".into()],
+            range: "5-".into(),
             separator: " ".into(),
         }
         .apply(input)
@@ -2214,8 +2299,35 @@ mod tests {
         let Value::Record(r) = &items[0] else {
             panic!();
         };
-        // Untouched: no _11/_12 to combine, original row survives.
         let keys: Vec<&str> = r.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["other"]);
+    }
+
+    #[test]
+    fn parse_column_range_handles_each_shape() {
+        // Bare position.
+        assert_eq!(parse_column_range("5", 10).unwrap(), vec![4]);
+        // Closed range.
+        assert_eq!(parse_column_range("3-5", 10).unwrap(), vec![2, 3, 4]);
+        // Open right ("everything from N onward").
+        assert_eq!(parse_column_range("8-", 10).unwrap(), vec![7, 8, 9]);
+        // Open left.
+        assert_eq!(parse_column_range("-3", 10).unwrap(), vec![0, 1, 2]);
+        // Mixed comma list with whitespace.
+        assert_eq!(
+            parse_column_range("1, 2, 3-5", 10).unwrap(),
+            vec![0, 1, 2, 3, 4]
+        );
+        // Bare `-` selects every column.
+        assert_eq!(parse_column_range("-", 3).unwrap(), vec![0, 1, 2]);
+        // Indices past the schema are clipped silently.
+        assert_eq!(parse_column_range("9-15", 10).unwrap(), vec![8, 9]);
+    }
+
+    #[test]
+    fn parse_column_range_errors_on_zero_or_reversed() {
+        assert!(parse_column_range("0", 10).is_err());
+        assert!(parse_column_range("7-3", 10).is_err());
+        assert!(parse_column_range("abc", 10).is_err());
     }
 }

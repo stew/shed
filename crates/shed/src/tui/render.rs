@@ -722,8 +722,8 @@ pub(super) fn describe_filter(spec: &FilterSpec) -> String {
             format!("pipe {joined}")
         }
         FilterSpec::ToJson => "to-json".into(),
-        FilterSpec::Combine { columns, separator } => {
-            format!("combine {} with {separator:?}", columns.join(", "))
+        FilterSpec::Combine { range, separator } => {
+            format!("combine {range} with {separator:?}")
         }
     }
 }
@@ -2475,6 +2475,7 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
         FormField::TargetColumn => "column",
         FormField::DelimText => "delim",
         FormField::Argv => "command",
+        FormField::Range => "range",
     };
     let label_style = if active {
         Style::default()
@@ -2573,6 +2574,11 @@ fn render_form_row(state: &FilterEditState, field: FormField) -> Line<'static> {
             &state.argv_text,
             active,
             "(empty: e.g. `jq .foo` or `awk '/inet/{print $2}'`)",
+        ),
+        FormField::Range => render_text_field(
+            &state.range_text,
+            active,
+            "(empty: e.g. `3-9`, `1, 2, 3-9`, `11-`)",
         ),
     };
 

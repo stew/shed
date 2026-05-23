@@ -567,7 +567,7 @@ Detection has three paths, in order:
 | `parse-time`  | columns     | `columns`                 | space-join the chosen columns, parse as a datetime, replace the first column with the result (others dropped). Renders as relative time ("3 minutes ago") and sorts chronologically; an unparseable join keeps the raw string |
 | `pipe`        | bytes       | `argv`                    | spawn an external command (`awk`, `jq`, `sed`, …), write the current pipeline bytes to its stdin, replace the pipeline with its stdout. Requires `Bytes` input — chain `to-json` first when piping structured data. Each invocation is cached per shed by `(argv, input-bytes-hash)`, so steady-state renders don't re-spawn. Non-zero exits and a 5s timeout surface as filter errors. |
 | `to-json`     | bytes       | (none)                    | serialize structured input to compact JSON bytes; `Bytes` input passes through unchanged. The bridge between structured pipelines and `pipe`. |
-| `combine`     | columns     | `columns`, `separator`    | merge the chosen columns into the first one, joined by `separator`; the rest are dropped. Useful when `from-fields` over-splits a value (e.g. `ps aux`'s command spans `_11..`) — combine the tail back together. |
+| `combine`     | columns     | `range`, `separator`      | merge a contiguous slice of columns into the first one of the slice, joined by `separator`; the rest are dropped. `range` is a comma-separated list of 1-based positions over the current schema — `3-9`, `1, 2, 3-9`, or the headline `11-` ("everything from column 11 onward"). Useful when `from-fields` over-splits a value (e.g. `ps aux`'s command spans `_11..`). |
 
 ### The `⓲ -N` annotation
 
