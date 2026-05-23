@@ -1010,9 +1010,18 @@ fn apply_combine(
         .map(|item| match item {
             // A record missing the primary column passes through untouched.
             Value::Record(r) if r.contains_key(primary.as_str()) => {
+                // Skip null / empty cells when joining — `from-fields`
+                // pads short rows to the max field count with Nulls, and
+                // we don't want to render those as the literal "null".
                 let joined = columns
                     .iter()
-                    .map(|c| r.get(c).map(value_to_display_string).unwrap_or_default())
+                    .filter_map(|c| match r.get(c) {
+                        None | Some(Value::Null) => None,
+                        Some(v) => {
+                            let s = value_to_display_string(v);
+                            if s.is_empty() { None } else { Some(s) }
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(separator);
                 let mut new_rec = IndexMap::with_capacity(r.len());
@@ -2301,6 +2310,33 @@ mod tests {
         };
         let keys: Vec<&str> = r.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["other"]);
+    }
+
+    #[test]
+    fn combine_skips_null_and_empty_cells_when_joining() {
+        // `from-fields` pads short rows to the max column count with
+        // `Value::Null`. Combine must not render those as the literal
+        // "null" in the joined string.
+        let mut r = IndexMap::new();
+        r.insert("_1".to_string(), Value::String("USER".into()));
+        r.insert("_2".to_string(), Value::String("PID".into()));
+        r.insert("_3".to_string(), Value::Null);
+        r.insert("_4".to_string(), Value::String("".into()));
+        r.insert("_5".to_string(), Value::String("COMMAND".into()));
+        let input = PipelineValue::Structured(Value::List(vec![Value::Record(r)]));
+        let out = FilterSpec::Combine {
+            range: "1-".into(),
+            separator: " ".into(),
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!();
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!();
+        };
+        assert!(matches!(r.get("_1"), Some(Value::String(s)) if s == "USER PID COMMAND"));
     }
 
     #[test]
