@@ -1,12 +1,28 @@
 # shed
 
-> An interactive shell where the pipeline comes after the command.
+> A re-runnable notebook for shell workflows. Save the commands +
+> pipelines you run; replay them next time you need them.
 
-shed is a TUI shell (Linux/macOS) that captures every command's output as a
-structured **shed** and lets you build pipelines **retroactively** — adding,
-editing, removing, and reordering filters with live preview. The killer
-feature is that you don't have to know what filter you want before you run
-the command. Run it; look at the output; sculpt the pipeline.
+shed (Linux/macOS) is a TUI for shell workflows you do more than once.
+Each command's output is captured as a *shed*; you build a pipeline of
+filters around it (`from-json | where status = "active"` …); and the
+whole session — commands, pipelines, names, outputs, notes — saves as
+a JSON **notebook** you re-open later.
+
+The pipeline editor works **retroactively**: you don't have to know
+what filter you want before you run the command. Run it, look at the
+output, sculpt the pipeline. Then save the sculpted form, so next
+time you don't have to sculpt it again.
+
+It's especially useful for:
+
+- **Repeatable workflows** — a deploy runbook, a cluster-health
+  check, the data extract you run every Monday. Build the pipeline
+  the first time; replay it every time after.
+- **Project-scoped operations** — keep a notebook in
+  `~/devel/<project>/` and open it whenever you `cd` in. The
+  commands you reach for inside that directory live in one place,
+  with the pipelines you've shaped around their output.
 
 ## Status
 
@@ -40,6 +56,10 @@ The yellow `ⓘ-1` next to `where _5 > 1000` says: *one row was dropped
 because it had no `_5` value to compare* (the `total 4567` summary line at
 the top of `ls -la`'s output).
 
+The whole session — both sheds, their pipelines, the pinned names if
+any — `Ctrl-S` writes out to JSON; `shed ./mywork.json` next time
+loads it back, idle, ready to re-run.
+
 ## Quick start
 
 ```bash
@@ -70,10 +90,51 @@ A walkthrough:
    `column` → cycle to `_5`; `op` → cycle to `>`; `value` → type `1000`.
    Watch the preview shrink as you type.
 7. Press **Enter** to apply; **Esc** to return to the prompt.
+8. **Save the session.** Press **Ctrl-S**, type `./mywork.json`,
+   **Enter**. You've just written a notebook. **Ctrl-D** to quit.
+9. **Re-open later.** `shed ./mywork.json` brings back the `ls -la
+   /etc` shed with its `from-fields | where _5 > 1000` pipeline
+   already in place. Loaded sheds start *idle* (hollow `○` glyph);
+   press **Space** on one to re-run it. The capture is fresh, the
+   pipeline applies as you set it up the first time.
 
 To quit: `Ctrl-D`.
 
 ## Concepts
+
+### Notebooks
+
+A *notebook* is the saveable form of a session — an ordered list of
+commands plus the retroactive pipelines you built around each one,
+serialised as JSON. This is the headline value of shed: build the
+workflow once, replay it next week, next deploy, or whenever you `cd`
+back into the project directory.
+
+A notebook holds *only* structure — argv, optional pinned name,
+pipeline, declared outputs, pre/post-notes. Captures, exit codes, and
+timestamps are not persisted on purpose: a notebook is a recipe, not a
+frozen view. Re-opening a notebook gives you idle sheds with `○`
+glyphs and no captured output; press **Space** on each (or trigger
+the run-chain via `Space` on a downstream `@name` / `${…}` dependant)
+to actually execute them.
+
+| Action                 | How |
+|------------------------|-----|
+| Open a notebook on launch | `shed PATH.json` (the file is created if it doesn't exist; it just binds the save target) |
+| Save                   | `Ctrl-S` — saves to the bound path; if none, opens an input bar to pick one |
+| Save as / open another | `Ctrl-O` — input bar to load a different notebook (replaces the current session) |
+| Run a loaded shed     | move the cursor onto it (`Esc`, `↑↓`) and press `Space` (or `x`). Loaded sheds start in `Idle` state with a hollow `○` glyph; running them swaps the capture in place. |
+| Quit with unsaved work | `Ctrl-D` shows `unsaved changes — save before quitting? [y]es [n]o [c]ancel` instead of quitting straight away |
+
+Shed re-runs and pipeline edits set a *dirty* flag. Save clears it;
+quitting while dirty triggers the confirmation prompt. `Ctrl-S` from
+anywhere (Prompt, ShedCursor, even mid-FilterEdit) writes the current
+session out.
+
+The conventions that follow — sheds, pipelines, tabs, pinned
+references, outputs, notes — are all the things that survive into the
+JSON. Everything else (capture bytes, run state, undo history,
+ephemeral UI state) is runtime-only.
 
 ### Tabs
 
@@ -501,28 +562,6 @@ The palette lives on **Ctrl-P** (so that **Ctrl-K** is free for
 kill-to-end), and the env editor is reachable via the palette only
 (rather than a Ctrl-E shortcut, which is now end-of-line).
 
-### Notebooks
-
-A *notebook* is the saveable form of a session: an ordered list of
-commands plus the retroactive pipeline you built around each one. The
-on-disk format is JSON (versioned via a top-level `version` field) and
-holds *only* structure — argv, optional pinned name, pipeline. Captures,
-exit codes, and timestamps are not persisted on purpose: a notebook is a
-recipe, not a frozen view.
-
-| Action                 | How |
-|------------------------|-----|
-| Open a notebook on launch | `shed PATH.json` (the file is created if it doesn't exist; it just binds the save target) |
-| Save                   | `Ctrl-S` — saves to the bound path; if none, opens an input bar to pick one |
-| Save as / open another | `Ctrl-O` — input bar to load a different notebook (replaces the current session) |
-| Run a loaded shed     | move the cursor onto it (`Esc`, `↑↓`) and press `Space` (or `x`). Loaded sheds start in `Idle` state with a hollow `○` glyph; running them swaps the capture in place. |
-| Quit with unsaved work | `Ctrl-D` shows `unsaved changes — save before quitting? [y]es [n]o [c]ancel` instead of quitting straight away |
-
-Shed re-runs and pipeline edits set a *dirty* flag. Save clears it;
-quitting while dirty triggers the confirmation prompt. `Ctrl-S` from
-anywhere (Prompt, ShedCursor, even mid-FilterEdit) writes the current
-session out.
-
 ### Fullscreen handover
 
 For interactive programs (`top`, `vim`, `less`, `man`, `tmux`, `ssh`,
@@ -801,6 +840,10 @@ Known gaps and likely next steps, in rough priority order:
 - Standalone note entries between sheds (today notes attach as
   pre / post text on a specific command shed — fine for commentary
   alongside a command but not for prose-only sections)
+- Directory-scoped notebook discovery — open shed in a project
+  directory and have it auto-locate (or offer to create) a notebook
+  for that project, so the project's commands and pipelines are
+  always one Enter away
 
 ## License
 
