@@ -111,6 +111,16 @@ pub enum FilterSpec {
     /// input through unchanged. Used to bridge structured pipelines
     /// into byte-consuming filters like [`FilterSpec::Pipe`].
     ToJson,
+    /// Merge the chosen columns into the first one, joined by
+    /// `separator`. The other source columns are dropped, the column
+    /// order is otherwise preserved. Useful for tools like `ps aux`
+    /// where the trailing columns (e.g. `_11..` for the command) are
+    /// really one logical value that `from-fields` over-split. A row
+    /// missing the first column passes through untouched.
+    Combine {
+        columns: Vec<String>,
+        separator: String,
+    },
 }
 
 /// One key in a `sort-by` filter: a column name and a direction.
@@ -270,6 +280,7 @@ impl Filter for FilterSpec {
                 "pipe filter must execute through the host application",
             )),
             FilterSpec::ToJson => apply_to_json(input),
+            FilterSpec::Combine { columns, separator } => apply_combine(input, columns, separator),
         }
     }
 }
@@ -887,6 +898,43 @@ fn apply_parse_time(
                 for (k, v) in r {
                     if k == primary {
                         new_rec.insert(k, merged.clone());
+                    } else if !drop.contains(k.as_str()) {
+                        new_rec.insert(k, v);
+                    }
+                }
+                Value::Record(new_rec)
+            }
+            other => other,
+        })
+        .collect();
+    Ok(PipelineValue::Structured(Value::List(out)))
+}
+
+fn apply_combine(
+    input: PipelineValue,
+    columns: &[String],
+    separator: &str,
+) -> Result<PipelineValue, FilterError> {
+    let items = require_list(input)?;
+    if columns.is_empty() {
+        return Ok(PipelineValue::Structured(Value::List(items)));
+    }
+    let primary = columns[0].as_str();
+    let drop: std::collections::HashSet<&str> = columns[1..].iter().map(String::as_str).collect();
+    let out: Vec<Value> = items
+        .into_iter()
+        .map(|item| match item {
+            // A record missing the primary column passes through untouched.
+            Value::Record(r) if r.contains_key(primary) => {
+                let joined = columns
+                    .iter()
+                    .map(|c| r.get(c).map(value_to_display_string).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(separator);
+                let mut new_rec = IndexMap::with_capacity(r.len());
+                for (k, v) in r {
+                    if k == primary {
+                        new_rec.insert(k, Value::String(joined.clone()));
                     } else if !drop.contains(k.as_str()) {
                         new_rec.insert(k, v);
                     }
@@ -2092,5 +2140,82 @@ mod tests {
             .apply(input)
             .expect_err("pipe.apply must error in core");
         assert!(matches!(err, FilterError::RequiresHost(_)));
+    }
+
+    // === combine ===
+
+    #[test]
+    fn combine_merges_trailing_columns_for_ps_aux_shape() {
+        // Simulates `ps aux` after `from-fields`: the command spans
+        // _11, _12, _13. Combining them yields one logical command
+        // column under _11, the others dropped.
+        let input = PipelineValue::Structured(Value::List(vec![record(&[
+            ("_1", "root"),
+            ("_2", "1"),
+            ("_11", "/sbin/init"),
+            ("_12", "splash"),
+            ("_13", "--quiet"),
+        ])]));
+        let out = FilterSpec::Combine {
+            columns: vec!["_11".into(), "_12".into(), "_13".into()],
+            separator: " ".into(),
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!("expected list");
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!("expected record");
+        };
+        assert!(matches!(r.get("_11"), Some(Value::String(s)) if s == "/sbin/init splash --quiet"));
+        assert!(r.get("_12").is_none());
+        assert!(r.get("_13").is_none());
+        // Non-source columns survive in place.
+        assert!(matches!(r.get("_1"), Some(Value::String(s)) if s == "root"));
+        // Order is preserved: _1, _2, _11.
+        let keys: Vec<&str> = r.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["_1", "_2", "_11"]);
+    }
+
+    #[test]
+    fn combine_uses_custom_separator() {
+        let input = PipelineValue::Structured(Value::List(vec![record(&[
+            ("first", "Ada"),
+            ("last", "Lovelace"),
+        ])]));
+        let out = FilterSpec::Combine {
+            columns: vec!["first".into(), "last".into()],
+            separator: ", ".into(),
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!();
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!();
+        };
+        assert!(matches!(r.get("first"), Some(Value::String(s)) if s == "Ada, Lovelace"));
+    }
+
+    #[test]
+    fn combine_passes_row_through_when_primary_missing() {
+        let input = PipelineValue::Structured(Value::List(vec![record(&[("other", "x")])]));
+        let out = FilterSpec::Combine {
+            columns: vec!["_11".into(), "_12".into()],
+            separator: " ".into(),
+        }
+        .apply(input)
+        .unwrap();
+        let PipelineValue::Structured(Value::List(items)) = out else {
+            panic!();
+        };
+        let Value::Record(r) = &items[0] else {
+            panic!();
+        };
+        // Untouched: no _11/_12 to combine, original row survives.
+        let keys: Vec<&str> = r.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["other"]);
     }
 }

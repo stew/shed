@@ -765,6 +765,7 @@ enum FilterKind {
     ParseTime,
     Pipe,
     ToJson,
+    Combine,
 }
 
 impl FilterKind {
@@ -788,6 +789,7 @@ impl FilterKind {
         FilterKind::ParseTime,
         FilterKind::Pipe,
         FilterKind::ToJson,
+        FilterKind::Combine,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -811,6 +813,7 @@ impl FilterKind {
             FilterKind::ParseTime => "parse-time",
             FilterKind::Pipe => "pipe",
             FilterKind::ToJson => "to-json",
+            FilterKind::Combine => "combine",
         }
     }
 
@@ -842,6 +845,9 @@ impl FilterKind {
             }
             FilterKind::ToJson => {
                 "serialize structured input to JSON bytes (pass-through for raw bytes)"
+            }
+            FilterKind::Combine => {
+                "merge the chosen columns into the first one, joined by a separator"
             }
         }
     }
@@ -1302,6 +1308,15 @@ impl FilterEditState {
             Some(FilterSpec::ToJson) => {
                 state.kind = FilterKind::ToJson;
             }
+            Some(FilterSpec::Combine { columns, separator }) => {
+                state.kind = FilterKind::Combine;
+                for col in columns {
+                    if let Some(i) = state.available_columns.iter().position(|c| c == col) {
+                        state.column_selections[i] = true;
+                    }
+                }
+                state.delim_text = separator.clone();
+            }
             Some(FilterSpec::Where { predicate }) => {
                 state.kind = FilterKind::Where;
                 let (combine, mut clauses) =
@@ -1381,6 +1396,7 @@ impl FilterEditState {
             ],
             FilterKind::Pipe => &[FormField::Kind, FormField::Argv],
             FilterKind::ToJson => &[FormField::Kind],
+            FilterKind::Combine => &[FormField::Kind, FormField::Columns, FormField::DelimText],
         }
     }
 
@@ -1648,6 +1664,17 @@ impl FilterEditState {
                 }
             }
             FilterKind::ToJson => Some(FilterSpec::ToJson),
+            FilterKind::Combine => {
+                let columns = self.selected_columns();
+                if columns.is_empty() {
+                    None
+                } else {
+                    Some(FilterSpec::Combine {
+                        columns,
+                        separator: self.delim_text.clone(),
+                    })
+                }
+            }
         }
     }
 }

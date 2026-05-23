@@ -722,6 +722,9 @@ pub(super) fn describe_filter(spec: &FilterSpec) -> String {
             format!("pipe {joined}")
         }
         FilterSpec::ToJson => "to-json".into(),
+        FilterSpec::Combine { columns, separator } => {
+            format!("combine {} with {separator:?}", columns.join(", "))
+        }
     }
 }
 
